@@ -54,6 +54,14 @@ def build_exe():
             print(f"[WARN] 自动生成图标异常: {e}")
 
     print("\n[3/4] 调用 PyInstaller 编译 PySide6 应用程序 (集成图标与 UAC 管理员清单)...")
+    # 确保发布前 Nginx 站点配置全量模板化生成
+    try:
+        sys.path.insert(0, str(BASE_DIR / "app"))
+        from nginx_generator import NginxConfGenerator
+        NginxConfGenerator.generate_all(BASE_DIR / "nginx" / "conf")
+    except Exception as e:
+        print(f"[WARN] Nginx 模板前置生成异常: {e}")
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",

@@ -121,11 +121,22 @@ class L4RelayServer:
     def is_running(self) -> bool:
         return self._is_running
 
+    def _tune_socket(self, writer: asyncio.StreamWriter):
+        """对底层 TCP Socket 进行性能调优 (禁用 Nagle, 扩大收发窗口)"""
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        except Exception:
+            pass
+
     async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """双向单向数据泵 (带缓冲高吞吐流式 copy)"""
+        """双向单向数据泵 (带 128KB 缓冲高吞吐流式 copy)"""
         try:
             while True:
-                buf = await reader.read(65536)
+                buf = await reader.read(131072)
                 if not buf:
                     break
                 writer.write(buf)
@@ -146,6 +157,8 @@ class L4RelayServer:
         upstream_reader = None
         upstream_writer = None
         try:
+            self._tune_socket(client_writer)
+
             # 1. 尝试读取前导握手包 (最多等待 2.0 秒)
             first_chunk = await asyncio.wait_for(client_reader.read(4096), timeout=2.0)
             if not first_chunk:
@@ -157,12 +170,20 @@ class L4RelayServer:
             target = None
 
             if sni:
-                # 查自定义路由表
+                # 1. 查自定义路由表 (精确匹配)
                 if sni in self.routes:
                     target = self.routes[sni]
                 else:
-                    # 查 Service Profile 候选 IP
+                    # 2. 查 Service Profile (精确匹配或泛域名通配)
                     profile = get_profile_by_domain(sni)
+                    if not profile:
+                        # 尝试主域名后缀通配匹配
+                        parts = sni.split(".")
+                        for i in range(1, len(parts) - 1):
+                            parent_domain = ".".join(parts[i:])
+                            profile = get_profile_by_domain(parent_domain)
+                            if profile:
+                                break
                     if profile and profile.candidate_ips:
                         target = (profile.candidate_ips[0], 443)
 
@@ -176,17 +197,25 @@ class L4RelayServer:
 
             target_ip, target_port = target
 
-            # 3. 连接目标上游
+            # 3. 连接目标上游 (3.5s 超时适应跨国握手)
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(target_ip, target_port),
-                timeout=3.0
+                timeout=3.5
             )
+            self._tune_socket(upstream_writer)
 
-            # 4. 回放首个握手包给上游
-            upstream_writer.write(first_chunk)
-            await upstream_writer.drain()
+            # 4. 回放首个握手包给上游 (支持 TLS 报文微切片分发以抵抗 SNI DPI 阻断)
+            if len(first_chunk) > 32:
+                split_point = 24  # 在 SNI 扩展前切片
+                upstream_writer.write(first_chunk[:split_point])
+                await upstream_writer.drain()
+                upstream_writer.write(first_chunk[split_point:])
+                await upstream_writer.drain()
+            else:
+                upstream_writer.write(first_chunk)
+                await upstream_writer.drain()
 
-            # 5. 启动双向透明数据传输
+            # 5. 启动双向透明高速数据管道 (256KB 内存泵)
             await asyncio.gather(
                 self._pipe(client_reader, upstream_writer),
                 self._pipe(upstream_reader, client_writer),

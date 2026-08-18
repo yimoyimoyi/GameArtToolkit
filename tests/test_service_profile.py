@@ -28,11 +28,14 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证 18 项服务 Profile 完整性"""
-        self.assertEqual(len(PROFILES), 18)
-        self.assertEqual(len(SERVICES_LIST), 18)
-        self.assertEqual(len(SERVICES_BY_ID), 18)
-        self.assertEqual(len(CANDIDATE_IPS), 18)
+        """验证 21 项服务 Profile 完整性 (包含 google_translate, fandom 与 wikipedia)"""
+        self.assertEqual(len(PROFILES), 21)
+        self.assertEqual(len(SERVICES_LIST), 21)
+        self.assertEqual(len(SERVICES_BY_ID), 21)
+        self.assertEqual(len(CANDIDATE_IPS), 21)
+        self.assertIn("fandom", SERVICES_BY_ID)
+        self.assertIn("wikipedia", SERVICES_BY_ID)
+        self.assertIn("google_translate", SERVICES_BY_ID)
 
     def test_profile_lookup(self):
         """测试服务根据 ID 与域名的动态查找与通配匹配"""
@@ -143,6 +146,50 @@ class TestL4Relay(unittest.TestCase):
         stop_ok, stop_msg = server.stop()
         self.assertTrue(stop_ok)
         self.assertFalse(server.is_running())
+
+
+class TestCDNHealthMonitor(unittest.TestCase):
+    """验证 CDN 持续健康巡检与自愈机制"""
+
+    def test_health_monitor_lifecycle(self):
+        """测试 CDNHealthMonitor 启停与状态"""
+        from cdn_optimizer import CDNOptimizer, CDNHealthMonitor
+        opt = CDNOptimizer()
+        monitor = CDNHealthMonitor(opt, check_interval=60.0)
+        self.assertFalse(monitor.is_running())
+
+        monitor.start(["pixiv_web"])
+        self.assertTrue(monitor.is_running())
+
+        monitor.stop()
+        self.assertFalse(monitor.is_running())
+
+
+class TestHostsMultiMode(unittest.TestCase):
+    """验证 Hosts 多模式 (Direct 与 Proxy) 注入分流"""
+
+    def test_hosts_direct_and_proxy_rules(self):
+        """测试 HostsManager 根据 ServiceProfile.mode 正确生成 Direct IP 或 127.0.0.1"""
+        from hosts_manager import HostsManager
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, encoding="utf-8") as tf:
+            tf.write("127.0.0.1 localhost\n")
+            tmp_hosts_path = Path(tf.name)
+
+        try:
+            hm = HostsManager(tmp_hosts_path)
+            # 测试应用 pixiv_web (l7_nginx 模式)
+            ok, msg = hm.apply_rules(["pixiv_web"])
+            self.assertTrue(ok)
+            content = tmp_hosts_path.read_text(encoding="utf-8")
+            self.assertIn("127.0.0.1 pixiv.net", content)
+
+            # 清理
+            hm.remove_rules()
+            clean_content = tmp_hosts_path.read_text(encoding="utf-8")
+            self.assertNotIn("pixiv.net", clean_content)
+        finally:
+            tmp_hosts_path.unlink(missing_ok=True)
 
 
 class TestNginxConfigValidation(unittest.TestCase):

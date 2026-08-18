@@ -15,8 +15,9 @@ import socket
 import ssl
 import re
 import concurrent.futures
+import threading
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable, Any
 
 from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID
@@ -170,11 +171,11 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
     rank 3: 双通道全挂 → 不写入
     """
     d_clean = bool(direct and direct.get("tcp_ok") and direct.get("tls_ok")
-                   and not _suspect_status(direct.get("http_status")))
+                   and direct.get("http_ok") and not _suspect_status(direct.get("http_status")))
     p_clean = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
-                   and not _suspect_status(proxy.get("http_status")))
+                   and proxy.get("http_ok") and not _suspect_status(proxy.get("http_status")))
     p_suspect = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
-                     and _suspect_status(proxy.get("http_status")))
+                     and proxy.get("http_ok") and _suspect_status(proxy.get("http_status")))
 
     item = {"latency": None, "available": False, "rank": 3,
             "via_proxy": False, "recommend": "none", "sni_mode": "host",
@@ -194,6 +195,11 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
 class CDNOptimizer:
     def __init__(self, conf_path: Path = UPSTREAM_CONF_PATH):
         self.conf_path = Path(conf_path)
+
+    def test_service_dual(self, srv_id: str, max_workers: int = 8) -> List[Dict]:
+        """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)"""
+        ips = CANDIDATE_IPS.get(srv_id, [])
+        return self.test_group(srv_id, ips, max_workers=max_workers)
 
     def test_group(self, group_name: str, ip_list: List[str], max_workers: int = 8) -> List[Dict]:
         """测试指定服务的一组候选 IP (双通道三态探测)"""
@@ -230,15 +236,22 @@ class CDNOptimizer:
         results.sort(key=lambda x: (x.get("rank", 3), x.get("latency") if x.get("latency") is not None else 99999))
         return results
 
-    def test_all_services(self, max_workers: int = 16, total_timeout: float = 30.0) -> Dict[str, List[Dict]]:
-        """全量双通道探测: 直连 + 经本地代理 CONNECT 隧道, 三态验证后 rank 合并排序"""
+    def test_all_services(self, max_workers: int = 16, total_timeout: float = 30.0,
+                          filter_services: Optional[List[str]] = None) -> Dict[str, List[Dict]]:
+        """全量/按需双通道探测: 直连 + 经本地代理 CONNECT 隧道, 三态验证后 rank 合并排序
+        
+        若指定 filter_services 则仅对指定服务进行并发网络探测，其他服务快速填充默认候选
+        """
         proxy = _load_proxy_config()
         proxy_ready = is_proxy_available(proxy, timeout=0.5)
         if not proxy_ready:
             proxy = None
 
+        target_set = set(filter_services) if filter_services is not None else None
         flat_tasks = []
         for srv_id, ips in CANDIDATE_IPS.items():
+            if target_set is not None and srv_id not in target_set:
+                continue
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
             sni_mode = SNI_MODES.get(srv_id, "host")
@@ -284,6 +297,20 @@ class CDNOptimizer:
 
         return results_by_srv
 
+    def _load_existing_upstream_blocks(self) -> Dict[str, str]:
+        """读取现有 upstream-dynamic.conf, 按服务提取已有 upstream 块 (供增量合并)"""
+        blocks: Dict[str, str] = {}
+        if not self.conf_path.exists():
+            return blocks
+        try:
+            text = self.conf_path.read_text(encoding="utf-8", errors="ignore")
+            pattern = re.compile(r"upstream\s+(upstream_[a-z0-9_]+)\s*\{.*?\n\}", re.S)
+            for m in pattern.finditer(text):
+                blocks[m.group(1)] = m.group(0)
+        except Exception:
+            pass
+        return blocks
+
     @staticmethod
     def _fmt_server(ip: str, extra: str = "") -> str:
         """生成 upstream server 行: IPv6 地址必须加方括号 (nginx 语法要求), 行尾必须带分号"""
@@ -309,7 +336,20 @@ class CDNOptimizer:
             "# ==============================================================================\n"
         ]
 
-        for srv_id, ip_items in test_results.items():
+        # 读取现有配置用于增量合并: 未参与本次测速的服务保留其已有 upstream 块,
+        # 避免单服务自愈/局部重测顺带把其余服务重置回候选池
+        existing_blocks = self._load_existing_upstream_blocks()
+
+        # 确保全量服务均生成 upstream 块 (若某服务未测速，则自动取 CANDIDATE_IPS 默认兜底)
+        for srv_id in CANDIDATE_IPS:
+            ip_items = test_results.get(srv_id)
+            if not ip_items:
+                old_block = existing_blocks.get(f"upstream_{srv_id}")
+                if old_block:
+                    lines.append(old_block + "\n")
+                    continue
+                ip_items = [{"ip": ip} for ip in CANDIDATE_IPS.get(srv_id, [])]
+
             # 只写 rank0 直连可用节点; 无 rank0 则回退候选池兜底 (保证 nginx 可启动)
             usable = [it for it in ip_items if it.get("rank", 3) == 0]
             fallback = not usable
@@ -380,7 +420,170 @@ class CDNOptimizer:
                       if not any(it.get("rank", 3) == 0 for it in items)]
             msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
             if failed:
-                msg += f" 注意: {len(failed)} 个服务双通道探测全部失败已回退候选池({', '.join(sorted(failed))}), 建议检查网络后重试"
+                msg += f" 注意: {len(failed)} 个服务直连探测全部失败已回退候选池({', '.join(sorted(failed))})"
+                # 代理可用但直连被阻断: 数据平面仍直连, 明确提示用户 (代理仅作测速筛选)
+                proxy = _load_proxy_config()
+                if proxy and is_proxy_available(proxy):
+                    msg += "。当前直连被阻断而本地代理可用, 但 Nginx 数据平面仍为直连, 请检查网络直连状态"
+                else:
+                    msg += ", 建议检查网络后重试"
             return True, msg
         except Exception as e:
             return False, f"写入 upstream 配置失败: {e}"
+
+
+class CDNHealthMonitor:
+    """持续 CDN 节点健康巡检与故障自愈引擎"""
+
+    def __init__(self, optimizer: CDNOptimizer, check_interval: float = 300.0,
+                 on_healed: Optional[Callable[[], Any]] = None):
+        self.optimizer = optimizer
+        self.check_interval = check_interval
+        self.on_healed = on_healed
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._is_running = False
+        self.enabled_services: List[str] = []
+        self.cached_results: Dict[str, List[Dict]] = {}
+        self.failure_counts: Dict[str, int] = {}
+
+    def is_running(self) -> bool:
+        return self._is_running
+
+    def update_services(self, enabled_services: List[str], current_results: Optional[Dict[str, List[Dict]]] = None):
+        """更新当前监听的服务清单与基准测试结果"""
+        self.enabled_services = list(enabled_services)
+        if current_results:
+            self.cached_results = dict(current_results)
+
+    def check_and_heal_service(self, srv_id: str) -> bool:
+        """检查单个服务的当前主力节点，并在故障时自动选举自愈"""
+        srv = SERVICES_BY_ID.get(srv_id)
+        if not srv:
+            return False
+
+        items = self.cached_results.get(srv_id)
+        if not items:
+            items = self.optimizer.test_service_dual(srv_id)
+            self.cached_results[srv_id] = items
+
+        best_item = next((it for it in items if it.get("rank", 3) == 0), items[0] if items else None)
+        if not best_item:
+            return False
+
+        # 轻量探针检查当前主力节点
+        sni_mode = SNI_MODES.get(srv_id, "host")
+        domain = srv["domains"][0] if srv["domains"] else ""
+        probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain, timeout=2.0, sni_mode=sni_mode)
+
+        if probe_res.get("tls_ok", False):
+            self.failure_counts[srv_id] = 0
+            return False  # 主力节点健康，无需自愈
+
+        # 连续失败计数累加
+        self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
+        if self.failure_counts[srv_id] >= 2:
+            # 触发故障自愈：单服务重测并选举新节点
+            new_items = self.optimizer.test_service_dual(srv_id)
+            self.cached_results[srv_id] = new_items
+            self.failure_counts[srv_id] = 0
+            return True
+
+        return False
+
+    def run_health_check_cycle(self) -> Tuple[bool, List[str]]:
+        """执行一轮轻量健康巡检周期，返回 (是否有自愈发生, 自愈服务列表)"""
+        healed_services = []
+        for srv_id in self.enabled_services:
+            if self._stop_event.is_set():
+                break
+            try:
+                if self.check_and_heal_service(srv_id):
+                    healed_services.append(srv_id)
+            except Exception:
+                pass
+
+        if healed_services and self.cached_results:
+            # 重新渲染 upstream 配置并应用
+            ok, _ = self.optimizer.apply_optimal(self.cached_results)
+            if ok and self.on_healed:
+                try:
+                    self.on_healed()
+                except Exception:
+                    pass
+            return True, healed_services
+
+        return False, []
+
+    def _worker_loop(self):
+        """后台低开销巡检工作循环"""
+        self._is_running = True
+        while not self._stop_event.is_set():
+            # 休眠指定周期（支持快速唤醒退出）
+            if self._stop_event.wait(timeout=self.check_interval):
+                break
+            try:
+                self.run_health_check_cycle()
+            except Exception:
+                pass
+        self._is_running = False
+
+    def start(self, enabled_services: Optional[List[str]] = None):
+        """启动后台健康巡检守护线程"""
+        if self._is_running:
+            return
+        if enabled_services is not None:
+            self.enabled_services = list(enabled_services)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="CDNHealthMonitorThread")
+        self._thread.start()
+
+    def stop(self):
+        """停止后台健康巡检"""
+        if not self._is_running:
+            return
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._is_running = False
+
+
+# ==============================================================================
+# 独立运行入口: 支持用户/开发者在终端手动执行一键测速与节点优选
+# ==============================================================================
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    print("=" * 80)
+    print(">>> PixivToolkit - CDN 节点全网深度探测与动态优选 CLI <<<")
+    print("=" * 80)
+
+    conf_file = Path(__file__).resolve().parent.parent / "nginx" / "conf" / "upstream-dynamic.conf"
+    opt = CDNOptimizer(conf_file)
+    print("正在对全量加速服务的 Anycast 节点进行并发探测 (超时阈值 3.5s)...")
+
+    t0 = time.perf_counter()
+    res = opt.test_all_services(max_workers=16, total_timeout=25.0)
+    elapsed = time.perf_counter() - t0
+
+    print("\n" + "=" * 80)
+    print(f"测速完成！总耗时: {elapsed:.2f} 秒")
+    print("=" * 80)
+
+    for srv_id, ip_items in res.items():
+        usable = [it for it in ip_items if it.get("available")]
+        best_lat = usable[0].get("latency") if usable else None
+        lat_str = f"{best_lat}ms" if best_lat is not None else "超时/不可用"
+        print(f"【{srv_id:<20}】可用节点: {len(usable)}/{len(ip_items)} | 最低延迟: {lat_str}")
+        for it in ip_items:
+            ip = it.get("ip")
+            lat = it.get("latency")
+            status = f"✅ {lat}ms" if lat is not None else "❌ 超时"
+            via = "(代理)" if it.get("via_proxy") else "(直连)"
+            print(f"    - {ip:<18} | {status:<12} {via}")
+
+    ok, msg = opt.apply_optimal(res)
+    print("\n" + "=" * 80)
+    print(f"优选结果应用状态: {'[成功]' if ok else '[失败]'} -> {msg}")
+    print("=" * 80)

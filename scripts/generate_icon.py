@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 PixivToolkit - 平面化风格应用图标生成器
 生成与内置托盘保持一致的平面化 (Flat) 图标，支持导出 16x16 至 256x256 全尺寸 Windows ICO 与 PNG

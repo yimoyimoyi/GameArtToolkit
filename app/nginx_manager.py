@@ -13,6 +13,7 @@ from typing import Tuple, Dict
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
 from win_utils import is_process_running, is_port_in_use, get_silent_startup_kwargs
+from nginx_generator import NginxConfGenerator
 
 NGINX_EXE = NGINX_DIR / "nginx.exe"
 CACHE_DIR = NGINX_DIR / "cache"
@@ -42,10 +43,20 @@ class NginxManager:
         return 0
 
     def test_config(self) -> Tuple[bool, str]:
-        """执行 nginx -t 进行语法与 upstream 预检"""
+        """执行 nginx -t 进行语法与 upstream 预检 (包含前置模板渲染)"""
         if not self.nginx_exe.exists():
             return False, "未找到 nginx.exe"
         try:
+            # 1. 自动从 ServiceProfile 单源渲染三大站点配置
+            NginxConfGenerator.generate_all(self.nginx_dir / "conf")
+
+            # 2. 仅当 upstream-dynamic.conf 缺失时生成兜底配置 (避免覆盖已优选的节点)
+            upstream_conf = self.nginx_dir / "conf" / "upstream-dynamic.conf"
+            if not upstream_conf.exists():
+                from cdn_optimizer import CDNOptimizer
+                CDNOptimizer(upstream_conf).apply_optimal({})
+
+            # 3. 执行 Nginx 语法预检
             cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-c", "conf/nginx.conf", "-t"]
             proc = subprocess.run(
                 cmd, cwd=str(self.nginx_dir), capture_output=True,

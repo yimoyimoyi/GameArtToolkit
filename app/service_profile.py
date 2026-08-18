@@ -149,7 +149,7 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_ea_app",
         ssl_sni_mode="host",
-        candidate_ips=["23.41.142.46", "104.91.87.202"]
+        candidate_ips=["23.1.179.144", "184.27.185.73", "23.202.34.90", "23.41.142.46"]
     ),
 
     # --------------------------------------------------------------------------
@@ -164,7 +164,7 @@ PROFILES: List[ServiceProfile] = [
             "pixiv.net", "www.pixiv.net", "ssl.pixiv.net", "accounts.pixiv.net", "touch.pixiv.net",
             "oauth.secure.pixiv.net", "dic.pixiv.net", "en-dic.pixiv.net", "sketch.pixiv.net",
             "payment.pixiv.net", "factory.pixiv.net", "comic.pixiv.net", "novel.pixiv.net",
-            "imgaz.pixiv.net", "imp.pixiv.net", "sensei.pixiv.net", "fanbox.pixiv.net",
+            "imp.pixiv.net", "sensei.pixiv.net", "fanbox.pixiv.net",
             "source.pixiv.net", "i1.pixiv.net", "i2.pixiv.net", "i3.pixiv.net", "i4.pixiv.net",
             "app-api.pixiv.net", "lc-event.pixiv.net"
         ],
@@ -229,12 +229,12 @@ PROFILES: List[ServiceProfile] = [
         id="yandere",
         group="acg",
         name="Yande.re 高清动漫壁纸",
-        desc="解决超高清壁纸原图下载超时与断流",
-        domains=["yande.re", "www.yande.re", "files.yande.re"],
+        desc="解决超高清壁纸原图下载超时与死循环重定向",
+        domains=["yande.re", "www.yande.re", "files.yande.re", "assets.yande.re"],
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_yandere",
         ssl_sni_mode="host",
-        candidate_ips=["104.26.12.197", "172.67.69.123"]
+        candidate_ips=["104.26.12.197", "172.67.69.123", "172.64.150.76"]
     ),
     ServiceProfile(
         id="vndb",
@@ -247,10 +247,43 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         candidate_ips=["217.182.194.133"]
     ),
+    ServiceProfile(
+        id="fandom",
+        group="acg",
+        name="Fandom 游戏动漫社区 Wiki",
+        desc="解决各类游戏/动漫/影视 Wiki 资料库与图片 CDN 加速",
+        domains=[
+            "fandom.com", "www.fandom.com", "wikia.com", "static.wikia.nocookie.net",
+            "vignette.wikia.nocookie.net", "images.wikia.com", "services.fandom.com",
+            "auth.fandom.com", "genshin-impact.fandom.com", "minecraft.fandom.com",
+            "starwars.fandom.com", "zelda.fandom.com", "honkai-star-rail.fandom.com", "terraria.fandom.com"
+        ],
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_fandom",
+        ssl_sni_mode="host",
+        candidate_ips=["151.101.0.194", "151.101.64.194", "151.101.128.194", "151.101.192.194"]
+    ),
 
     # --------------------------------------------------------------------------
     # 💻 开发者 & AI
     # --------------------------------------------------------------------------
+    ServiceProfile(
+        id="wikipedia",
+        group="dev",
+        name="Wikipedia 维基百科",
+        desc="解决全球自由百科全书中文/英文版及图库媒体加载",
+        domains=[
+            "wikipedia.org", "www.wikipedia.org",
+            "zh.wikipedia.org", "en.wikipedia.org", "ja.wikipedia.org", "zh-tw.wikipedia.org", "zh-cn.wikipedia.org",
+            "zh.m.wikipedia.org", "en.m.wikipedia.org",
+            "upload.wikimedia.org", "commons.wikimedia.org", "meta.wikimedia.org",
+            "wikidata.org", "www.wikidata.org", "wikimedia.org"
+        ],
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_wikipedia",
+        ssl_sni_mode="host",
+        candidate_ips=["185.15.59.224", "185.15.58.224", "198.35.26.96", "208.80.154.224"]
+    ),
     ServiceProfile(
         id="github_web",
         group="dev",
@@ -273,7 +306,6 @@ PROFILES: List[ServiceProfile] = [
         name="GitHub 静态资产与 Raw 直连",
         desc="解决 GitHub CSS/JS 样式错乱、头像破图与 Raw 脚本直连",
         domains=[
-            "githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev",
             "raw.githubusercontent.com", "user-images.githubusercontent.com", "favicons.githubusercontent.com",
             "avatars.githubusercontent.com", "avatars0.githubusercontent.com", "avatars1.githubusercontent.com",
             "avatars2.githubusercontent.com", "avatars3.githubusercontent.com", "avatars4.githubusercontent.com",
@@ -300,11 +332,11 @@ PROFILES: List[ServiceProfile] = [
         group="dev",
         name="GitHub 前端 JS/CSS 静态 CDN",
         desc="解决 GitHub 前端 CSS/JS 静态资源与文档页加载",
-        domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev", "docs.github.com"],
+        domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev"],
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_assets",
         ssl_sni_mode="host",
-        candidate_ips=["185.199.108.154", "185.199.109.154", "185.199.110.154", "185.199.111.154"]
+        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133", "185.199.108.154"]
     ),
     ServiceProfile(
         id="gitlab",
@@ -315,22 +347,35 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_gitlab",
         ssl_sni_mode="host",
-        candidate_ips=["172.65.251.78"]
+        candidate_ips=["104.18.37.180", "172.64.150.76", "172.65.251.78"]
     ),
     ServiceProfile(
         id="huggingface",
         group="dev",
         name="HuggingFace AI 平台",
-        desc="解决开源大模型权重文件与 Space 空间直连加速",
-        domains=["huggingface.co", "www.huggingface.co", "cdn-lfs.huggingface.co", "cdn-thumbnails.huggingface.co"],
-        mode=ServiceMode.L7_NGINX,
+        desc="解决开源大模型权重文件与 Space 空间直连加速 (L4 极速直通)",
+        domains=["huggingface.co", "www.huggingface.co", "cdn-lfs.huggingface.co", "cdn-thumbnails.huggingface.co", "hf.co"],
+        mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载，突破 Nginx 缓冲与体积限制
         upstream_name="upstream_huggingface",
-        ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",  # 伪 SNI
+        ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",
         candidate_ips=[
-            "2600:9000:2014:a400:17:b174:6d00:93a1",
-            "2600:9000:2939:7600:17:b174:6d00:93a1",
-            "2600:9000:2804:ce00:1c:55ad:4180:93a1",
+            "18.155.68.86", "18.155.68.106", "18.155.68.125",
+            "18.64.8.43", "18.64.8.84", "108.138.246.7",
             "54.230.71.56", "3.175.207.30", "3.175.207.31"
+        ]
+    ),
+    ServiceProfile(
+        id="google_translate",
+        group="dev",
+        name="Google 谷歌翻译",
+        desc="解决 Chrome 内置网页翻译与划词翻译连接超时 (亚太 Anycast 官方直连)",
+        domains=["translate.googleapis.com", "translate.google.com"],
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_google_translate",
+        ssl_sni_mode="host",
+        candidate_ips=[
+            "142.250.107.90", "142.250.72.234", "172.217.160.106", "172.217.163.42",
+            "142.250.66.42", "142.250.198.10", "142.250.204.42"
         ]
     )
 ]

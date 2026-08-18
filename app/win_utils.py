@@ -59,28 +59,44 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def elevate_relaunch() -> bool:
-    """唤起 Windows UAC 提示框并以管理员权限重新启动自身 (兼容 PyInstaller 与脚本环境)"""
+def elevate_relaunch(*args, **kwargs) -> bool:
+    """唤起 Windows UAC 提示框并以管理员权限重新启动自身 (兼容 PyInstaller 打包与 Python 脚本环境)"""
+    import os
     import sys
     from pathlib import Path
-    
+
     is_frozen = getattr(sys, 'frozen', False)
     if is_frozen:
         exe_path = sys.executable
         work_dir = str(Path(sys.executable).parent)
         param_str = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
     else:
-        exe_path = sys.executable
-        script_abs = str(Path(sys.argv[0]).resolve())
-        work_dir = str(Path(__file__).resolve().parent.parent)
-        args = [f'"{arg}"' for arg in sys.argv[1:]]
-        param_str = f'"{script_abs}"' + (" " + " ".join(args) if args else "")
+        base_dir = Path(__file__).resolve().parent.parent
+        bat_file = base_dir / "启动桌面客户端(双击运行).bat"
+        if bat_file.exists():
+            # 优先通过启动批处理以管理员权限拉起
+            exe_path = "cmd.exe"
+            param_str = f'/c ""{bat_file}""'
+            work_dir = str(base_dir)
+        else:
+            exe_path = sys.executable
+            script_abs = str((base_dir / "app" / "pyside_app.py").resolve())
+            work_dir = str(base_dir)
+            extra_args = [f'"{a}"' for a in sys.argv[1:]]
+            param_str = f'"{script_abs}"' + (" " + " ".join(extra_args) if extra_args else "")
 
     ret = ctypes.windll.shell32.ShellExecuteW(
         None, "runas", exe_path, param_str, work_dir, 1
     )
     if ret > 32:
-        sys.exit(0)
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                app.quit()
+        except Exception:
+            pass
+        os._exit(0)
     return False
 
 def get_silent_startup_kwargs() -> dict:
@@ -215,12 +231,27 @@ def fast_terminate_pid(pid: int) -> bool:
         pass
     return False
 
-def check_proxy_alive(host: str = "127.0.0.1", port: int = 7897, timeout: float = 0.5) -> bool:
-    """测试上游测速代理是否处于监听连通状态"""
+def check_proxy_alive(host: str = "127.0.0.1", port: int = 7897, timeout: float = 1.0) -> bool:
+    """测试上游测速代理是否可用: TCP 端口探活 + HTTP CONNECT 隧道握手双重验证
+
+    仅 TCP 探活会将任意占用端口的服务误判为代理, 增加 CONNECT 握手
+    保证返回 True 时该端口确实是可用的 HTTP 代理 (与测速链路的 CONNECT 行为一致)
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            return s.connect_ex((host, port)) == 0
+            if s.connect_ex((host, port)) != 0:
+                return False
+            # CONNECT 到测试地址 (1.2.3.4:443), 真实代理会返回 200 Connection established
+            s.sendall(b"CONNECT 1.2.3.4:443 HTTP/1.1\r\nHost: 1.2.3.4:443\r\n\r\n")
+            hdr = b""
+            while b"\r\n\r\n" not in hdr:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                hdr += chunk
+            line = hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+            return " 200 " in line
     except Exception:
         return False
 

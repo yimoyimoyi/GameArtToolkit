@@ -37,6 +37,10 @@ from hosts_manager import HostsManager, BLOCK_START, BLOCK_END
 from steam_manager import SteamManager, tokenize_vdf, parse_vdf_structure, serialize_vdf_dict
 from nginx_manager import NginxManager
 from cdn_optimizer import CDNOptimizer
+from nginx_generator import NginxConfGenerator
+
+# 确保测试前最新站点配置文件已完全模板化渲染
+NginxConfGenerator.generate_all(WORKSPACE_DIR / "nginx" / "conf")
 
 class RegressionTestSuite:
     def __init__(self):
@@ -79,12 +83,12 @@ class RegressionTestSuite:
         defined_upstreams = set(re.findall(r"upstream\s+([a-zA-Z0-9_-]+)\s*\{", dynamic_upstream_conf))
         self.log_sub(f"upstream-dynamic.conf 中解析到 {len(defined_upstreams)} 个负载均衡组")
 
-        # 校验 18 项服务是否全部在 upstream-dynamic.conf 中定义
+        # 校验 20 项服务是否全部在 upstream-dynamic.conf 中定义
         for srv in SERVICES_LIST:
             srv_id = srv["id"]
             expected_upstream = f"upstream_{srv_id}"
             assert expected_upstream in defined_upstreams, f"服务 {srv_id} 对应的 {expected_upstream} 未在 upstream-dynamic.conf 中定义"
-        self.log_sub("18 项加速服务在 upstream-dynamic.conf 中全部具备匹配的 upstream 定义")
+        self.log_sub(f"{len(SERVICES_LIST)} 项加速服务在 upstream-dynamic.conf 中全部具备匹配的 upstream 定义")
 
         # 检查 site-acg.conf, site-gaming.conf, site-dev.conf 中引用的 upstream
         site_files = ["site-acg.conf", "site-gaming.conf", "site-dev.conf"]
@@ -334,7 +338,7 @@ class RegressionTestSuite:
 
         assert "backup " in conf_text, "具备 >2 节点时应生成 backup 指令"
 
-        self.log_sub("18 项服务 Upstream 配置生成格式与 Nginx 指令兼容")
+        self.log_sub(f"{len(SERVICES_LIST)} 项服务 Upstream 配置生成格式与 Nginx 指令兼容")
 
         # 5.3 兜底测试：当某服务所有 IP 均不可用时，保证 fallback 不生成空 upstream 导致 Nginx 崩溃
         disaster_results = {

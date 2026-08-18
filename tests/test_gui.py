@@ -395,6 +395,18 @@ def run_full_verification():
     upstream_conf = copt.generate_upstream_conf({"pixiv_web": [{"ip": "210.140.139.151", "latency": 35.0, "available": True, "rank": 0}]})
     report.assert_true("upstream upstream_pixiv_web" in upstream_conf, "CDNOptimizer 动态 Upstream 块生成格式正常")
 
+    # 4.6 MainWindow 初始化与 start_acceleration 生命周期回归
+    from pyside_app import MainWindow, emergency_fast_cleanup
+    main_win = MainWindow()
+    report.assert_true(main_win is not None, "MainWindow 实例化成功")
+    main_win.start_acceleration(show_toast_on_fail=False)
+    report.assert_true(True, "MainWindow.start_acceleration 执行无未定义异常 (enabled_services 回归)")
+    main_win.stop_acceleration()
+    report.assert_true(True, "MainWindow.stop_acceleration 执行正常")
+    if hasattr(main_win, "_status_timer"):
+        main_win._status_timer.stop()
+    main_win.close()
+
     # =========================================================================
     # 测试总结与报告输出
     # =========================================================================

@@ -44,5 +44,8 @@ SERVICES_BY_ID = {s["id"]: s for s in SERVICES_LIST}
 # 各服务的优质 CDN Anycast IP 候选池
 CANDIDATE_IPS = {p.id: p.candidate_ips for p in PROFILES}
 
-# 默认全部开启已验证的优质服务 ID 集合
-DEFAULT_ENABLED_SERVICES = [p.id for p in PROFILES]
+# 默认开启已验证的优质稳定直连服务集合 (排除需要依赖海外中继代理的 fandom, wikipedia, yandere)
+EXPERIMENTAL_OR_PROXY_SERVICES = {"fandom", "wikipedia", "yandere"}
+DEFAULT_ENABLED_SERVICES = [p.id for p in PROFILES if p.id not in EXPERIMENTAL_OR_PROXY_SERVICES]
+
+

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 PixivToolkit - 18 项加速服务通用 SAN 证书生成器 (X.509 v3 + SHA256)
 自动生成覆盖 18 项服务的根证书 (Root CA) 与多域名通用通配符服务端证书

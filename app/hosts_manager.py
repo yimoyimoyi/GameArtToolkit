@@ -9,10 +9,11 @@ import sys
 import stat
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ip_pool import SERVICES_LIST, SERVICES_BY_ID
+from service_profile import ServiceMode, get_profile_by_id
 from win_utils import flush_dns_native
 
 HOSTS_PATH = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
@@ -139,37 +140,49 @@ class HostsManager:
 
             base_content = self.remove_rules_from_content(content)
 
-            # 收集所有已启用服务的域名 (去重)
-            all_domains: Set[str] = set()
+            # 收集所有已启用服务的域名与目标 IP 映射
+            domain_ip_map: Dict[str, str] = {}
             for s_id in enabled_services:
+                profile = get_profile_by_id(s_id)
                 srv = SERVICES_BY_ID.get(s_id)
-                if srv:
-                    for d in srv.get("domains", []):
-                        all_domains.add(d)
+                if not srv:
+                    continue
+                # 判定目标 IP (Direct 模式直接写最优 CDN IP, 代理模式写 127.0.0.1)
+                if profile and profile.mode == ServiceMode.DIRECT and profile.candidate_ips:
+                    target_ip = profile.candidate_ips[0]
+                else:
+                    target_ip = "127.0.0.1"
+
+                for d in srv.get("domains", []):
+                    domain_ip_map[d] = target_ip
 
             # 兼容旧版服务组键名 ('pixiv', 'steam', 'github', 'huggingface')
             if "pixiv" in enabled_services:
                 for s in SERVICES_LIST:
                     if s["group"] == "acg":
-                        all_domains.update(s["domains"])
+                        for d in s["domains"]:
+                            domain_ip_map[d] = "127.0.0.1"
             if "steam" in enabled_services:
                 for s in SERVICES_LIST:
                     if s["group"] == "gaming":
-                        all_domains.update(s["domains"])
+                        for d in s["domains"]:
+                            domain_ip_map[d] = "127.0.0.1"
             if "github" in enabled_services:
                 for s in SERVICES_LIST:
                     if s["group"] == "dev":
-                        all_domains.update(s["domains"])
+                        for d in s["domains"]:
+                            domain_ip_map[d] = "127.0.0.1"
 
-            if not all_domains:
+            if not domain_ip_map:
                 self._safe_write_hosts(base_content)
                 self.flush_dns()
                 return True, "已清空所有加速 Hosts 规则"
 
-            # 构造全新的注入规则块
+            # 构造全新的注入规则块 (按域名排序输出)
             lines = [BLOCK_START, "# 本规则由 PixivToolkit 自动安全托管，退出程序时将自动完全清理"]
-            for dom in sorted(all_domains):
-                lines.append(f"127.0.0.1 {dom}")
+            for dom in sorted(domain_ip_map.keys()):
+                ip = domain_ip_map[dom]
+                lines.append(f"{ip} {dom}")
             lines.append(BLOCK_END)
             rule_block = "\r\n".join(lines) + "\r\n"
 
@@ -177,7 +190,7 @@ class HostsManager:
             self._safe_write_hosts(new_hosts_content)
 
             self.flush_dns()
-            return True, f"已成功注入 {len(all_domains)} 条加速域名规则！"
+            return True, f"已成功注入 {len(domain_ip_map)} 条加速域名规则！"
         except PermissionError:
             from win_utils import is_admin
             if not is_admin():

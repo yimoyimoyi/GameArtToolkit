@@ -36,7 +36,10 @@ from steam_manager import SteamManager
 from cert_manager import CertManager
 from hosts_manager import HostsManager
 from nginx_manager import NginxManager
-from cdn_optimizer import CDNOptimizer
+from cdn_optimizer import CDNOptimizer, CDNHealthMonitor
+from l4_relay import relay_server
+from dns_server import local_dns_server
+from env_detector import EnvDetector
 from win_utils import (
     is_process_running, is_port_in_use, is_admin, elevate_relaunch,
     is_autostart_enabled, set_autostart, register_shutdown_handler,
@@ -57,6 +60,7 @@ cert_mgr = CertManager()
 hosts_mgr = HostsManager()
 nginx_mgr = NginxManager()
 cdn_opt = CDNOptimizer()
+health_monitor = CDNHealthMonitor(cdn_opt, on_healed=nginx_mgr.reload)
 
 # ==================== 全局快速退出与 Windows 关机安全清理通道 ====================
 _CLEANUP_LOCK = threading.Lock()
@@ -74,6 +78,13 @@ def emergency_fast_cleanup():
         cfg = load_config()
         if cfg.get("auto_clean_hosts_on_exit", True):
             hosts_mgr.fast_remove_rules()
+    except Exception:
+        pass
+
+    try:
+        local_dns_server.stop()
+        health_monitor.stop()
+        relay_server.stop()
     except Exception:
         pass
 
@@ -338,6 +349,9 @@ class MainWindow(QMainWindow):
                     print(f"[Startup] 已自动修复 Hosts: {diag.get('fixes')}")
             except Exception as e:
                 print(f"[Startup] 环境检查异常: {e}")
+
+        # 初始刷新网络环境与代理诊断
+        self.refresh_env_diagnostics_ui()
 
         # 4. 自动托管启动
         if cfg.get("auto_proxy", True):
@@ -968,6 +982,9 @@ class MainWindow(QMainWindow):
 
     def on_cdn_ping_finished(self, results: Dict):
         self.cached_cdn_results = results
+        # 同步测速结果到健康巡检 (缓存基准节点, 避免巡检时全量重测)
+        services = list(dict.fromkeys(load_config().get("enabled_services", []) + DEFAULT_ENABLED_SERVICES))
+        health_monitor.update_services(services, results)
         self.btn_start_ping.setEnabled(True)
         self.btn_start_ping.setText("重新全量测速")
         self.btn_apply_cdn.setEnabled(True)
@@ -1066,6 +1083,41 @@ class MainWindow(QMainWindow):
         is_dark = ThemeManager.get_instance().is_dark
         primary_icon_c = "#D0BCFF" if is_dark else "#6750A4"
         cfg = load_config()
+
+        # ==================== 卡片 0: 网络环境与第三方代理共存诊断 ====================
+        env_card = QFrame()
+        env_card.setProperty("class", "MDCard")
+        e_layout = QVBoxLayout(env_card)
+        e_layout.setContentsMargins(20, 16, 20, 16)
+        e_layout.setSpacing(12)
+
+        e_title_box = QHBoxLayout()
+        e_icon = QLabel()
+        e_icon.setPixmap(SvgIconFactory.get_pixmap("shield", primary_icon_c, 18))
+        self.settings_icon_labels.append((e_icon, "shield"))
+        lbl_e_title = QLabel("网络环境与代理共存诊断")
+        lbl_e_title.setProperty("class", "SectionHeaderTitle")
+        e_title_box.addWidget(e_icon)
+        e_title_box.addWidget(lbl_e_title)
+        e_title_box.addStretch()
+
+        btn_refresh_env = QPushButton("重新诊断")
+        btn_refresh_env.setProperty("class", "MDBtnTonal")
+        btn_refresh_env.clicked.connect(self.refresh_env_diagnostics_ui)
+        e_title_box.addWidget(btn_refresh_env)
+        e_layout.addLayout(e_title_box)
+
+        self.lbl_env_sys_proxy = QLabel("系统代理: 检测中...")
+        self.lbl_env_sys_proxy.setProperty("class", "ItemTitle")
+        self.lbl_env_ports = QLabel("活跃代理: 检测中...")
+        self.lbl_env_ports.setProperty("class", "ItemDesc")
+        self.lbl_env_summary = QLabel("共存状态: Toolkit 仅接管指定加速域名，可与第三方代理安全共存。")
+        self.lbl_env_summary.setProperty("class", "ItemDesc")
+
+        e_layout.addWidget(self.lbl_env_sys_proxy)
+        e_layout.addWidget(self.lbl_env_ports)
+        e_layout.addWidget(self.lbl_env_summary)
+        layout.addWidget(env_card)
 
         # ==================== 卡片 1: 常规偏好与系统交互 ====================
         gen_card = QFrame()
@@ -1287,6 +1339,100 @@ class MainWindow(QMainWindow):
         p_layout.addLayout(row_pxy_fields)
 
         layout.addWidget(proxy_card)
+
+        # ==================== 卡片 3.5: 流量接入与故障自愈模式 ====================
+        mode_card = QFrame()
+        mode_card.setProperty("class", "MDCard")
+        m_layout = QVBoxLayout(mode_card)
+        m_layout.setContentsMargins(20, 16, 20, 16)
+        m_layout.setSpacing(14)
+
+        m_title_box = QHBoxLayout()
+        m_icon = QLabel()
+        m_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 18))
+        self.settings_icon_labels.append((m_icon, "zap"))
+        lbl_m_title = QLabel("流量接入与故障自愈模式")
+        lbl_m_title.setProperty("class", "SectionHeaderTitle")
+        m_title_box.addWidget(m_icon)
+        m_title_box.addWidget(lbl_m_title)
+        m_title_box.addStretch()
+        m_layout.addLayout(m_title_box)
+
+        # 3.5.1 启用本地 DNS 模式
+        row_dns = QHBoxLayout()
+        r_dns_text = QVBoxLayout()
+        r_dns_text.setSpacing(2)
+        lbl_dns_title = QLabel("启用本地 DNS 智能分流 (UDP 5353)")
+        lbl_dns_title.setProperty("class", "ItemTitle")
+        lbl_dns_desc = QLabel("开启轻量本地 DNS 解析服务，加速域名智能命中，普通公网域名透明递归转发")
+        lbl_dns_desc.setProperty("class", "ItemDesc")
+        r_dns_text.addWidget(lbl_dns_title)
+        r_dns_text.addWidget(lbl_dns_desc)
+        row_dns.addLayout(r_dns_text)
+        row_dns.addStretch()
+
+        self.sw_dns_mode = MDSwitch(checked=cfg.get("dns_mode_enabled", False))
+        self.sw_dns_mode.toggled.connect(self.on_dns_mode_toggled)
+        row_dns.addWidget(self.sw_dns_mode)
+        m_layout.addLayout(row_dns)
+
+        # 3.5.2 持续健康自愈巡检
+        row_heal = QHBoxLayout()
+        r_heal_text = QVBoxLayout()
+        r_heal_text.setSpacing(2)
+        lbl_heal_title = QLabel("持续 CDN 健康巡检与故障自愈")
+        lbl_heal_title.setProperty("class", "ItemTitle")
+        lbl_heal_desc = QLabel("后台以微量开销持续监控主力节点，检测到阻断或断流时自动选举高分备用节点平滑重载")
+        lbl_heal_desc.setProperty("class", "ItemDesc")
+        r_heal_text.addWidget(lbl_heal_title)
+        r_heal_text.addWidget(lbl_heal_desc)
+        row_heal.addLayout(r_heal_text)
+        row_heal.addStretch()
+
+        self.sw_health_heal = MDSwitch(checked=cfg.get("health_heal_enabled", True))
+        self.sw_health_heal.toggled.connect(self.on_health_heal_toggled)
+        row_heal.addWidget(self.sw_health_heal)
+        m_layout.addLayout(row_heal)
+
+        # 3.5.3 Git 命令行网络与吞吐一键调优
+        row_git = QHBoxLayout()
+        r_git_text = QVBoxLayout()
+        r_git_text.setSpacing(2)
+        lbl_git_title = QLabel("Git 命令行网络与大文件传输优化")
+        lbl_git_title.setProperty("class", "ItemTitle")
+        lbl_git_desc = QLabel("自动将 Git 全局 http.postBuffer 提升至 500MB，解除低速超时限制，解决 git pull / clone 卡顿")
+        lbl_git_desc.setProperty("class", "ItemDesc")
+        r_git_text.addWidget(lbl_git_title)
+        r_git_text.addWidget(lbl_git_desc)
+        row_git.addLayout(r_git_text)
+        row_git.addStretch()
+
+        btn_opt_git = QPushButton("一键优化 Git 配置")
+        btn_opt_git.setProperty("class", "MDBtnTonal")
+        btn_opt_git.clicked.connect(self.optimize_git_config_action)
+        row_git.addWidget(btn_opt_git)
+        m_layout.addLayout(row_git)
+
+        # 3.5.4 CDN 节点智能探测与动态优选
+        row_speedtest = QHBoxLayout()
+        r_st_text = QVBoxLayout()
+        r_st_text.setSpacing(2)
+        lbl_st_title = QLabel("CDN 节点全网深度探测与动态优选")
+        lbl_st_title.setProperty("class", "ItemTitle")
+        self.lbl_st_desc = QLabel("随时手动发起全网并发测速，自动选举响应最快节点并无缝重载 Nginx 负载均衡")
+        self.lbl_st_desc.setProperty("class", "ItemDesc")
+        r_st_text.addWidget(lbl_st_title)
+        r_st_text.addWidget(self.lbl_st_desc)
+        row_speedtest.addLayout(r_st_text)
+        row_speedtest.addStretch()
+
+        self.btn_manual_speedtest = QPushButton("全网测速并优选节点")
+        self.btn_manual_speedtest.setProperty("class", "MDBtnPrimary")
+        self.btn_manual_speedtest.clicked.connect(self.start_manual_cdn_speedtest)
+        row_speedtest.addWidget(self.btn_manual_speedtest)
+        m_layout.addLayout(row_speedtest)
+
+        layout.addWidget(mode_card)
 
         # ==================== 卡片 4: 系统根证书与本地存储管理 ====================
         cert_card = QFrame()
@@ -1661,7 +1807,8 @@ class MainWindow(QMainWindow):
             cert_mgr.install_cert()
 
         cfg = load_config()
-        services = cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES)
+        saved_services = cfg.get("enabled_services") or []
+        services = list(dict.fromkeys(saved_services + DEFAULT_ENABLED_SERVICES))
         h_ok, h_msg = hosts_mgr.apply_rules(services)
         if not h_ok:
             if not self._has_prompted_hosts_perm:
@@ -1693,14 +1840,20 @@ class MainWindow(QMainWindow):
                 self.tray.showMessage("Nginx 启动提示", n_msg, QSystemTrayIcon.Warning, 2500)
             return
 
+        # 同步启动 L4 Relay 与持续健康巡检
+        relay_server.start()
+        health_monitor.start(services)
+
         if show_toast_on_fail:
-            show_toast(self, "加速服务已启动，18 项服务规则已生效！", toast_type="success", duration=2500)
+            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！", toast_type="success", duration=2500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
 
     def stop_acceleration(self):
         self._is_manually_stopped = True
+        health_monitor.stop()
+        relay_server.stop()
         hosts_mgr.remove_rules()
         nginx_mgr.stop()
         show_toast(self, "加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
@@ -1710,6 +1863,121 @@ class MainWindow(QMainWindow):
         update_config_key("auto_proxy", checked)
         state_str = "开启" if checked else "关闭"
         show_toast(self, f"自动托管代理已{state_str}", toast_type="info", duration=2000)
+
+    def refresh_env_diagnostics_ui(self):
+        """刷新并展示系统网络环境与第三方代理诊断信息"""
+        try:
+            diag = EnvDetector.get_full_diagnostics()
+            sys_p = diag["system_proxy"]
+            if sys_p.get("enabled", False):
+                self.lbl_env_sys_proxy.setText(f"系统代理: 已开启 ({sys_p.get('server', '')})")
+                self.lbl_env_sys_proxy.setStyleSheet("color: #60A5FA; font-weight: bold;")
+            else:
+                self.lbl_env_sys_proxy.setText("系统代理: 未开启 (直连模式)")
+                self.lbl_env_sys_proxy.setStyleSheet("color: #34D399; font-weight: bold;")
+
+            active_ports = diag.get("active_proxy_ports", [])
+            if active_ports:
+                p_str = ", ".join(f"{p['port']} ({p['desc']})" for p in active_ports)
+                self.lbl_env_ports.setText(f"本地活跃代理: {p_str}")
+            else:
+                self.lbl_env_ports.setText("本地活跃代理: 无冲突端口")
+
+            self.lbl_env_summary.setText(f"诊断结论: {diag.get('summary_text', '')}")
+        except Exception as e:
+            self.lbl_env_summary.setText(f"诊断异常: {e}")
+
+    def on_dns_mode_toggled(self, checked: bool):
+        """响应本地 DNS 模式切换"""
+        update_config_key("dns_mode_enabled", checked)
+        if checked:
+            ok, msg = local_dns_server.start()
+            show_toast(self, msg, toast_type="success" if ok else "error", duration=2500)
+        else:
+            local_dns_server.stop()
+            show_toast(self, "本地 DNS 服务已停止", toast_type="info", duration=2000)
+
+    def on_health_heal_toggled(self, checked: bool):
+        """响应持续健康巡检与故障自愈切换"""
+        update_config_key("health_heal_enabled", checked)
+        if checked:
+            services = list(dict.fromkeys(load_config().get("enabled_services", []) + DEFAULT_ENABLED_SERVICES))
+            health_monitor.start(services)
+            show_toast(self, "CDN 持续健康巡检与故障自愈已开启", toast_type="success", duration=2000)
+        else:
+            health_monitor.stop()
+            show_toast(self, "CDN 持续健康巡检已关闭", toast_type="info", duration=2000)
+
+    def optimize_git_config_action(self):
+        """一键优化 Windows Git 命令行网络与大文件传输配置"""
+        import shutil
+        git_exe = shutil.which("git")
+        if not git_exe:
+            show_toast(self, "未检测到系统安装的 Git 命令行工具", toast_type="warning", duration=3000)
+            return
+
+        cmds = [
+            ["git", "config", "--global", "http.postBuffer", "524288000"],
+            ["git", "config", "--global", "http.lowSpeedLimit", "0"],
+            ["git", "config", "--global", "http.lowSpeedTime", "999999"],
+            ["git", "config", "--global", "http.version", "HTTP/1.1"],
+            ["git", "config", "--global", "core.compression", "0"],
+        ]
+        success_count = 0
+        for cmd in cmds:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3, **get_silent_startup_kwargs())
+                if proc.returncode == 0:
+                    success_count += 1
+            except Exception:
+                pass
+
+        if success_count >= 3:
+            show_toast(self, "Git 传输配置优化成功！(postBuffer=500MB, 低速超时已解除)", toast_type="success", duration=3500)
+        else:
+            show_toast(self, "Git 配置执行完成", toast_type="info", duration=2500)
+
+    def start_manual_cdn_speedtest(self):
+        """手动发起全网 CDN 节点深度测速并自动优选"""
+        if self.cdn_worker and self.cdn_worker.isRunning():
+            show_toast(self, "正在测速中，请稍候...", toast_type="info", duration=2000)
+            return
+
+        self.btn_manual_speedtest.setEnabled(False)
+        self.btn_manual_speedtest.setText("正在测速优选中...")
+        if hasattr(self, "lbl_st_desc"):
+            self.lbl_st_desc.setText("正在并发探测 20 项服务全量 Anycast 候选节点...")
+
+        show_toast(self, "开始全网并发探测 20 项服务 CDN 节点...", toast_type="info", duration=2500)
+
+        self.cdn_worker = CDNTestWorker()
+        self.cdn_worker.finished.connect(self.on_manual_speedtest_finished)
+        self.cdn_worker.start()
+
+    def on_manual_speedtest_finished(self, results: Dict):
+        self.cached_cdn_results = results
+        # 同步测速结果到健康巡检 (缓存基准节点, 避免巡检时全量重测)
+        services = list(dict.fromkeys(load_config().get("enabled_services", []) + DEFAULT_ENABLED_SERVICES))
+        health_monitor.update_services(services, results)
+        self.btn_manual_speedtest.setEnabled(True)
+        self.btn_manual_speedtest.setText("全网测速并优选节点")
+        if hasattr(self, "lbl_st_desc"):
+            import time
+            self.lbl_st_desc.setText(f"上次优选时间: {time.strftime('%H:%M:%S')} | 已更新 20 项服务最优路由")
+
+        # 自动原子应用优选节点 (直连全挂回退时 msg 会携带告警, 用 warning 样式突出展示)
+        ok, msg = cdn_opt.apply_optimal(results)
+        if ok and nginx_mgr.is_running():
+            nginx_mgr.reload()
+
+        # 刷新主页面角标
+        for sid, ip_list in results.items():
+            if ip_list and sid in self.service_badges:
+                best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
+                self.service_badges[sid].set_latency(int(best_lat), is_star=True)
+
+        show_toast(self, msg if ok else f"优选失败: {msg}",
+                   toast_type="warning" if (not ok or "全部失败" in msg) else "success", duration=4000)
 
 
 def main():
