@@ -1,81 +1,155 @@
-# PixivToolkit 🧰
+# PixivToolkit
 
-现代化网络加速与 Steam 多账号快速免密切换管理工具（**PySide6 Material Design 3 原生桌面客户端**）。
+<p align="center">
+  <b>基于 PySide6 (Material Design 3) 与高性能 Nginx 的 Windows 本地网络加速与 Steam 多账号快速免密切换管理套件</b>
+</p>
 
-结合了 **Pixiv-Nginx 的极致高性能、超低内存反代架构** 与 **SteamTools (Watt Toolkit) 的多功能账号管理及智能 CDN 调度思想**，支持**系统托盘后台常驻**与**代理自动托管自愈**。
-
----
-
-## ✨ 核心特性
-
-### 1. 🎨 Material Design 3 原生桌面客户端 (PySide6)
-- **极简高质感 MD3 界面**：深色 Material 3 配色规范、动态状态圆点、发光状态指示、柔和圆角卡片。
-- **后台常驻与系统托盘 (System Tray)**：关闭窗口自动最小化到系统托盘，加速不中断；托盘右键直接支持**一键启动/停止加速**与 **Steam 账号快速秒切子菜单**。
-- **代理自动托管与看门狗自愈**：开启后，开机/启动自动应用 Hosts 并拉起 Nginx，后台看门狗每 8 秒自动检测代理健康状态并实时自愈。
-
-### 2. 🎮 Steam 快速账号管家 (Steam Account Switcher)
-- **多账号自动识别**：深度解析本地 `loginusers.vdf`，自动提取已记住的所有 Steam 账号、昵称、历史登录时间与头像。
-- **免密一键无缝切换**：主界面或托盘右键一键点击，自动安全退出当前 Steam、切换注册表与 VDF 活跃标记，并以选定账号重新拉起 Steam 客户端。
-- **个性化备注标签**：支持为账号设置备注别名（如：主号、小号、交易号、挂卡号）。
-
-### 3. 🚀 全能网络加速引擎 (Next-Gen Acceleration)
-- **Pixiv 插画与社区**：解决 Pixiv 网页端、插画大图加载缓慢或破图、APP 接口、Fanbox 赞助平台、WebSocket 等访问问题。
-- **本地图片高速磁盘缓存 (Proxy Cache)**：基于 Nginx 磁盘缓存，浏览过的插画原图二次打开秒加载。
-- **Steam 全平台加速**：解决 Steam 商店打不开、社区错误代码 118/105、个人资料与讨论区论坛打不开等问题。
-- **GitHub & HuggingFace 开发者加速**：支持加速 GitHub Web、Raw 脚本直连、Release 附件下载以及 HuggingFace 大模型权重（LFS）下载。
-
-### 4. ⚡ 智能 CDN 多线程测速与零停机优选 (Smart CDN Ping)
-- **多线程高并发探测**：对候选 IP 池并发进行毫秒级 TCP/TLS 握手测速与连通性检测。
-- **动态 Upstream 热重载**：自动筛选最优 Top N 节点并写入配置，触发 Nginx 零中断平滑热重载（`nginx -s reload`）。
-
-### 5. 🔐 证书与 Hosts 安全无残留管理
-- **Windows 根证书自检**：自动检测系统“受信任的根证书颁发机构”，支持一键静默导入与卸载。
-- **标签化原子 Hosts 读写**：采用独立标记块管理，退出时一键还原系统 Hosts，绝不破坏用户原本的 hosts 文件。
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/GUI-PySide6%20MD3-emerald.svg" alt="PySide6">
+  <img src="https://img.shields.io/badge/Proxy-Nginx-green.svg" alt="Nginx">
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License">
+</p>
 
 ---
 
-## 🖥 启动与使用方式
+## 📖 项目简介
 
-### 方式 1：直接运行已编译好的 EXE（推荐）
-直接进入发布目录双击运行：
-👉 **[`E:\PixivToolkit\dist\PixivToolkit\PixivToolkit.exe`](file:///E:/PixivToolkit/dist/PixivToolkit/PixivToolkit.exe)**
+**PixivToolkit** 是一款专为 Windows 平台打造的现代化网络加速与游戏生态辅助工具。
 
-### 方式 2：通过源码脚本运行
-- 双击运行根目录下的 **[`启动Material桌面端(双击运行).bat`](file:///E:/PixivToolkit/启动Material桌面端(双击运行).bat)**。
+通过将 **PySide6 Material Design 3 桌面交互** 与 **本地便携式 Nginx 高性能反代数据平面** 深度结合，提供透明网络加速、动态 CDN 多线程优选以及 Steam 多账号免密快速切换体验。
 
-### 方式 3：重新一键打包 EXE
-- 双击运行 **[`一键打包为EXE(双击运行).bat`](file:///E:/PixivToolkit/一键打包为EXE(双击运行).bat)**，将自动编译生成全新的 `PixivToolkit.exe`。
+### 🌟 核心特性
+
+- 🚀 **高性能透明反向代理**
+  - 内置便携式 Nginx 引擎，毫秒级响应与超低内存占用。
+  - 支持 Pixiv（插画大图、Fanbox、APP 接口）、Steam（商店、社区 118/105 修复、Akamai CDN）、GitHub（Web、Raw、Releases 附件）及 HuggingFace 等服务加速。
+  - 基于 Nginx 磁盘缓存的插画本地极速二次加载。
+
+- ⚡ **智能 CDN 节点测速与平滑热重载**
+  - 多线程高并发 TCP / TLS 握手连通性与延迟测速。
+  - 自动优选最优节点并动态写入 Upstream 配置，支持零停机热重载 (`nginx -s reload`)。
+
+- 🎮 **Steam 账号快速免密秒切**
+  - 自动解析本地 `loginusers.vdf`，直观展示已记住账号、昵称、历史登录时间及头像。
+  - 主界面与系统托盘右键菜单支持一键免密安全秒切。
+  - 支持自定义账号备注标签（如：主号、小号、交易号）。
+
+- 🎨 **Material Design 3 沉浸式桌面客户端**
+  - 深度集成深浅色主题切换与流畅过渡动画。
+  - 支持无边框沉浸式窗口与 Windows 11 Snap Layouts 贴靠对齐。
+  - 完善的系统托盘后台常驻、流量与请求实时监控波形图。
+  - 8 秒看门狗守护机制，保障代理链路稳定与异常自动自愈。
+
+- 🔐 **安全原子管理与零残留**
+  - 标签化独立 Hosts 规则块管理，退出时一键完整还原，不污染系统原有 Hosts。
+  - 自签 Universal Root CA 根证书自检，支持一键静默安全导入与卸载。
+
+---
+
+## 🛠️ 技术架构
+
+```
+[ 用户应用 / 浏览器 / Steam ]
+             │ (Hosts 解析定向到 127.0.0.1)
+             ▼
+    [ Nginx 本地反代数据平面 (Port: 80 / 443) ]
+             │
+             ├──► 磁盘高速图片缓存 (cache/img)
+             └──► 动态优选 Upstream 负载均衡池
+                      │ (TCP / TLS 直连)
+                      ▼
+            [ 目标海外 CDN / 官方服务器 ]
+
+    [ PySide6 客户端管理控制平面 ]
+      ├── Hosts 原子注入与无损还原
+      ├── SSL 根证书自检与静默管理
+      ├── 多线程高并发 CDN 延迟探测 (Smart CDN Ping)
+      └── Steam VDF 解析与多账号免密调度
+```
+
+---
+
+## 🚀 快速开始
+
+### 运行环境要求
+- **操作系统**：Windows 10 / Windows 11 (x64)
+- **Python 环境**（仅源码运行需）：Python 3.10+
+- **系统权限**：管理员权限（用于写入 Hosts 及安装自签加速证书）
+
+### 方式一：运行已编译的独立客户端（推荐）
+直接运行发布目录中的可执行程序（已内嵌所有依赖与管理员清单）：
+```
+dist/PixivToolkit/PixivToolkit.exe
+```
+
+### 方式二：从源码运行
+
+1. **安装依赖**
+   ```bash
+   pip install PySide6 PyInstaller
+   ```
+
+2. **启动桌面客户端**
+   - 双击根目录下的 `启动Material桌面端(双击运行).bat` 或执行命令：
+   ```bash
+   python app/pyside_app.py
+   ```
+
+---
+
+## 📦 编译与打包
+
+项目提供了自动化构建脚本，支持一键打包为附带 UAC 管理员权限清单的独立绿色客户端：
+
+- 双击运行根目录下的 `一键打包为EXE(双击运行).bat`，或执行命令：
+  ```bash
+  python build.py
+  ```
+- 构建产物将生成至 `dist/PixivToolkit/` 目录。
 
 ---
 
 ## 📂 项目结构
 
 ```
-E:\PixivToolkit\
-├── dist\
-│   └── PixivToolkit\
-│       ├── PixivToolkit.exe # 独立 Windows 桌面可执行文件
-│       └── nginx\           # 内置便携 Nginx 数据平面
-├── app\                     # Python 核心引擎与 PySide6 客户端
-│   ├── pyside_app.py        # PySide6 Material 桌面主程序 (托盘/看门狗/界面)
-│   ├── material_theme.py    # Material Design 3 QSS 样式系统
-│   ├── steam_manager.py     # Steam 路径检测、VDF解析、多账号管理与一键免密切换
-│   ├── nginx_manager.py     # Nginx 进程托管、状态检测、80/443端口冲突排查
-│   ├── cert_manager.py      # Windows 系统根证书自检与静默安装/卸载
-│   ├── hosts_manager.py     # 标签化安全 Hosts 读写、无损备份、还原与 DNS 刷新
-│   ├── cdn_optimizer.py     # 智能多线程 TCP/TLS 延迟测速、动态 Upstream 生成与热重载
-│   ├── config_store.py      # 用户偏好、服务勾选与账号别名数据持久化
-│   ├── ip_pool.py           # Pixiv/Steam/GitHub/HuggingFace 候选 CDN 节点 IP 池
-│   └── main.py              # 本地 REST API 核心
-├── nginx\                   # Nginx 高性能数据平面
+PixivToolkit/
+├── app/                     # Python 核心控制平面与 PySide6 客户端
+│   ├── pyside_app.py        # 客户端主程序入口 (UI / 系统托盘 / 看门狗)
+│   ├── material_theme.py    # Material Design 3 样式规范与主题管理
+│   ├── md_widgets.py        # 自定义 Material 风格控件与动态图表
+│   ├── steam_manager.py     # Steam 路径检测、VDF 解析与账号免密秒切
+│   ├── nginx_manager.py     # Nginx 进程生命周期、端口与热重载管理
+│   ├── cdn_optimizer.py     # 智能多线程 TCP/TLS 测速与动态 Upstream 生成
+│   ├── cert_manager.py      # Windows 系统根证书自检与安全管理
+│   ├── hosts_manager.py     # 标签化安全 Hosts 原子读写与 DNS 刷新
+│   ├── config_store.py      # 配置持久化存储与原子灾备
+│   ├── ip_pool.py           # 候选加速服务与 CDN 节点 IP 池
+│   ├── frameless_helper.py  # Win32 DWM 原生无边框贴靠支持
+│   ├── svg_icons.py         # 矢量 SVG 图标资源
+│   └── win_utils.py         # Windows 底层 API 与静默执行封装
+├── nginx/                   # Nginx 高性能反代数据平面
 │   ├── nginx.exe            # 核心代理引擎
-│   ├── ca\                  # 自签根证书与私钥
-│   └── conf\                # Nginx 配置与动态 Upstream
-├── web\                     # Web 前端资源
-├── scripts\                 # 辅助批处理脚本 (UTF-8 with BOM)
-├── 启动Material桌面端(双击运行).bat  # 原生桌面客户端入口 (UTF-8 with BOM)
-├── 一键打包为EXE(双击运行).bat       # 一键打包编译脚本 (UTF-8 with BOM)
-├── build.py                 # PyInstaller 编译构建程序
-├── test_suite.py            # 全自动化集成测试套件
-└── README.md                # 项目详细说明文档
+│   ├── ca/                  # 自签加速根证书与私钥
+│   └── conf/                # Nginx 主配置与各生态分站规则
+├── scripts/                 # 辅助维护批处理脚本
+├── build.py                 # PyInstaller 一键编译打包程序
+├── test_suite.py            # 自动化集成测试套件
+├── .gitignore               # Git 忽略规则
+└── README.md                # 项目文档
 ```
+
+---
+
+## ⚠️ 注意事项
+
+1. **端口冲突排查**：本工具需要占用本地 `80` 和 `443` 端口作为反向代理网关。若被 IIS、Skype、VMware 等服务占用，请先释放对应端口。
+2. **安全与 Hosts 还原**：程序退出时会自动安全清理注入的 Hosts 规则；若遭遇异常断电，下次启动客户端将自动检测并自愈还原。
+3. **Steam 令牌安全**：Steam 快速切换功能仅通过官方支持的本地记住凭据 (`loginusers.vdf`) 与注册表切换活跃状态，不会收集或上传任何用户密码与令牌信息。
+
+---
+
+## 📄 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
