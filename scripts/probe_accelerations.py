@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 全加速项实机真实连通性与反代可用性深度探测脚本 (纯文本安全版)
+PixivToolkit - 全加速项实机真实连通性与反代可用性探测脚本 (纯文本安全版)
 """
 
 import sys
@@ -66,7 +66,7 @@ def test_service_proxy_capability(item: dict) -> dict:
         "http_status": None,
         "best_ip": None,
         "recommended_method": "不可用",
-        "verdict_level": 0, # 2: 完美, 1: 良好, 0: 不可用
+        "verdict_level": 0, # 2: 直连可用, 1: 需策略, 0: 不可用
         "verdict": "[FAIL] 不可用"
     }
 
@@ -148,11 +148,11 @@ def test_service_proxy_capability(item: dict) -> dict:
     # 5. 综合评判
     if empty_sni_success and (http_status in [200, 301, 302, 307, 403, 404] if http_status else True):
         res["verdict_level"] = 2
-        res["verdict"] = "[PASS-PERFECT] 完美可用(空SNI纯反代)"
+        res["verdict"] = "[PASS-PERFECT] 直连可用(空SNI纯反代)"
         res["recommended_method"] = "清空SNI + IP优选"
     elif standard_sni_success and http_status:
         res["verdict_level"] = 2
-        res["verdict"] = "[PASS-STABLE] 稳定可用(标准SNI直连)"
+        res["verdict"] = "[PASS-STABLE] 标准SNI直连可用"
         res["recommended_method"] = "标准SNI直连反代"
     elif empty_sni_success:
         res["verdict_level"] = 1

@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 原生自绘高级现代控件库
+PixivToolkit - Material Design 3 自绘控件库
 包含:
-1. TitleBar: 沉浸式无边框标题栏组件 (Win11 Snap 联动、状态胶囊、三联窗口控制按钮)
-2. ToastManager / ToastNotification: 全局悬浮非侵入式通知系统 (Success/Info/Warning/Error)
-3. InlineEditableLabel: 原位无感内联编辑组件 (Steam 备注点击/双击原地编辑)
-4. MDSwitch: 平滑阻尼动效、涟漪光晕与物理按压缩放 MD3 现代开关
-5. TrafficMonitorChart: 单调三次样条平滑实时网络速率监控波形图 (抗过冲、双层发光流光)
-6. LatencyBadge: 动态毫秒延迟微徽章与优选星标
-7. SkeletonCard: CDN 测速流光骨架屏占位卡片
+1. TitleBar: 无边框标题栏组件 (Win11 Snap 联动、状态胶囊、三联窗口控制按钮)
+2. ToastManager / ToastNotification: 全局悬浮非阻塞通知系统 (Success/Info/Warning/Error)
+3. InlineEditableLabel: 原位内联编辑组件 (Steam 备注点击/双击原地编辑)
+4. MDSwitch: 阻尼动效、按压缩放的 MD3 开关
+5. TrafficMonitorChart: 单调三次样条平滑实时网络速率监控波形图 (抗过冲)
+6. LatencyBadge: 动态延迟微徽章与优选星标
+7. SkeletonCard: CDN 测速骨架屏占位卡片
 """
 
 import time
@@ -182,11 +182,11 @@ class AnimatedStackedWidget(QStackedWidget):
         self._anim.start()
 
 
-# 1. 沉浸式自定义标题栏 (TitleBar)
+# 1. 自定义标题栏 (TitleBar)
 # ==============================================================================
 class TitleBar(QFrame):
     """
-    MD3 沉浸式无边框标题栏
+    MD3 无边框标题栏
     高度 38px，包含品牌 Logo、大标题、版本 Pill、状态胶囊与三联窗口按钮
     """
     def __init__(self, parent=None):
@@ -298,7 +298,7 @@ class TitleBar(QFrame):
         self.icon_label.setPixmap(pixmap)
 
     def update_status(self, is_running: bool, text: str = None):
-        """更新标题栏状态胶囊 (极简微光无粗厚边框)"""
+        """更新标题栏状态胶囊"""
         is_dark = ThemeManager.get_instance().is_dark
         if is_running:
             msg = text if text else "● 代理加速中"
@@ -596,7 +596,7 @@ class ToastManager(QObject):
         :param message: 通知文本内容
         :param toast_type: 'success' | 'info' | 'warning' | 'error'
         :param duration: 自动消失毫秒数 (默认 3000ms)
-        :param action_text: 内联动作按钮文字 (如 '[🛡️ 一键提权]')
+        :param action_text: 内联动作按钮文字 (如 '[🛡️ 提权]')
         :param on_action: 动作回调函数
         """
         if not parent:
@@ -667,7 +667,7 @@ def show_toast(parent: QWidget, message: str, toast_type: str = "info",
 # ==============================================================================
 class InlineEditableLabel(QWidget):
     """
-    原位无缝内联编辑组件
+    原位内联编辑组件
     常规态：显示当前别名徽章或 '+ 备注' (带微铅笔 ✏️)
     激活态：单击/双击原地切换为 QLineEdit，回车保存，Esc取消，失去焦点自动保存
     """
@@ -812,8 +812,8 @@ class InlineEditableLabel(QWidget):
 # ==============================================================================
 class MDSwitch(QAbstractButton):
     """
-    Material Design 3 标准高质感动画开关
-    具备阻尼微动效、状态色彩平滑插值、按压缩放与涟漪光晕
+    Material Design 3 标准动画开关
+    具备阻尼微动效、状态色彩平滑插值、按压缩放
     """
     def __init__(self, parent=None, checked=False):
         super().__init__(parent)
@@ -982,7 +982,7 @@ class MDSwitch(QAbstractButton):
 class TrafficMonitorChart(QWidget):
     """
     实时网络监控波形图
-    采用单调三次样条 (Monotone Spline) 平滑算法，消除折线突变与过冲，渲染双层渐变流光
+    采用单调三次样条 (Monotone Spline) 平滑算法，消除折线突变与过冲
     """
     def __init__(self, parent=None, max_points: int = 30):
         super().__init__(parent)
@@ -1105,7 +1105,7 @@ class TrafficMonitorChart(QWidget):
             min_y_down = min(min_y_down, y)
             points_down.append(QPointF(x, y))
 
-        # 4. 绘制上传曲线与自适应渐变流光 (Pixiv 柔和电光蓝)
+        # 4. 绘制上传曲线与渐变填充 (Pixiv 蓝)
         if len(points_up) >= 2:
             path_up = self._build_smooth_path(points_up)
             fill_up = QPainterPath(path_up)
@@ -1130,7 +1130,7 @@ class TrafficMonitorChart(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path_up)
 
-        # 5. 绘制下载曲线与自适应渐变流光 (极客薄荷翡翠绿)
+        # 5. 绘制下载曲线与渐变填充 (绿色)
         if len(points_down) >= 2:
             path_down = self._build_smooth_path(points_down)
             fill_down = QPainterPath(path_down)
@@ -1181,7 +1181,7 @@ class TrafficMonitorChart(QWidget):
 # 6. 延迟微徽章 (LatencyBadge)
 # ==============================================================================
 class LatencyBadge(QWidget):
-    """动态毫秒延迟微徽章控件"""
+    """动态延迟微徽章控件"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.latency_ms = -1
@@ -1257,12 +1257,12 @@ class LatencyBadge(QWidget):
 
 
 # ==============================================================================
-# 7. CDN 测速流光骨架屏卡片 (SkeletonCard)
+# 7. CDN 测速骨架屏卡片 (SkeletonCard)
 # ==============================================================================
 class SkeletonCard(QFrame):
     """
-    流光骨架屏占位卡片
-    在测速或异步加载过程中提供丝滑的渐变流动微动效
+    骨架屏占位卡片
+    在测速或异步加载过程中提供渐变流动动效
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1302,7 +1302,7 @@ class SkeletonCard(QFrame):
         painter.setBrush(QBrush(QColor("#141A28") if is_dark else QColor("#F8FAFC")))
         painter.drawRoundedRect(QRectF(0, 0, w, h), 12, 12)
 
-        # 流光扫掠渐变
+        # 扫掠渐变
         grad = QLinearGradient(0, 0, w, 0)
         p0 = max(0.0, min(1.0, self._offset - 0.4))
         p1 = max(0.0, min(1.0, self._offset))

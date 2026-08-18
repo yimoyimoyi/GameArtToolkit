@@ -5,8 +5,8 @@ PixivToolkit - 全面自动化回归验证与针对性测试脚本
 1. Nginx 语法预检与 Upstream 对齐测试
 2. CryptoAPI 原生证书检测与防误判测试
 3. VDF 词法解析与序列化幂等性测试
-4. Hosts 原子写入、只读自愈与无损剥离测试
-5. CDN 测速引擎单池任务调度与 Upstream 容灾生成测试
+4. Hosts 原子写入、只读修复与无损剥离测试
+5. CDN 测速引擎单池任务调度与 Upstream 兜底生成测试
 6. 批处理脚本 UTF-8 with BOM 编码全量校验
 """
 
@@ -20,8 +20,14 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
+# 设置输出流为 UTF-8 编码，防止 Windows 终端字符编码问题
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 将 app 目录加入 Python 搜索路径
-WORKSPACE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = WORKSPACE_DIR / "app"
 sys.path.insert(0, str(APP_DIR))
 
@@ -73,12 +79,12 @@ class RegressionTestSuite:
         defined_upstreams = set(re.findall(r"upstream\s+([a-zA-Z0-9_-]+)\s*\{", dynamic_upstream_conf))
         self.log_sub(f"upstream-dynamic.conf 中解析到 {len(defined_upstreams)} 个负载均衡组")
 
-        # 校验 28 项全量服务是否全部在 upstream-dynamic.conf 中定义
+        # 校验 18 项服务是否全部在 upstream-dynamic.conf 中定义
         for srv in SERVICES_LIST:
             srv_id = srv["id"]
             expected_upstream = f"upstream_{srv_id}"
             assert expected_upstream in defined_upstreams, f"服务 {srv_id} 对应的 {expected_upstream} 未在 upstream-dynamic.conf 中定义"
-        self.log_sub("28 项加速服务在 upstream-dynamic.conf 中全部具备匹配的 upstream 定义")
+        self.log_sub("18 项加速服务在 upstream-dynamic.conf 中全部具备匹配的 upstream 定义")
 
         # 检查 site-acg.conf, site-gaming.conf, site-dev.conf 中引用的 upstream
         site_files = ["site-acg.conf", "site-gaming.conf", "site-dev.conf"]
@@ -224,7 +230,7 @@ class RegressionTestSuite:
     # 4. Hosts 原子写入、只读解除与标记块无损剥离测试
     # =========================================================================
     def test_hosts_atomic_and_readonly_healing(self):
-        self.log_section("4. Hosts 原子写入、只读自愈与无损剥离测试")
+        self.log_section("4. Hosts 原子写入、只读修复与无损剥离测试")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             dummy_hosts = Path(temp_dir) / "hosts"
@@ -245,11 +251,11 @@ class RegressionTestSuite:
 
             hm = HostsManager(hosts_file=dummy_hosts)
 
-            # 4.3 执行规则注入 (测试只读自愈与原子写入)
+            # 4.3 执行规则注入 (测试只读修复与原子写入)
             ok, msg = hm.apply_rules(enabled_services=["pixiv_web", "steam_store"])
             assert ok is True, f"规则注入失败: {msg}"
             assert dummy_hosts.exists(), "注入后 hosts 文件丢失"
-            self.log_sub(f"只读文件自愈写入成功: {msg}")
+            self.log_sub(f"只读文件修复写入成功: {msg}")
 
             # 4.4 检查内容：用户原有规则必须完整保留，且包含 PixivToolkit 标记块
             injected_text = dummy_hosts.read_text(encoding="utf-8")
@@ -289,10 +295,10 @@ class RegressionTestSuite:
         self.results["hosts_atomic_and_healing"] = True
 
     # =========================================================================
-    # 5. CDN 测速引擎单池任务调度与 upstream 容灾生成测试
+    # 5. CDN 测速引擎单池任务调度与 upstream 兜底生成测试
     # =========================================================================
     def test_cdn_optimizer_scheduling_and_upstream_generation(self):
-        self.log_section("5. CDN 测速引擎单池任务调度与 Upstream 容灾生成测试")
+        self.log_section("5. CDN 测速引擎单池任务调度与 Upstream 兜底生成测试")
         copt = CDNOptimizer()
 
         # 5.1 验证单池全量服务测速调度 (扁平化任务流，防止线程池嵌套)
@@ -307,7 +313,7 @@ class RegressionTestSuite:
         assert all("ip" in item and "latency" in item and "available" in item for item in steam_res)
         self.log_sub(f"单组测速测试完成: {len(steam_res)} 个节点已测速并按可用性与延迟排序")
 
-        # 5.2 测试全量 28 项服务的动态 Upstream 配置生成
+        # 5.2 测试 18 项服务的动态 Upstream 配置生成
         # 构造包含主备节点的丰富模拟测速数据
         mock_results: Dict[str, List[Dict]] = {}
         for srv_id, ips in CANDIDATE_IPS.items():
@@ -328,9 +334,9 @@ class RegressionTestSuite:
 
         assert "backup " in conf_text, "具备 >2 节点时应生成 backup 指令"
 
-        self.log_sub("28 项服务全量 Upstream 配置生成格式与 Nginx 指令完全兼容")
+        self.log_sub("18 项服务 Upstream 配置生成格式与 Nginx 指令兼容")
 
-        # 5.3 容灾测试：当某服务所有 IP 全军覆没时，保证 fallback 不生成空 upstream 导致 Nginx 崩溃
+        # 5.3 兜底测试：当某服务所有 IP 均不可用时，保证 fallback 不生成空 upstream 导致 Nginx 崩溃
         disaster_results = {
             "pixiv_web": [
                 {"ip": "210.140.139.151", "latency": -1, "available": False},
@@ -340,7 +346,7 @@ class RegressionTestSuite:
         disaster_conf = copt.generate_upstream_conf(disaster_results)
         assert "upstream upstream_pixiv_web {" in disaster_conf
         assert "server 210.140.139.151:443" in disaster_conf, "全挂灾难场景下未触发默认候选节点兜底"
-        self.log_sub("全节点不可用灾难场景容灾兜底测试通过 (保证 Nginx 语法永不报错)")
+        self.log_sub("全节点不可用场景兜底测试通过 (保证 Nginx 语法不报错)")
 
         self.results["cdn_optimizer_and_upstream"] = True
 

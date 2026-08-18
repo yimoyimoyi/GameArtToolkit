@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Steam 快速账号切换管理引擎 (健壮词法解析与原子灾备版)
+PixivToolkit - Steam 快速账号切换管理引擎 (词法解析与原子备份)
 """
 
 import os
@@ -201,7 +201,7 @@ class SteamManager:
         return self.steam_exe is not None and self.steam_exe.exists()
 
     def is_steam_running(self) -> bool:
-        """检查 Steam 是否在运行 (毫秒级)"""
+        """检查 Steam 是否在运行"""
         return is_process_running("steam.exe")
 
     def close_steam(self, timeout: float = 6.0) -> bool:
@@ -339,7 +339,7 @@ class SteamManager:
         update_config_key("steam_account_aliases", aliases)
 
     def switch_account(self, steamid: str, restart_steam: bool = True) -> Tuple[bool, str]:
-        """一键免密切换 Steam 账号并安全重启客户端"""
+        """免密切换 Steam 账号并安全重启客户端"""
         if not self.steam_path or not self.steam_exe:
             return False, "未检测到 Steam 安装路径，请确认 Steam 是否已安装。"
 

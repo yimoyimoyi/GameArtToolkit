@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 全景调色板与高级原生桌面 QSS 样式系统
+PixivToolkit - Material Design 3 调色板与桌面 QSS 样式系统
 提供:
-1. 完整的 MD3 Tonal Elevation 层级色彩常量与语义定义
-2. 沉浸式无边框标题栏 (TitleBar) 与 Windows 窗口控制按钮规范
-3. 悬浮非侵入式通知 (MD3 Toast / Snackbar) 视觉容器
+1. MD3 Tonal Elevation 层级色彩常量与语义定义
+2. 无边框标题栏 (TitleBar) 与 Windows 窗口控制按钮规范
+3. 悬浮非阻塞通知 (MD3 Toast / Snackbar) 视觉容器
 4. 原位编辑 (Inline Edit) 与微徽章样式
-5. 富空态 (Rich Empty State) 与流光骨架屏 (Skeleton Screen) 样式
+5. 空态 (Empty State) 与骨架屏 (Skeleton Screen) 样式
 6. 阶梯式 8dp 网格与圆角系统规范
 """
 
@@ -77,7 +77,7 @@ QToolTip {
 }
 
 /* ==========================================================================
-   沉浸式无边框标题栏 (TitleBar)
+   无边框标题栏 (TitleBar)
    ========================================================================== */
 QFrame#TitleBar {
     background-color: #0C101A;
@@ -460,7 +460,7 @@ QPushButton[class="ToastCloseBtn"]:hover {
 }
 
 /* ==========================================================================
-   富空态卡片 (Rich Empty State) 与骨架屏
+   空态卡片 (Empty State) 与骨架屏
    ========================================================================== */
 QFrame[class="EmptyStateCard"] {
     background-color: #141A28;
@@ -744,7 +744,7 @@ QToolTip {
 }
 
 /* ==========================================================================
-   沉浸式无边框标题栏 (TitleBar)
+   无边框标题栏 (TitleBar)
    ========================================================================== */
 QFrame#TitleBar {
     background-color: #F8FAFC;
@@ -1127,7 +1127,7 @@ QPushButton[class="ToastCloseBtn"]:hover {
 }
 
 /* ==========================================================================
-   富空态卡片 (Rich Empty State) 与骨架屏
+   空态卡片 (Empty State) 与骨架屏
    ========================================================================== */
 QFrame[class="EmptyStateCard"] {
     background-color: #FFFFFF;

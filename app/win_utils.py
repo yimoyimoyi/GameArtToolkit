@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Windows 原生高性能 API 工具集 (毫秒级无损进程与端口探测)
+PixivToolkit - Windows 原生 API 工具集 (进程与端口探测)
 """
 
 import socket
@@ -47,7 +47,7 @@ def is_process_running(proc_name: str) -> bool:
     return found
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
-    """使用原生 Socket 极速探测端口是否被监听 (耗时 < 0.1ms)"""
+    """使用 Socket 探测端口是否被监听"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.05)
         return s.connect_ex((host, port)) == 0
@@ -98,7 +98,7 @@ def get_silent_startup_kwargs() -> dict:
     return {}
 
 def hide_console_window():
-    """如果在 Windows 控制台下被拉起，毫秒级静默隐藏黑框控制台"""
+    """如果在 Windows 控制台下被拉起，静默隐藏控制台窗口"""
     import sys
     if sys.platform == "win32":
         try:
@@ -110,7 +110,7 @@ def hide_console_window():
             pass
 
 def flush_dns_native() -> bool:
-    """调用 Windows 原生 DnsFlushResolverCache 极速刷新 DNS 缓存 (< 0.1ms，零子进程开销)"""
+    """调用 Windows 原生 DnsFlushResolverCache 刷新 DNS 缓存 (不启动子进程)"""
     try:
         dnsapi = ctypes.windll.dnsapi
         return dnsapi.DnsFlushResolverCache() != 0
@@ -196,11 +196,11 @@ def register_shutdown_handler(callback) -> bool:
             return False
     return True
 
-# ==================== 原生毫秒级进程终止与代理探测 ====================
+# ==================== 原生进程终止与代理探测 ====================
 PROCESS_TERMINATE = 0x0001
 
 def fast_terminate_pid(pid: int) -> bool:
-    """使用 Win32 OpenProcess + TerminateProcess 毫秒级直接杀死进程 (<0.5ms，零子进程开销)"""
+    """使用 Win32 OpenProcess + TerminateProcess 直接终止进程 (不启动子进程)"""
     if pid <= 0:
         return False
     try:
@@ -216,7 +216,7 @@ def fast_terminate_pid(pid: int) -> bool:
     return False
 
 def check_proxy_alive(host: str = "127.0.0.1", port: int = 7897, timeout: float = 0.5) -> bool:
-    """毫秒级极速测试上游测速代理是否处于监听连通状态"""
+    """测试上游测速代理是否处于监听连通状态"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)

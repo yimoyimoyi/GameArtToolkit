@@ -32,7 +32,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # 设置 Qt 平台为 offscreen 保证在无显示器/CI/命令行自动化环境下 100% 稳定运行
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-WORKSPACE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = WORKSPACE_DIR / "app"
 sys.path.insert(0, str(APP_DIR))
 
@@ -137,7 +137,7 @@ def run_full_verification():
     # =========================================================================
     # 2. 交互收敛与弹窗清零验证 (Zero-Modal AST Code Inspection)
     # =========================================================================
-    report.print_section("第 2 部分：交互收敛与弹窗彻底清零验证 (Zero-Modal AST Compliance)")
+    report.print_section("第 2 部分：交互收敛与无模态弹窗验证 (Zero-Modal AST Compliance)")
 
     banned_symbols = {"QMessageBox", "QInputDialog", "messagebox"}
     all_violations = []
@@ -225,7 +225,7 @@ def run_full_verification():
     # 测试带有 Action 动作按钮的回调
     toast_with_action = ToastNotification(
         test_win, "需要提权", toast_type="warning",
-        duration=3000, action_text="[🛡️ 一键提权]", on_action=sample_action
+        duration=3000, action_text="[🛡️ 提权]", on_action=sample_action
     )
     report.assert_true(hasattr(toast_with_action, "action_btn"), "带有 action_text 时成功生成动作按钮")
     toast_with_action._handle_action()
@@ -292,13 +292,13 @@ def run_full_verification():
     report.assert_equal(len(clicked_steamid), 1, "双击卡片成功发射 1 次 double_clicked 信号")
     report.assert_equal(clicked_steamid[0], "76561198966320302", "double_clicked 发射的 SteamID 完全吻合")
 
-    # 3.6 实例化 SkeletonCard (流光骨架屏)
+    # 3.6 实例化 SkeletonCard (骨架屏)
     skeleton = SkeletonCard(test_win)
     report.assert_true(skeleton is not None, "SkeletonCard 实例化成功")
     report.assert_true(skeleton.timer.isActive(), "SkeletonCard 骨架流动定时器已启动")
     initial_offset = skeleton._offset
     skeleton._step_animation()
-    report.assert_true(skeleton._offset != initial_offset, "SkeletonCard 流光动画帧步进正常")
+    report.assert_true(skeleton._offset != initial_offset, "SkeletonCard 动画帧步进正常")
 
     # 3.7 实例化 TrafficMonitorChart 并测试单调样条平滑算法与极值鲁棒性
     chart = TrafficMonitorChart(test_win, max_points=20)

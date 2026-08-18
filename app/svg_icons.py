@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 原生 SVG 矢量图标引擎
-内置全部高精度矢量 SVG 路径，支持动态着色与 High-DPI 缩放
-彻底替代模糊、跨平台样式不一的 Emoji，提供统一的专业现代质感
+PixivToolkit - Material Design 3 SVG 矢量图标引擎
+内置矢量 SVG 路径，支持动态着色与 High-DPI 缩放
 """
 
 from PySide6.QtCore import Qt, QSize, QByteArray

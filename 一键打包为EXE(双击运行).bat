@@ -1,11 +1,11 @@
 ﻿
 @echo off
 chcp 65001 >nul
-title PixivToolkit - 一键打包为 EXE
+title PixivToolkit - 打包为 EXE
 cd /d "%~dp0"
 
 echo ========================================================
-echo   正在打包编译 PySide6 Material 桌面应用 (内置 UAC 管理员清单)...
+echo   正在打包编译 PySide6 桌面应用 (内置 UAC 管理员清单)...
 echo ========================================================
 python build.py
 echo.

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 标签化安全 Hosts 管理引擎 (原子替换与只读自愈版)
+PixivToolkit - 标签化 Hosts 管理引擎 (原子替换与只读自动修复)
 """
 
 import os
@@ -64,8 +64,8 @@ class HostsManager:
         return text.rstrip() + "\n"
 
     def _safe_write_hosts(self, content: str):
-        """安全可靠写入 hosts 文件，支持 Windows 原生属性自愈与多重容灾写入机制"""
-        # 1. 创建前置灾备副本
+        """写入 hosts 文件，支持 Windows 原生属性修复与多重备份写入机制"""
+        # 1. 创建前置备份副本
         if self.hosts_file.exists() and not HOSTS_BAK_PATH.exists():
             try:
                 shutil.copy2(self.hosts_file, HOSTS_BAK_PATH)
@@ -214,7 +214,7 @@ class HostsManager:
             return False, f"清理 Hosts 异常: {e}"
 
     def fast_remove_rules(self) -> bool:
-        """专为 Windows 关机与极速退出设计的无阻塞 Hosts 清理 (<2ms，零子进程/零重试)"""
+        """为 Windows 关机与退出设计的无阻塞 Hosts 清理 (不启动子进程、不重试)"""
         if not self.hosts_file.exists():
             return True
         try:
@@ -246,7 +246,7 @@ class HostsManager:
             return False
 
     def diagnose_and_repair(self, auto_fix: bool = True) -> dict:
-        """深度自检 Hosts 状态（属性、编码、不对称标签、历史残留）并自动执行修复自愈"""
+        """检查 Hosts 状态（属性、编码、不对称标签、历史残留）并自动修复"""
         issues = []
         fixes = []
 
@@ -328,7 +328,7 @@ class HostsManager:
             details_lines.append("【检测到以下问题】:")
             details_lines.extend([f"  • {i}" for i in issues])
         if fixes:
-            details_lines.append("【已执行自愈修复】:")
+            details_lines.append("【已执行修复】:")
             details_lines.extend([f"  ✓ {f}" for f in fixes])
         if not issues:
             details_lines.append("Hosts 文件环境与权限完全正常，无任何冲突或异常残留。")
@@ -344,7 +344,7 @@ class HostsManager:
         }
 
     def restore_default_windows_hosts(self) -> Tuple[bool, str]:
-        """一键重置为 Windows 官方原生纯净 Hosts 文件 (带灾备备份)"""
+        """重置为 Windows 官方原生纯净 Hosts 文件 (带备份)"""
         template = (
             "# Copyright (c) 1993-2009 Microsoft Corp.\r\n"
             "#\r\n"
@@ -369,7 +369,7 @@ class HostsManager:
             "#\t::1             localhost\r\n"
         )
         try:
-            # 1. 强制生成时间戳灾备副本
+            # 1. 生成时间戳备份副本
             if self.hosts_file.exists():
                 import time
                 ts = int(time.time())
@@ -392,7 +392,7 @@ class HostsManager:
                 f.flush()
                 os.fsync(f.fileno())
 
-            # 4. 极速刷新 DNS 缓存
+            # 4. 刷新 DNS 缓存
             self.flush_dns()
             return True, "已成功恢复 Windows 官方原生纯净 Hosts 文件！"
         except PermissionError:
@@ -404,6 +404,6 @@ class HostsManager:
             return False, f"恢复默认 Hosts 异常: {e}"
 
     def flush_dns(self):
-        """极速刷新 Windows DNS 缓存 (<0.1ms)"""
+        """刷新 Windows DNS 缓存"""
         flush_dns_native()
 

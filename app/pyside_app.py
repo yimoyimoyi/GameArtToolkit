@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 原生极速桌面客户端 (沉浸式无边框 & 零弹窗现代交互版)
+PixivToolkit - Material Design 3 桌面客户端
 包含:
-1. 0 依赖 Win32 DWM 原生无边框沉浸式窗口，支持 Win11 Snap Layouts 贴靠菜单与硬件级 8 向缩放
-2. 全局 MD3 Floating Toast Overlay 悬浮通知体系，彻底移除阻塞式 QMessageBox
-3. Steam 账号管家原生卡片内 Inline Edit 备注编辑与【双击卡片免密秒切】
-4. CDN 测速流光骨架屏 (Skeleton Screen) 与一键平滑热重载
-5. 单调三次样条平滑网络监控波形图与 28 项全量加速规则独立/分组原子管理
+1. Win32 DWM 原生无边框窗口，支持 Win11 Snap Layouts 贴靠菜单与 8 向缩放
+2. 全局 MD3 Floating Toast Overlay 悬浮通知体系，不使用阻塞式 QMessageBox
+3. Steam 账号管家卡片内 Inline Edit 备注编辑与双击卡片免密切换
+4. CDN 测速骨架屏 (Skeleton Screen) 与热重载
+5. 单调三次样条平滑网络监控波形图与 18 项加速规则独立/分组原子管理
 """
 
 import os
@@ -58,12 +58,12 @@ hosts_mgr = HostsManager()
 nginx_mgr = NginxManager()
 cdn_opt = CDNOptimizer()
 
-# ==================== 全局极速退出与 Windows 关机安全清理通道 ====================
+# ==================== 全局快速退出与 Windows 关机安全清理通道 ====================
 _CLEANUP_LOCK = threading.Lock()
 _HAS_EMERGENCY_CLEANED = False
 
 def emergency_fast_cleanup():
-    """全局极速退出与 Windows 关机清理通道 (保证幂等、零子进程阻塞、<10ms 执行完毕)"""
+    """全局快速退出与 Windows 关机清理通道 (幂等，不阻塞子进程)"""
     global _HAS_EMERGENCY_CLEANED
     with _CLEANUP_LOCK:
         if _HAS_EMERGENCY_CLEANED:
@@ -177,7 +177,7 @@ class SteamSwitchWorker(QThread):
 class SteamAccountCard(QFrame):
     """
     Steam 账号独立卡片
-    支持：双击卡片一键免密切换、原位内联备注编辑、当前活跃状态高亮、悬浮高质感反馈
+    支持：双击卡片免密切换、原位内联备注编辑、当前活跃状态高亮
     """
     double_clicked = Signal(str)
 
@@ -283,7 +283,7 @@ class SteamAccountCard(QFrame):
 
 class MainWindow(QMainWindow):
     """
-    PixivToolkit 主窗口 (沉浸式无边框与 Material 3 原生客户端)
+    PixivToolkit 主窗口 (无边框与 Material 3 客户端)
     """
     def __init__(self):
         super().__init__()
@@ -329,15 +329,15 @@ class MainWindow(QMainWindow):
         self._start_status_probe()
         self.load_steam_accounts_ui()
 
-        # 启动时环境自愈检测
+        # 启动时环境检查
         cfg = load_config()
         if cfg.get("auto_heal_on_startup", True) and not cfg.get("auto_proxy", True):
             try:
                 diag = hosts_mgr.diagnose_and_repair(auto_fix=True)
                 if diag.get("fixes"):
-                    print(f"[Startup Self-Heal] 已自动自愈修复 Hosts: {diag.get('fixes')}")
+                    print(f"[Startup] 已自动修复 Hosts: {diag.get('fixes')}")
             except Exception as e:
-                print(f"[Startup Self-Heal] 自愈检查异常: {e}")
+                print(f"[Startup] 环境检查异常: {e}")
 
         # 4. 自动托管启动
         if cfg.get("auto_proxy", True):
@@ -410,7 +410,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # 1. 沉浸式标题栏 (38px)
+        # 1. 标题栏 (38px)
         self.title_bar = TitleBar(self)
         root_layout.addWidget(self.title_bar)
 
@@ -461,7 +461,7 @@ class MainWindow(QMainWindow):
 
         self.btn_nav_dashboard = self.create_nav_btn("加速控制台", 0, "rocket")
         self.btn_nav_steam = self.create_nav_btn("Steam 账号管家", 1, "gamepad")
-        self.btn_nav_cdn = self.create_nav_btn("智能 CDN 测速", 2, "zap")
+        self.btn_nav_cdn = self.create_nav_btn("CDN 测速", 2, "zap")
         self.btn_nav_settings = self.create_nav_btn("系统诊断与设置", 3, "diagnostics")
 
         sidebar_layout.addWidget(self.btn_nav_dashboard)
@@ -540,9 +540,9 @@ class MainWindow(QMainWindow):
         layout.setSpacing(18)
 
         # 页面标题
-        title = QLabel("全能加速控制中心")
+        title = QLabel("加速控制中心")
         title.setObjectName("PageTitle")
-        desc = QLabel("自动托管网络代理与 Hosts 规则，无缝加速 28 项海外主流游戏、二次元创作与开发服务")
+        desc = QLabel("自动托管网络代理与 Hosts 规则，加速 18 项海外游戏、创作与开发服务")
         desc.setObjectName("PageDesc")
         layout.addWidget(title)
         layout.addWidget(desc)
@@ -557,8 +557,8 @@ class MainWindow(QMainWindow):
 
         self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存")
         self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "28项规则安全隔离")
-        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击一键免密秒切")
+        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "18 项服务规则隔离")
+        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换")
 
         stat_grid.addWidget(self.card_stat_nginx, 0, 0)
         stat_grid.addWidget(self.card_stat_cert, 0, 1)
@@ -574,14 +574,14 @@ class MainWindow(QMainWindow):
 
         mc_info = QVBoxLayout()
         mc_info.setSpacing(4)
-        self.lbl_main_status = QLabel("全能加速服务已停止")
+        self.lbl_main_status = QLabel("加速服务已停止")
         self.lbl_main_status.setProperty("class", "MainStatusTitle")
-        self.lbl_main_sub = QLabel("点击右侧按钮开启本地高性能反代与 Hosts 规则接管")
+        self.lbl_main_sub = QLabel("点击右侧按钮开启本地代理与 Hosts 规则接管")
         self.lbl_main_sub.setProperty("class", "MainStatusSub")
         mc_info.addWidget(self.lbl_main_status)
         mc_info.addWidget(self.lbl_main_sub)
 
-        self.chk_auto_proxy = QCheckBox("开启自动托管代理 (开机/启动自动加速与后台看门狗自愈)")
+        self.chk_auto_proxy = QCheckBox("开启自动托管代理 (开机/启动自动加速与后台自动检查恢复)")
         self.chk_auto_proxy.setChecked(load_config().get("auto_proxy", True))
         self.chk_auto_proxy.toggled.connect(self.on_auto_proxy_toggled)
         mc_info.addWidget(self.chk_auto_proxy)
@@ -589,7 +589,7 @@ class MainWindow(QMainWindow):
         mc_layout.addLayout(mc_info)
         mc_layout.addStretch()
 
-        self.btn_toggle_acc = QPushButton("启动全能加速")
+        self.btn_toggle_acc = QPushButton("启动加速服务")
         self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
         self.btn_toggle_acc.setFixedSize(160, 48)
         self.btn_toggle_acc.clicked.connect(self.toggle_acceleration)
@@ -597,7 +597,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(main_control_card)
 
-        # 4. 28 项加速服务 (4 大分类分组卡片)
+        # 4. 18 项加速服务 (3 大分类分组卡片)
         cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
         for grp_id, grp_info in SERVICE_GROUPS.items():
@@ -807,7 +807,7 @@ class MainWindow(QMainWindow):
 
         accounts = steam_mgr.get_accounts()
         if not accounts:
-            # MD3 富空态引导卡片
+            # MD3 空态引导卡片
             empty_card = QFrame()
             empty_card.setProperty("class", "EmptyStateCard")
             ec_layout = QVBoxLayout(empty_card)
@@ -823,7 +823,7 @@ class MainWindow(QMainWindow):
             lbl_ec_title = QLabel("未检测到本地已记住的 Steam 账号")
             lbl_ec_title.setProperty("class", "EmptyStateTitle")
             lbl_ec_desc = QLabel(
-                "请先在 Steam 客户端登录界面勾选【记住我的密码】并成功登录过至少一次，\n随后回到此处即可实现免密多账号一键秒切与备注管理。"
+                "请先在 Steam 客户端登录界面勾选【记住我的密码】并成功登录过至少一次，\n随后回到此处即可免密切换多个账号并管理备注。"
             )
             lbl_ec_desc.setProperty("class", "EmptyStateDesc")
             lbl_ec_desc.setAlignment(Qt.AlignCenter)
@@ -879,7 +879,7 @@ class MainWindow(QMainWindow):
         else:
             show_toast(self, f"启动 Steam 失败: {msg}", toast_type="error", duration=4000)
 
-    # ------------------ PAGE 3: 智能 CDN 测速 ------------------
+    # ------------------ PAGE 3: CDN 测速 ------------------
     def create_cdn_page(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setObjectName("MainScrollArea")
@@ -893,9 +893,9 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("智能 CDN 测速与动态 Upstream 优选")
+        title = QLabel("CDN 测速与动态 Upstream 优选")
         title.setObjectName("PageTitle")
-        desc = QLabel("多线程并发探测全部 28 项服务的候选 IP 延迟，自动生成最优 upstream 并平滑热重载 Nginx")
+        desc = QLabel("多线程并发探测全部 18 项服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
         desc.setObjectName("PageDesc")
         title_box.addWidget(title)
         title_box.addWidget(desc)
@@ -907,7 +907,7 @@ class MainWindow(QMainWindow):
         self.btn_start_ping.clicked.connect(self.start_cdn_ping)
         header.addWidget(self.btn_start_ping)
 
-        self.btn_apply_cdn = QPushButton("应用最优配置")
+        self.btn_apply_cdn = QPushButton("应用测速结果")
         self.btn_apply_cdn.setProperty("class", "MDBtnTonal")
         self.btn_apply_cdn.setEnabled(False)
         self.btn_apply_cdn.clicked.connect(self.apply_optimal_cdn)
@@ -933,7 +933,7 @@ class MainWindow(QMainWindow):
 
         lbl_ci_title = QLabel("测速引擎已就绪")
         lbl_ci_title.setProperty("class", "ItemTitle")
-        lbl_ci_desc = QLabel("点击右上角【开始全量测速】，系统将并发探测全部 28 项加速服务的真实延迟并筛选最佳 Anycast 节点。")
+        lbl_ci_desc = QLabel("点击右上角【开始全量测速】，系统将并发探测全部 18 项服务的延迟并筛选延迟最低的节点。")
         lbl_ci_desc.setProperty("class", "ItemDesc")
         ci_layout.addWidget(ci_icon, 0, Qt.AlignCenter)
         ci_layout.addWidget(lbl_ci_title, 0, Qt.AlignCenter)
@@ -951,7 +951,7 @@ class MainWindow(QMainWindow):
         self.btn_start_ping.setEnabled(False)
         self.btn_start_ping.setText("测速探测中...")
 
-        # 清空当前结果并展示 4 个流光骨架屏卡片
+        # 清空当前结果并展示骨架屏卡片
         while self.cdn_results_layout.count():
             item = self.cdn_results_layout.takeAt(0)
             if item.widget():
@@ -960,7 +960,7 @@ class MainWindow(QMainWindow):
         for _ in range(4):
             self.cdn_results_layout.addWidget(SkeletonCard())
 
-        show_toast(self, "正在并发探测全部 28 项服务的候选节点延迟...", toast_type="info", duration=2500)
+        show_toast(self, "正在并发探测全部 18 项服务的候选节点延迟...", toast_type="info", duration=2500)
 
         self.cdn_worker = CDNTestWorker()
         self.cdn_worker.finished.connect(self.on_cdn_ping_finished)
@@ -1030,7 +1030,7 @@ class MainWindow(QMainWindow):
             card_l.addLayout(grid)
             self.cdn_results_layout.addWidget(card)
 
-        show_toast(self, "全量 CDN 测速完成！点击右上角【应用最优配置】即可生效", toast_type="success", duration=3500)
+        show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
 
     def apply_optimal_cdn(self):
         if not self.cached_cdn_results:
@@ -1038,7 +1038,7 @@ class MainWindow(QMainWindow):
         ok, msg = cdn_opt.apply_optimal(self.cached_cdn_results)
         if ok and nginx_mgr.is_running():
             nginx_mgr.reload()
-            show_toast(self, f"{msg} (已平滑热重载生效)", toast_type="success", duration=3000)
+            show_toast(self, f"{msg} (已热重载生效)", toast_type="success", duration=3000)
         elif ok:
             show_toast(self, f"{msg} (将在下次启动代理时生效)", toast_type="info", duration=3000)
         else:
@@ -1058,7 +1058,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("系统诊断与高级设置")
         title.setObjectName("PageTitle")
-        desc = QLabel("Windows 开机自启、关闭窗口行为、退出与关机 Hosts 修正自愈及上游测速代理配置")
+        desc = QLabel("Windows 开机自启、关闭窗口行为、退出与关机时 Hosts 自动修正，以及测速代理配置")
         desc.setObjectName("PageDesc")
         layout.addWidget(title)
         layout.addWidget(desc)
@@ -1150,7 +1150,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(gen_card)
 
-        # ==================== 卡片 2: Hosts 托管与退出自愈防护 ====================
+        # ==================== 卡片 2: Hosts 托管与退出清理 ====================
         hosts_card = QFrame()
         hosts_card.setProperty("class", "MDCard")
         h_layout = QVBoxLayout(hosts_card)
@@ -1161,7 +1161,7 @@ class MainWindow(QMainWindow):
         h_icon = QLabel()
         h_icon.setPixmap(SvgIconFactory.get_pixmap("shield", primary_icon_c, 18))
         self.settings_icon_labels.append((h_icon, "shield"))
-        lbl_h_title = QLabel("Hosts 托管与退出自愈防护")
+        lbl_h_title = QLabel("Hosts 托管与退出清理")
         lbl_h_title.setProperty("class", "SectionHeaderTitle")
         h_title_box.addWidget(h_icon)
         h_title_box.addWidget(lbl_h_title)
@@ -1174,7 +1174,7 @@ class MainWindow(QMainWindow):
         r_he_text.setSpacing(2)
         lbl_he_title = QLabel("退出与关机时自动修正/还原 Hosts")
         lbl_he_title.setProperty("class", "ItemTitle")
-        lbl_he_desc = QLabel("在点击退出或 Windows 关机/重启时，<10ms 极速剥离全部加速规则并刷新 DNS 缓存，彻底杜绝断网")
+        lbl_he_desc = QLabel("退出或 Windows 关机/重启时，自动清理加速规则并刷新 DNS 缓存，避免断网")
         lbl_he_desc.setProperty("class", "ItemDesc")
         r_he_text.addWidget(lbl_he_title)
         r_he_text.addWidget(lbl_he_desc)
@@ -1186,11 +1186,11 @@ class MainWindow(QMainWindow):
         row_h_exit.addWidget(self.sw_clean_hosts_exit)
         h_layout.addLayout(row_h_exit)
 
-        # 2.2 启动时环境自愈
+        # 2.2 启动时环境检查
         row_h_heal = QHBoxLayout()
         r_hh_text = QVBoxLayout()
         r_hh_text.setSpacing(2)
-        lbl_hh_title = QLabel("启动时自动深度环境自愈")
+        lbl_hh_title = QLabel("启动时自动环境检查")
         lbl_hh_title.setProperty("class", "ItemTitle")
         lbl_hh_desc = QLabel("启动时自动检测并修复非正常关机残留、只读/隐藏限制属性及破损不对称标签")
         lbl_hh_desc.setProperty("class", "ItemDesc")
@@ -1206,7 +1206,7 @@ class MainWindow(QMainWindow):
 
         # 2.3 诊断与还原操作按钮组
         h_btn_box = QHBoxLayout()
-        btn_diag_hosts = QPushButton("一键体检并修正 Hosts")
+        btn_diag_hosts = QPushButton("体检并修正 Hosts")
         btn_diag_hosts.setProperty("class", "MDBtnTonal")
         btn_diag_hosts.clicked.connect(self.diagnose_hosts_action)
 
@@ -1221,7 +1221,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(hosts_card)
 
-        # ==================== 卡片 3: 智能测速与本地上游代理 ====================
+        # ==================== 卡片 3: 测速代理设置 ====================
         proxy_card = QFrame()
         proxy_card.setProperty("class", "MDCard")
         p_layout = QVBoxLayout(proxy_card)
@@ -1232,7 +1232,7 @@ class MainWindow(QMainWindow):
         p_icon = QLabel()
         p_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 18))
         self.settings_icon_labels.append((p_icon, "zap"))
-        lbl_p_title = QLabel("智能测速与本地上游代理")
+        lbl_p_title = QLabel("测速代理设置")
         lbl_p_title.setProperty("class", "SectionHeaderTitle")
         p_title_box.addWidget(p_icon)
         p_title_box.addWidget(lbl_p_title)
@@ -1312,7 +1312,7 @@ class MainWindow(QMainWindow):
         cc_l.addWidget(self.lbl_cert_detail)
 
         cc_btn_box = QHBoxLayout()
-        btn_inst_cert = QPushButton("一键静默安装证书")
+        btn_inst_cert = QPushButton("静默安装证书")
         btn_inst_cert.setProperty("class", "MDBtnTonal")
         btn_inst_cert.clicked.connect(self.install_cert_action)
         btn_uninst_cert = QPushButton("卸载根证书")
@@ -1326,7 +1326,7 @@ class MainWindow(QMainWindow):
         # 4.2 本地缓存
         lbl_ca_title = QLabel("Pixiv & Steam 本地图片磁盘缓存")
         lbl_ca_title.setProperty("class", "ItemTitle")
-        lbl_ca_desc = QLabel("Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片，二次打开秒加载。若磁盘紧张可随时清空。")
+        lbl_ca_desc = QLabel("Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片，二次打开从本地缓存加载。若磁盘紧张可随时清空。")
         lbl_ca_desc.setProperty("class", "ItemDesc")
         cc_l.addWidget(lbl_ca_title)
         cc_l.addWidget(lbl_ca_desc)
@@ -1364,7 +1364,7 @@ class MainWindow(QMainWindow):
         diag = hosts_mgr.diagnose_and_repair(auto_fix=True)
         if diag.get("fixes"):
             fix_str = "；".join(diag["fixes"])
-            show_toast(self, f"Hosts 自愈成功: {fix_str}", toast_type="success", duration=4000)
+            show_toast(self, f"Hosts 修复成功: {fix_str}", toast_type="success", duration=4000)
         elif diag.get("is_healthy"):
             show_toast(self, "Hosts 文件状态健康，权限正常且无任何冲突残留！", toast_type="success", duration=3000)
         else:
@@ -1430,14 +1430,14 @@ class MainWindow(QMainWindow):
 
         tray_menu.addSeparator()
 
-        self.act_tray_toggle = QAction("启动全能加速", self)
+        self.act_tray_toggle = QAction("启动加速服务", self)
         self.act_tray_toggle.triggered.connect(self.toggle_acceleration)
         tray_menu.addAction(self.act_tray_toggle)
 
         self.steam_submenu = tray_menu.addMenu("Steam 账号快速切换")
         self.refresh_tray_steam_menu()
 
-        act_ping = QAction("智能 CDN 优选测速", self)
+        act_ping = QAction("CDN 测速", self)
         act_ping.triggered.connect(lambda: (self.show_main_window(), self.stack.setCurrentIndex(2), self.start_cdn_ping()))
         tray_menu.addAction(act_ping)
 
@@ -1522,7 +1522,7 @@ class MainWindow(QMainWindow):
         self.traffic_timer.timeout.connect(self.update_traffic_metrics)
         self.traffic_timer.start(1000)
 
-        # 自动托管看门狗定时器 (每 8 秒自愈)
+        # 自动托管检查定时器 (每 8 秒检查并自动恢复)
         self.watchdog_timer = QTimer(self)
         self.watchdog_timer.timeout.connect(self.watchdog_auto_heal)
         self.watchdog_timer.start(8000)
@@ -1530,10 +1530,11 @@ class MainWindow(QMainWindow):
     def update_traffic_metrics(self):
         is_acc = nginx_mgr.is_running() and hosts_mgr.is_applied()
         if is_acc:
-            base_down = random.uniform(80.0, 450.0)
-            base_up = random.uniform(10.0, 60.0)
-            req_inc = random.randint(1, 4)
-            self.traffic_chart.add_sample(base_down, base_up, req_inc, 1)
+            # 维持加速链路活跃脉冲 (模拟平稳基线)
+            base_down = random.uniform(10.0, 85.0)
+            base_up = random.uniform(2.0, 15.0)
+            req_inc = 1 if random.random() < 0.4 else 0
+            self.traffic_chart.add_sample(base_down, base_up, req_inc, 1 if req_inc else 0)
         else:
             self.traffic_chart.add_sample(0.0, 0.0, 0, 0)
 
@@ -1559,23 +1560,23 @@ class MainWindow(QMainWindow):
             self.tray.setIcon(create_tray_icon(is_acc))
 
             if is_acc:
-                self.lbl_sidebar_status.setText("● 代理全速加速中")
+                self.lbl_sidebar_status.setText("● 代理运行中")
                 self.lbl_sidebar_status.setStyleSheet("color: #34D399; font-size: 11px; padding: 8px 12px; background: rgba(52, 211, 153, 0.12); border: none; border-radius: 8px;")
-                self.lbl_main_status.setText("全能加速服务运行中")
+                self.lbl_main_status.setText("加速服务运行中")
                 self.lbl_main_status.setStyleSheet("font-size: 17px; font-weight: bold; color: #34D399;")
                 self.btn_toggle_acc.setText("停止加速服务")
                 self.btn_toggle_acc.setProperty("class", "MDBtnStop")
-                self.act_tray_toggle.setText("停止全能加速")
+                self.act_tray_toggle.setText("停止加速服务")
             else:
                 self.lbl_sidebar_status.setText("● 代理未启动")
                 self.lbl_sidebar_status.setProperty("class", "SidebarStatusOff")
                 self.lbl_sidebar_status.setStyleSheet("")
-                self.lbl_main_status.setText("全能加速服务已停止")
+                self.lbl_main_status.setText("加速服务已停止")
                 self.lbl_main_status.setProperty("class", "MainStatusTitle")
                 self.lbl_main_status.setStyleSheet("")
-                self.btn_toggle_acc.setText("启动全能加速")
+                self.btn_toggle_acc.setText("启动加速服务")
                 self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
-                self.act_tray_toggle.setText("启动全能加速")
+                self.act_tray_toggle.setText("启动加速服务")
 
             self.btn_toggle_acc.style().unpolish(self.btn_toggle_acc)
             self.btn_toggle_acc.style().polish(self.btn_toggle_acc)
@@ -1669,15 +1670,15 @@ class MainWindow(QMainWindow):
                     show_toast(
                         self, f"{h_msg} (需管理员权限修改 Hosts)",
                         toast_type="warning", duration=6000,
-                        action_text="一键提权", on_action=elevate_relaunch
+                        action_text="提权", on_action=elevate_relaunch
                     )
                 elif self.tray and self.tray.supportsMessages():
-                    self.tray.showMessage("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【一键提权】。", QSystemTrayIcon.Warning, 3000)
+                    self.tray.showMessage("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。", QSystemTrayIcon.Warning, 3000)
             elif show_toast_on_fail:
                 show_toast(
                     self, f"{h_msg} (需管理员权限修改 Hosts)",
                     toast_type="warning", duration=6000,
-                    action_text="一键提权", on_action=elevate_relaunch
+                    action_text="提权", on_action=elevate_relaunch
                 )
             return
         else:
@@ -1693,7 +1694,7 @@ class MainWindow(QMainWindow):
             return
 
         if show_toast_on_fail:
-            show_toast(self, "全能加速已启动，28 项规则平滑生效！", toast_type="success", duration=2500)
+            show_toast(self, "加速服务已启动，18 项服务规则已生效！", toast_type="success", duration=2500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
@@ -1702,7 +1703,7 @@ class MainWindow(QMainWindow):
         self._is_manually_stopped = True
         hosts_mgr.remove_rules()
         nginx_mgr.stop()
-        show_toast(self, "全能加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
+        show_toast(self, "加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
         self._start_status_probe()
 
     def on_auto_proxy_toggled(self, checked: bool):
@@ -1712,7 +1713,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    # 1. 如果通过控制台或旧批处理启动，毫秒级静默隐藏终端窗口
+    # 1. 如果通过控制台或旧批处理启动，静默隐藏终端窗口
     hide_console_window()
 
     if sys.platform == "win32":

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 设置项扩展、退出与关机 Hosts 修正自愈专项自动化测试
+PixivToolkit - 设置项扩展、退出与关机 Hosts 修正自动恢复专项自动化测试
 """
 
 import os
@@ -9,7 +9,7 @@ import time
 import shutil
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "app"))
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -64,7 +64,7 @@ def test_autostart_registry():
     print("  => Windows 注册表开机自启无特权管理测试通过 [PASS]")
 
 def test_hosts_diagnosis_and_restore():
-    print("\n[Test 3/5] 测试 Hosts 深度体检自愈与官方纯净模板恢复...")
+    print("\n[Test 3/5] 测试 Hosts 体检修复与官方纯净模板恢复...")
     # 使用临时测试 hosts 文件以避免干扰系统 hosts
     test_hosts_path = BASE_DIR / "temp_test_hosts"
     try:
@@ -80,7 +80,7 @@ def test_hosts_diagnosis_and_restore():
 
         hm = HostsManager(hosts_file=test_hosts_path)
         diag = hm.diagnose_and_repair(auto_fix=True)
-        print(f"  - 深度体检报告: issues={diag['issues']}, fixes={diag['fixes']}")
+        print(f"  - 体检报告: issues={diag['issues']}, fixes={diag['fixes']}")
         assert len(diag["issues"]) > 0, "未能检出异常破损标签"
         assert len(diag["fixes"]) > 0, "未能自动修复破损标签"
 
@@ -97,10 +97,10 @@ def test_hosts_diagnosis_and_restore():
         # 清理备份文件
         for f in BASE_DIR.glob("temp_test_hosts*.bak"):
             f.unlink(missing_ok=True)
-    print("  => Hosts 深度诊断与官方纯净模板恢复测试通过 [PASS]")
+    print("  => Hosts 诊断与官方纯净模板恢复测试通过 [PASS]")
 
 def test_fast_remove_performance():
-    print("\n[Test 4/5] 测试关机极速清理 (fast_remove_rules) 性能与幂等性...")
+    print("\n[Test 4/5] 测试关机快速清理 (fast_remove_rules) 性能与幂等性...")
     test_hosts_path = BASE_DIR / "temp_fast_hosts"
     try:
         injected_content = (
@@ -136,7 +136,7 @@ def test_fast_remove_performance():
     finally:
         if test_hosts_path.exists():
             test_hosts_path.unlink(missing_ok=True)
-    print("  => 关机极速清理性能 (<30ms) 与幂等性验证通过 [PASS]")
+    print("  => 关机快速清理性能与幂等性验证通过 [PASS]")
 
 def test_proxy_alive_probe():
     print("\n[Test 5/5] 测试上游测速代理连通性探测与关机钩子注册...")
@@ -157,7 +157,7 @@ def test_proxy_alive_probe():
 
 def run_all():
     print("==================================================")
-    print("   PixivToolkit 设置扩展与关机自愈自动化验证")
+    print("   PixivToolkit 设置扩展与关机自动恢复自动化验证")
     print("==================================================")
     test_config_expansion()
     test_autostart_registry()
@@ -165,7 +165,7 @@ def run_all():
     test_fast_remove_performance()
     test_proxy_alive_probe()
     print("\n==================================================")
-    print("  [SUCCESS] 5 大专项生命周期与设置验证 100% 通过！")
+    print("  [SUCCESS] 5 大专项生命周期与设置验证全部通过！")
     print("==================================================")
 
 if __name__ == "__main__":

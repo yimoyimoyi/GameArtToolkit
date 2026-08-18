@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 28 项全量加速服务通用 SAN 证书生成器 (X.509 v3 + SHA256)
-自动生成覆盖全生态 28 项服务的根证书 (Root CA) 与多域名通用通配符服务端证书
+PixivToolkit - 18 项加速服务通用 SAN 证书生成器 (X.509 v3 + SHA256)
+自动生成覆盖 18 项服务的根证书 (Root CA) 与多域名通用通配符服务端证书
 """
 
 import sys
@@ -18,7 +18,7 @@ CA_DIR = NGINX_DIR / "ca"
 CONF_DIR = NGINX_DIR / "conf"
 CONF_CA_DIR = CONF_DIR / "ca"
 
-# 28 项全量加速服务全域名 & 通配符 SAN 列表
+# 18 项加速服务全域名 & 通配符 SAN 列表
 ALL_SAN_DOMAINS = [
     # 🎨 Pixiv 二次元 & 创作生态
     "*.pixiv.net", "pixiv.net", "www.pixiv.net", "touch.pixiv.net", "app-api.pixiv.net",
@@ -68,7 +68,7 @@ ALL_SAN_DOMAINS = [
 
 def generate_certificates():
     print("========================================================")
-    print("   PixivToolkit - 生成 28 项全量加速生态通用 SSL 根证书与服务端证书")
+    print("   PixivToolkit - 生成 18 项加速服务通用 SSL 根证书与服务端证书")
     print("========================================================")
 
     # 1. 创建 Root CA 私钥
@@ -119,7 +119,7 @@ def generate_certificates():
     print("[3/4] 生成服务端私钥 (RSA 2048)...")
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-    # 4. 签发覆盖全生态 28 项服务的多域名 SAN 服务端证书
+    # 4. 签发覆盖 18 项服务的多域名 SAN 服务端证书
     print(f"[4/4] 签发全量多域名通用证书 (包含 {len(ALL_SAN_DOMAINS)} 个通配符与独立域名)...")
     server_subject = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
@@ -185,22 +185,16 @@ def generate_certificates():
         serialization.NoEncryption()
     )
 
-    # 写入各部署目录
+    # 写入规范部署路径 (根证书位于 nginx/ca.cer, 服务端证书位于 nginx/ca/ 与 nginx/conf/ca/)
     CA_DIR.mkdir(parents=True, exist_ok=True)
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
     CONF_CA_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. 根证书 (供 Windows 导入受信任根证书库)
     (NGINX_DIR / "ca.cer").write_bytes(ca_pem)
-    (CA_DIR / "ca.cer").write_bytes(ca_pem)
 
     # 2. 服务端证书 (Nginx ssl_certificate 引用)
     (CA_DIR / "pixiv.net.crt").write_bytes(server_pem)
     (CA_DIR / "pixiv.net.key").write_bytes(server_key_pem)
-
-    (CONF_DIR / "cert.pem").write_bytes(server_pem)
-    (CONF_DIR / "key.pem").write_bytes(server_key_pem)
-
     (CONF_CA_DIR / "pixiv.net.crt").write_bytes(server_pem)
     (CONF_CA_DIR / "pixiv.net.key").write_bytes(server_key_pem)
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Windows 根证书自检与静默管理模块 (Native CryptoAPI 极速版)
+PixivToolkit - Windows 根证书自检与静默管理模块 (CryptoAPI)
 """
 
 import os

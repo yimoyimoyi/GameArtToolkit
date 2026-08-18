@@ -1,7 +1,7 @@
 ﻿
 @echo off
 chcp 65001 >nul
-title PixivToolkit - 一键安装根证书
+title PixivToolkit - 安装根证书
 cd /d "%~dp0.."
 
 echo ========================================================

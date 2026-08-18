@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - PySide6 Material 客户端 PyInstaller 一键编译与打包脚本 (防占用与环境自愈版)
+PixivToolkit - PySide6 客户端 PyInstaller 编译与打包脚本 (防占用与自动清理)
 """
 
 import os
@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 def build_exe():
     print("========================================================")
-    print("   PixivToolkit (PySide6 Material) 开始编译打包为 EXE")
+    print("   PixivToolkit (PySide6) 开始编译打包为 EXE")
     print("========================================================")
 
     dist_dir = BASE_DIR / "dist"
@@ -53,7 +53,7 @@ def build_exe():
         except Exception as e:
             print(f"[WARN] 自动生成图标异常: {e}")
 
-    print("\n[3/4] 调用 PyInstaller 编译 PySide6 应用程序 (集成专属图标与 UAC 管理员清单)...")
+    print("\n[3/4] 调用 PyInstaller 编译 PySide6 应用程序 (集成图标与 UAC 管理员清单)...")
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
@@ -82,11 +82,15 @@ def build_exe():
     # 4. 复制 Nginx 运行时、SSL 证书与默认配置到发布目录
     print("\n[4/4] 部署便携式 Nginx 数据平面与依赖文件...")
     target_out_dir = dist_dir / "PixivToolkit"
-    target_nginx_dir = target_out_dir / "_internal" / "nginx"
     target_nginx_root = target_out_dir / "nginx"
 
-    shutil.copytree(BASE_DIR / "nginx", target_nginx_dir, dirs_exist_ok=True)
-    shutil.copytree(BASE_DIR / "nginx", target_nginx_root, dirs_exist_ok=True)
+    # 忽略开发运行产生的脏日志与缓存
+    ignore_patterns = shutil.ignore_patterns("*.log", "*.pid", "cache", "temp")
+    shutil.copytree(BASE_DIR / "nginx", target_nginx_root, dirs_exist_ok=True, ignore=ignore_patterns)
+
+    # 确保生成纯净的 cache 与 logs 目录
+    (target_nginx_root / "cache").mkdir(parents=True, exist_ok=True)
+    (target_nginx_root / "logs").mkdir(parents=True, exist_ok=True)
 
     # 复制根目录 ca.cer 到发布根目录以供快捷手动导入
     if (BASE_DIR / "nginx" / "ca.cer").exists():
@@ -101,7 +105,7 @@ def build_exe():
     print("\n========================================================")
     print("  [SUCCESS] 打包完成！发布目录:")
     print(f"  {target_out_dir}")
-    print("  可执行文件: PixivToolkit.exe (自带 UAC 管理员盾牌清单，原生启动无需 Python 环境)")
+    print("  可执行文件: PixivToolkit.exe (自带 UAC 管理员清单，启动无需 Python 环境)")
     print("========================================================")
     return True
 

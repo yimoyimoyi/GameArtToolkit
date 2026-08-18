@@ -26,7 +26,7 @@ class NginxManager:
         self.pid_file = self.nginx_dir / "logs" / "nginx.pid"
 
     def is_running(self) -> bool:
-        """检查 Nginx 进程是否正在运行 (毫秒级)"""
+        """检查 Nginx 进程是否正在运行"""
         return is_process_running("nginx.exe")
 
     def get_pid(self) -> int:
@@ -59,7 +59,7 @@ class NginxManager:
             return False, f"预检 Nginx 配置异常: {e}"
 
     def check_port_occupancy(self, port: int) -> Dict:
-        """极速诊断指定端口是否被占用"""
+        """诊断指定端口是否被占用"""
         occupied = is_port_in_use(port)
         return {
             "occupied": occupied,

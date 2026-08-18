@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-生成带有 UTF-8 BOM 编码与 cmd.exe 兼容前缀的批处理脚本 (Material 客户端版)
+生成带有 UTF-8 BOM 编码与 cmd.exe 兼容前缀的批处理脚本 (桌面客户端版)
 """
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# 1. 原生 Material 客户端双击运行脚本 (无黑框静默拉起版)
+# 1. 桌面客户端双击运行脚本 (无黑框静默拉起)
 start_gui_bat = """
 @echo off
 chcp 65001 >nul
-title PixivToolkit 原生 Material 桌面客户端
+title PixivToolkit 桌面客户端
 cd /d "%~dp0"
 
 :: 优先使用无黑框控制台的 pythonw 静默启动应用程序
@@ -20,7 +20,7 @@ if %errorLevel% equ 0 (
     exit /b 0
 )
 
-:: 兜底使用标准 python (内置毫秒级自动隐形控制台)
+:: 兜底使用标准 python (自动隐藏控制台)
 where python >nul 2>&1
 if %errorLevel% equ 0 (
     start "" python app\\pyside_app.py %*
@@ -36,32 +36,15 @@ pause
 exit /b 1
 """
 
-# 2. Web 版启动入口
-start_web_bat = """
-@echo off
-chcp 65001 >nul
-title PixivToolkit Web 控制台
-cd /d "%~dp0"
-
-echo ========================================================
-echo   正在启动 PixivToolkit 服务控制台...
-echo ========================================================
-python app\\main.py
-if %errorLevel% neq 0 (
-    echo.
-    pause
-)
-"""
-
-# 3. 一键打包为 EXE
+# 2. 打包为 EXE
 build_exe_bat = """
 @echo off
 chcp 65001 >nul
-title PixivToolkit - 一键打包为 EXE
+title PixivToolkit - 打包为 EXE
 cd /d "%~dp0"
 
 echo ========================================================
-echo   正在打包编译 PySide6 Material 桌面应用 (内置 UAC 管理员清单)...
+echo   正在打包编译 PySide6 桌面应用 (内置 UAC 管理员清单)...
 echo ========================================================
 python build.py
 echo.
@@ -72,7 +55,7 @@ if exist "%~dp0dist\\PixivToolkit" (
 )
 """
 
-# 4. 辅助清理与安装脚本
+# 3. 辅助清理与安装脚本
 clean_hosts_bat = """
 @echo off
 chcp 65001 >nul
@@ -80,7 +63,7 @@ title PixivToolkit - 安全清理 Hosts
 cd /d "%~dp0.."
 
 echo ========================================================
-echo   正在从系统 Hosts 中完全清理 PixivToolkit 加速规则...
+echo   正在从系统 Hosts 中清理 PixivToolkit 加速规则...
 echo ========================================================
 python -c "import sys; sys.path.insert(0, 'app'); from hosts_manager import HostsManager; ok, msg = HostsManager().remove_rules(); print(msg)"
 pause
@@ -89,7 +72,7 @@ pause
 install_cert_bat = """
 @echo off
 chcp 65001 >nul
-title PixivToolkit - 一键安装根证书
+title PixivToolkit - 安装根证书
 cd /d "%~dp0.."
 
 echo ========================================================
@@ -100,14 +83,8 @@ pause
 """
 
 files = {
-    BASE_DIR / "启动Material桌面端(双击运行).bat": start_gui_bat,
     BASE_DIR / "启动桌面客户端(双击运行).bat": start_gui_bat,
-    BASE_DIR / "start.bat": start_gui_bat,
-    BASE_DIR / "启动Web控制台(备用).bat": start_web_bat,
-    BASE_DIR / "启动工具(双击运行).bat": start_web_bat,
     BASE_DIR / "一键打包为EXE(双击运行).bat": build_exe_bat,
-    BASE_DIR / "build.bat": build_exe_bat,
-    BASE_DIR / "scripts" / "start.bat": start_gui_bat,
     BASE_DIR / "scripts" / "clean_hosts.bat": clean_hosts_bat,
     BASE_DIR / "scripts" / "install_cert.bat": install_cert_bat,
 }

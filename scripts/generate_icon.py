@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 原生平面化风格应用图标生成器
-生成与内置托盘保持一致的极简平面化 (Flat) 图标，支持导出 16x16 至 256x256 全尺寸 Windows ICO 与 PNG
+PixivToolkit - 平面化风格应用图标生成器
+生成与内置托盘保持一致的平面化 (Flat) 图标，支持导出 16x16 至 256x256 全尺寸 Windows ICO 与 PNG
 """
 
 import sys
@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = BASE_DIR / "app"
 
 def generate_flat_icon(size: int = 512, bg_hex: str = "#0284C7") -> Image.Image:
-    """生成原本极简平面化风格应用图标 (圆角矩形纯色底座 + 白色大写 P)"""
+    """生成平面化风格应用图标 (圆角矩形纯色底座 + 白色大写 P)"""
     _app = QGuiApplication.instance() or QGuiApplication(sys.argv)
 
     image = QImage(size, size, QImage.Format_ARGB32_Premultiplied)

@@ -1,7 +1,7 @@
 ﻿
 @echo off
 chcp 65001 >nul
-title PixivToolkit 原生 Material 桌面客户端
+title PixivToolkit 桌面客户端
 cd /d "%~dp0"
 
 :: 优先使用无黑框控制台的 pythonw 静默启动应用程序
@@ -11,7 +11,7 @@ if %errorLevel% equ 0 (
     exit /b 0
 )
 
-:: 兜底使用标准 python (内置毫秒级自动隐形控制台)
+:: 兜底使用标准 python (自动隐藏控制台)
 where python >nul 2>&1
 if %errorLevel% equ 0 (
     start "" python app\pyside_app.py %*

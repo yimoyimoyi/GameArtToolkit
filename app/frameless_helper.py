@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Win32 原生沉浸式无边框窗口与 DWM 拦截器
+PixivToolkit - Win32 原生无边框窗口与 DWM 拦截器
 提供:
-1. 0 外部依赖的原生硬件级无边框 (去掉系统白色边框与标题栏)
-2. 完整保留 Windows 硬件阴影与 Windows 11 原生圆角
-3. 8 方向硬件级平滑边缘缩放 (Resize)，绝不卡顿
-4. 原生映射最大化按钮为 HTMAXBUTTON，完美支持 Windows 11 Snap Layouts 贴靠菜单
+1. 无外部依赖的原生无边框 (去掉系统白色边框与标题栏)
+2. 保留 Windows 硬件阴影与 Windows 11 原生圆角
+3. 8 方向边缘缩放 (Resize)
+4. 映射最大化按钮为 HTMAXBUTTON，支持 Windows 11 Snap Layouts 贴靠菜单
 5. 修复双击标题栏最大化、全屏状态下任务栏防遮挡与多显示器 DPI 自适应
 """
 
@@ -149,7 +149,7 @@ class NativeFramelessHelper:
         style = user32.GetWindowLongW(hwnd, GWL_STYLE)
         user32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU)
 
-        # 启用 Win10/Win11 沉浸式深色模式与 Win11 圆角
+        # 启用 Win10/Win11 深色模式与 Win11 圆角
         try:
             dwmapi = ctypes.windll.dwmapi
             dark_mode = ctypes.c_int(1)
@@ -200,7 +200,7 @@ class NativeFramelessHelper:
         except Exception:
             return False, 0
 
-        # 0. 拦截 Windows 系统关机与会话结束消息 (极速响应，防强杀断网)
+        # 0. 拦截 Windows 系统关机与会话结束消息 (响应后清理，防止异常断网)
         if msg.message == WM_QUERYENDSESSION:
             return True, 1  # 明确告知系统允许关机
         elif msg.message == WM_ENDSESSION:
@@ -240,7 +240,7 @@ class NativeFramelessHelper:
 
         # 2. 命中测试 (NCHITTEST): 边缘拉伸、标题栏拖拽、Win11 最大化按钮贴靠菜单
         elif msg.message == WM_NCHITTEST:
-            # 使用 Qt 校准后的标准全局逻辑坐标，彻底消除 High-DPI 缩放下的像素错位
+            # 使用 Qt 校准后的标准全局逻辑坐标，消除 High-DPI 缩放下的像素错位
             global_pos = QCursor.pos()
             local_pos = self.window.mapFromGlobal(global_pos)
 

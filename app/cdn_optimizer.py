@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 智能高并发 CDN 测速与动态 Upstream 优选引擎 (双通道三态探测版)
+PixivToolkit - 高并发 CDN 测速与动态 Upstream 优选引擎 (双通道三态探测)
 
 核心改进:
 - 双通道探测: 直连 + 经本地代理(默认 127.0.0.1:7897 Clash mixed) HTTP CONNECT 隧道
-- 三态验证: TCP 握手 → TLS 握手(按服务 SNI 模式) → HTTP 状态码, 杜绝"TCP 通但 TLS 被阻断"的假可用节点
+- 三态验证: TCP 握手 → TLS 握手(按服务 SNI 模式) → HTTP 状态码, 排除"TCP 通但 TLS 被阻断"的假可用节点
 - rank 分级: 0=直连可用 1=经代理验证的真节点 2=代理可疑(5xx/421) 3=不可用(不入选)
-- 代理仅作"真实节点筛选器", 最终写入 nginx 的仍是直连 IP
+- 代理仅作"节点筛选器", 最终写入 nginx 的仍是直连 IP
 """
 
 import sys
@@ -27,15 +27,10 @@ UPSTREAM_CONF_PATH = NGINX_DIR / "conf" / "upstream-dynamic.conf"
 # 默认本地代理 (Clash mixed 端口, HTTP CONNECT 隧道, 仅作探测筛选)
 DEFAULT_PROXY = ("127.0.0.1", 7897)
 
-# 各服务的 nginx 反代 SNI 模式 (与 site-*.conf 的 proxy_ssl_name 保持一致)
-#   empty = 空 SNI (proxy_ssl_name "")   host = 域名 SNI (proxy_ssl_name $host)
-#   其他 = 自定义 SNI 域名 (伪 SNI, 如 CloudFront 分发域名)
-SNI_MODES = {
-    "pixiv_web": "empty",
-    "pixiv_img": "empty",
-    "steam_community": "statuspage.akamaized.net",
-    "huggingface": "d1cnjqbqjby1vq.cloudfront.net",
-}
+from service_profile import PROFILES
+
+# 各服务的 SNI 模式自动由 ServiceProfile 单源导出
+SNI_MODES = {p.id: p.ssl_sni_mode for p in PROFILES}
 
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
 SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
@@ -53,7 +48,7 @@ def _load_proxy_config() -> Optional[Tuple[str, int]]:
 
 
 def is_proxy_available(proxy: Optional[Tuple[str, int]], timeout: float = 0.3) -> bool:
-    """轻量预检本地代理端口是否可达 (毫秒级)"""
+    """预检本地代理端口是否可达"""
     if not proxy:
         return False
     try:
@@ -297,7 +292,7 @@ class CDNOptimizer:
         return f"    server {ip}:443 {extra};".rstrip()
 
     def generate_upstream_conf(self, test_results: Dict[str, List[Dict]]) -> str:
-        """根据 rank 分级结果生成最优 upstream-dynamic.conf
+        """根据 rank 分级结果生成延迟最低的 upstream-dynamic.conf
 
         规则:
         - 每个服务永远生成 upstream 块 (保证 nginx 引用不缺失, 防 host not found 启动失败)
@@ -307,9 +302,9 @@ class CDNOptimizer:
         """
         lines = [
             "# ==============================================================================",
-            "# PixivToolkit - 动态 Upstream 优选配置 (由智能双通道测速引擎自动生成)",
+            "# PixivToolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)",
             f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            "# 仅写入 rank0 (直连三态全通) 节点, 杜绝假节点导致 502",
+            "# 仅写入 rank0 (直连三态全通) 节点, 排除假节点导致 502",
             "# max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
             "# ==============================================================================\n"
         ]
@@ -364,7 +359,7 @@ class CDNOptimizer:
         return refs
 
     def apply_optimal(self, test_results: Dict[str, List[Dict]]) -> Tuple[bool, str]:
-        """将最优节点配置原子写入 upstream-dynamic.conf (含引用交叉校验)"""
+        """将延迟最低的节点配置原子写入 upstream-dynamic.conf (含引用交叉校验)"""
         try:
             conf_str = self.generate_upstream_conf(test_results)
 
@@ -383,7 +378,7 @@ class CDNOptimizer:
 
             failed = [srv_id for srv_id, items in test_results.items()
                       if not any(it.get("rank", 3) == 0 for it in items)]
-            msg = "已生成最优节点配置并写入 upstream-dynamic.conf！"
+            msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
             if failed:
                 msg += f" 注意: {len(failed)} 个服务双通道探测全部失败已回退候选池({', '.join(sorted(failed))}), 建议检查网络后重试"
             return True, msg
