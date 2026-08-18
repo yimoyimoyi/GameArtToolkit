@@ -1,0 +1,105 @@
+# ==============================================================================
+# PixivToolkit - Git Ignore Rules
+# ==============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+*.pyo
+*.pyd
+
+# C extensions
+*.so
+
+# Distribution / packaging / PyInstaller
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+
+# PyInstaller logs & caches
+build.log
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage / linting
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments / Virtual Envs
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Nginx runtime data & logs
+nginx/logs/*
+!nginx/logs/.gitkeep
+nginx/temp/*
+!nginx/temp/.gitkeep
+nginx/cache/*
+!nginx/cache/.gitkeep
+*.pid
+
+# Project runtime local configuration & cache
+config.json
+config.json.bak
+probe_results.json
+
+# Temporary & backup files
+*.bak
+*.tmp
+*.log
+hosts.ptk_bak_*
+*_backup.py
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+.BIN/
