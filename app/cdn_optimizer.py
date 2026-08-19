@@ -304,12 +304,23 @@ class CDNOptimizer:
         return self.test_group(srv_id, ips, max_workers=max_workers)
 
     def test_group(self, group_name: str, ip_list: List[str], max_workers: int = 8) -> List[Dict]:
-        """测试指定服务的一组候选 IP (双通道三态探测, 自动补充 DNS 当前解析节点)"""
+        """测试指定服务的一组候选 IP (双通道三态探测, 自动补充 DNS 当前解析节点, 遵从 IPv4/v6 偏好)"""
+        cfg = load_config()
+        timeout = float(cfg.get("cdn_timeout_seconds", 1.5))
+        ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
+
         srv = SERVICES_BY_ID.get(group_name, {})
         domain = srv.get("domains", [""])[0] if srv else ""
         # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
         if domain:
             ip_list = list(dict.fromkeys(list(ip_list) + _resolve_dns_candidates(domain)))
+
+        # 根据 IP 协议偏好过滤
+        if ip_mode == "ipv4_only":
+            ip_list = [ip for ip in ip_list if ":" not in ip]
+            if not ip_list:  # 容错兜底
+                ip_list = list(CANDIDATE_IPS.get(group_name, []))
+
         sni_mode = SNI_MODES.get(group_name, "host")
         proxy = _load_proxy_config()
         proxy_ready = is_proxy_available(proxy)
@@ -319,8 +330,8 @@ class CDNOptimizer:
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             def run_one(ip):
-                direct = probe_ip_endpoint_v2(ip, domain, sni_mode=sni_mode, proxy=None)
-                proxy_res = probe_ip_endpoint_v2(ip, domain, sni_mode=sni_mode, proxy=proxy) if proxy else None
+                direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None)
+                proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -338,7 +349,18 @@ class CDNOptimizer:
                             "direct": None, "proxy": None, "proxy_used": proxy_ready}
                 results.append(item)
 
-        results.sort(key=lambda x: (x.get("rank", 3), x.get("latency") if x.get("latency") is not None else 99999))
+        def _sort_key(x):
+            rank = x.get("rank", 3)
+            lat = x.get("latency") if x.get("latency") is not None else 99999
+            is_v6 = ":" in str(x.get("ip", ""))
+            v_penalty = 0
+            if ip_mode == "prefer_ipv4" and is_v6:
+                v_penalty = 1
+            elif ip_mode == "prefer_ipv6" and not is_v6:
+                v_penalty = 1
+            return (rank, v_penalty, lat)
+
+        results.sort(key=_sort_key)
         return results
 
     def test_all_services(self, max_workers: int = 16, total_timeout: float = 30.0,
@@ -347,6 +369,11 @@ class CDNOptimizer:
         
         若指定 filter_services 则仅对指定服务进行并发网络探测，其他服务快速填充默认候选
         """
+        cfg = load_config()
+        timeout = float(cfg.get("cdn_timeout_seconds", 1.5))
+        max_workers = int(cfg.get("cdn_max_workers", max_workers))
+        ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
+
         proxy = _load_proxy_config()
         proxy_ready = is_proxy_available(proxy, timeout=0.5)
         if not proxy_ready:
@@ -362,6 +389,10 @@ class CDNOptimizer:
             # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
             if domain:
                 ips = list(dict.fromkeys(list(ips) + _resolve_dns_candidates(domain)))
+            
+            if ip_mode == "ipv4_only":
+                ips = [ip for ip in ips if ":" not in ip] or list(CANDIDATE_IPS.get(srv_id, []))
+
             sni_mode = SNI_MODES.get(srv_id, "host")
             for ip in ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode))
@@ -370,8 +401,8 @@ class CDNOptimizer:
 
         def run_both(task):
             srv_id, ip, domain, sni_mode = task
-            direct = probe_ip_endpoint_v2(ip, domain, timeout=1.5, sni_mode=sni_mode, proxy=None)
-            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=1.5, sni_mode=sni_mode, proxy=proxy) if proxy else None
+            direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None)
+            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
@@ -399,15 +430,28 @@ class CDNOptimizer:
             except Exception:
                 pass
 
-        # 补齐超时未完成项并排序 (rank 升序, latency 升序; rank 3 全部排最后)
+        def _sort_key(x):
+            rank = x.get("rank", 3)
+            lat = x.get("latency") if x.get("latency") is not None else 99999
+            is_v6 = ":" in str(x.get("ip", ""))
+            v_penalty = 0
+            if ip_mode == "prefer_ipv4" and is_v6:
+                v_penalty = 1
+            elif ip_mode == "prefer_ipv6" and not is_v6:
+                v_penalty = 1
+            return (rank, v_penalty, lat)
+
+        # 补齐超时未完成项并排序 (rank 升序, IP偏好, latency 升序; rank 3 全部排最后)
         for srv_id, items in results_by_srv.items():
             done_ips = {it["ip"] for it in items}
             for expected_ip in CANDIDATE_IPS.get(srv_id, []):
+                if ip_mode == "ipv4_only" and ":" in expected_ip:
+                    continue
                 if expected_ip not in done_ips:
                     items.append({"ip": expected_ip, "latency": None, "available": False, "rank": 3,
                                   "via_proxy": False, "recommend": "none", "sni_mode": SNI_MODES.get(srv_id, "host"),
                                   "direct": None, "proxy": None, "proxy_used": proxy_ready})
-            items.sort(key=lambda x: (x.get("rank", 3), x.get("latency") if x.get("latency") is not None else 99999))
+            items.sort(key=_sort_key)
 
         return results_by_srv
 
@@ -594,6 +638,10 @@ class CDNOptimizer:
             return True, msg
         except Exception as e:
             return False, f"写入 upstream 配置失败: {e}"
+
+    def apply_single_optimal(self, srv_id: str, single_results: List[Dict]) -> Tuple[bool, str]:
+        """将单项服务的测速结果增量写入 upstream-dynamic.conf 并热重载 (增量无缝生效)"""
+        return self.apply_optimal({srv_id: single_results})
 
 
 class CDNHealthMonitor:

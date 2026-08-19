@@ -388,6 +388,52 @@ QLabel[class="AccountHint"] {
     color: #64748B;
 }
 
+QLabel[class="ActiveTagLabel"] {
+    background-color: rgba(52, 211, 153, 0.15);
+    color: #34D399;
+    border: 1px solid rgba(52, 211, 153, 0.35);
+    border-radius: 8px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+/* 搜索框 (ServiceSearchInput) */
+QLineEdit[class="ServiceSearchInput"] {
+    background-color: #141A28;
+    color: #F1F5F9;
+    border: 1px solid #1E283E;
+    border-radius: 10px;
+    padding: 8px 14px 8px 34px;
+    font-size: 12px;
+}
+
+QLineEdit[class="ServiceSearchInput"]:focus {
+    border: 1.5px solid #7EB9F5;
+    background-color: #182032;
+}
+
+/* 微型单项测速按钮 (MDBtnTiny) */
+QPushButton[class="MDBtnTiny"] {
+    background-color: #1E283E;
+    color: #CFE5FF;
+    border: 1px solid #273752;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+QPushButton[class="MDBtnTiny"]:hover {
+    background-color: #27344E;
+    border-color: #7EB9F5;
+    color: #FFFFFF;
+}
+
+QPushButton[class="MDBtnTiny"]:pressed {
+    background-color: #141A28;
+}
+
 /* 原位编辑输入框 (Inline Edit) */
 QLineEdit[class="InlineEditInput"] {
     background-color: #0F1420;
@@ -1054,6 +1100,52 @@ QLabel[class="AccountSteamId"] {
 QLabel[class="AccountHint"] {
     font-size: 10px;
     color: #94A3B8;
+}
+
+QLabel[class="ActiveTagLabel"] {
+    background-color: rgba(16, 185, 129, 0.12);
+    color: #059669;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    border-radius: 8px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+/* 搜索框 (ServiceSearchInput) */
+QLineEdit[class="ServiceSearchInput"] {
+    background-color: #F1F5F9;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 10px;
+    padding: 8px 14px 8px 34px;
+    font-size: 12px;
+}
+
+QLineEdit[class="ServiceSearchInput"]:focus {
+    border: 1.5px solid #0284C7;
+    background-color: #FFFFFF;
+}
+
+/* 微型单项测速按钮 (MDBtnTiny) */
+QPushButton[class="MDBtnTiny"] {
+    background-color: #E0F2FE;
+    color: #0284C7;
+    border: 1px solid #BAE6FD;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+QPushButton[class="MDBtnTiny"]:hover {
+    background-color: #BAE6FD;
+    border-color: #0284C7;
+    color: #0369A1;
+}
+
+QPushButton[class="MDBtnTiny"]:pressed {
+    background-color: #7DD3FC;
 }
 
 /* 原位编辑输入框 (Inline Edit) */

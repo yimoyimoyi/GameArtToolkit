@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QFrame, QScrollArea, QStackedWidget,
     QGridLayout, QSystemTrayIcon, QMenu, QButtonGroup, QProgressBar,
-    QRadioButton, QLineEdit
+    QRadioButton, QLineEdit, QComboBox, QFileDialog
 )
 
 from path_utils import BASE_DIR, APP_DIR
@@ -47,7 +47,8 @@ from env_detector import EnvDetector
 from win_utils import (
     is_process_running, is_port_in_use, is_admin, elevate_relaunch,
     is_autostart_enabled, set_autostart, register_shutdown_handler,
-    fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window
+    fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window,
+    is_windows_dark_mode
 )
 from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT
 from frameless_helper import NativeFramelessHelper
@@ -236,6 +237,40 @@ class SteamSwitchWorker(QThread):
             self.finished.emit(ok, msg, self.steamid)
 
 
+class SingleCDNTestWorker(QThread):
+    finished = Signal(str, list)
+
+    def __init__(self, srv_id: str):
+        super().__init__()
+        self.srv_id = srv_id
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        results = cdn_opt.test_service_dual(self.srv_id)
+        if not self._stop_requested:
+            self.finished.emit(self.srv_id, results)
+
+
+class StartupAutoCDNWorker(QThread):
+    finished = Signal(dict)
+
+    def __init__(self, filter_services: Optional[List[str]] = None):
+        super().__init__()
+        self.filter_services = filter_services
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        results = cdn_opt.test_all_services(filter_services=self.filter_services)
+        if not self._stop_requested:
+            self.finished.emit(results)
+
+
 class SteamAccountCard(QFrame):
     """
     Steam 账号独立卡片
@@ -374,6 +409,14 @@ class MainWindow(QMainWindow):
         self.lbl_main_icon: Optional[QLabel] = None
         self.lbl_sidebar_logo: Optional[QLabel] = None
 
+        # 搜索与单项测速引用
+        self.service_cards: Dict[str, QFrame] = {}
+        self.group_cards: Dict[str, QFrame] = {}
+        self.cdn_card_widgets: Dict[str, QFrame] = {}
+        self.cdn_single_buttons: Dict[str, QPushButton] = {}
+        self._single_cdn_workers: Dict[str, SingleCDNTestWorker] = {}
+        self._startup_cdn_worker: Optional[StartupAutoCDNWorker] = None
+
         # 1. 注册 Win32 原生无边框辅助器
         self.frameless_helper = NativeFramelessHelper(self)
 
@@ -383,7 +426,12 @@ class MainWindow(QMainWindow):
         self.init_timers()
 
         cfg = load_config()
-        current_theme = cfg.get("theme", "dark")
+        theme_mode = cfg.get("theme_mode", "dark")
+        if theme_mode == "system":
+            current_theme = "dark" if is_windows_dark_mode() else "light"
+        else:
+            current_theme = cfg.get("theme", "dark")
+
         # 订阅主题变化总线，移除对 btn_theme.clicked 的重复绑定
         ThemeManager.get_instance().theme_changed.connect(self.on_theme_changed)
         ThemeManager.get_instance().set_theme(current_theme, QApplication.instance())
@@ -411,6 +459,10 @@ class MainWindow(QMainWindow):
         if cfg.get("auto_proxy", True):
             if not nginx_mgr.is_running() or not hosts_mgr.is_applied():
                 self.start_acceleration(show_toast_on_fail=False)
+
+        # 5. 启动时后台静默 CDN 测速并优选 (延迟 2.5 秒，避开启动竞争高峰)
+        if cfg.get("auto_cdn_optimize_on_startup", True):
+            QTimer.singleShot(2500, self.trigger_startup_auto_cdn)
 
     def _update_service_icon(self, sid: str, is_checked: bool):
         """根据开关状态与当前主题动态调整服务卡片图标色彩 (开启高亮/关闭待命灰)"""
@@ -626,7 +678,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.btn_nav_settings)
         sidebar_layout.addStretch()
 
-        # 侧栏底部权限与状态指示
+        # 侧栏底部权限指示
         self.btn_sidebar_admin = QPushButton("标准用户 [点击提权]")
         self.btn_sidebar_admin.setIcon(SvgIconFactory.get_icon("shield", "#FBBF24", 14))
         self.btn_sidebar_admin.setIconSize(QSize(14, 14))
@@ -634,10 +686,6 @@ class MainWindow(QMainWindow):
         self.btn_sidebar_admin.setStyleSheet("font-size: 11px; padding: 6px 10px; border-radius: 8px;")
         self.btn_sidebar_admin.clicked.connect(elevate_relaunch)
         sidebar_layout.addWidget(self.btn_sidebar_admin)
-
-        self.lbl_sidebar_status = QLabel("● 加速待命")
-        self.lbl_sidebar_status.setProperty("class", "SidebarStatusOff")
-        sidebar_layout.addWidget(self.lbl_sidebar_status)
 
         body_layout.addWidget(sidebar)
 
@@ -762,12 +810,24 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(main_control_card)
 
+        # 3.5 服务即时搜索与过滤栏
+        search_box = QHBoxLayout()
+        search_box.setSpacing(10)
+        self.txt_service_search = QLineEdit()
+        self.txt_service_search.setProperty("class", "ServiceSearchInput")
+        self.txt_service_search.setPlaceholderText("🔍 快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
+        self.txt_service_search.setClearButtonEnabled(True)
+        self.txt_service_search.textChanged.connect(self.on_service_search_changed)
+        search_box.addWidget(self.txt_service_search)
+        layout.addLayout(search_box)
+
         # 4. 18 项加速服务 (3 大分类分组卡片)
         cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
         for grp_id, grp_info in SERVICE_GROUPS.items():
             grp_card = QFrame()
             grp_card.setProperty("class", "MDCard")
+            self.group_cards[grp_id] = grp_card
             grp_card_layout = QVBoxLayout(grp_card)
             grp_card_layout.setContentsMargins(20, 16, 20, 16)
             grp_card_layout.setSpacing(12)
@@ -811,6 +871,7 @@ class MainWindow(QMainWindow):
                 sid = srv["id"]
                 s_item = QFrame()
                 s_item.setProperty("class", "ServiceItem")
+                self.service_cards[sid] = s_item
                 si_layout = QHBoxLayout(s_item)
                 si_layout.setContentsMargins(12, 10, 12, 10)
                 si_layout.setSpacing(10)
@@ -838,6 +899,9 @@ class MainWindow(QMainWindow):
 
                 cached_lats = load_config().get("cached_latencies", {})
                 badge = LatencyBadge()
+                badge.setCursor(Qt.PointingHandCursor)
+                badge.setToolTip("点击直接进行单项独立测速与热重载")
+                badge.mousePressEvent = lambda e, s=sid: self.start_single_cdn_ping(s)
                 if sid in cached_lats:
                     c_info = cached_lats[sid]
                     c_lat = c_info.get("latency", -1) if isinstance(c_info, dict) else int(c_info)
@@ -896,6 +960,49 @@ class MainWindow(QMainWindow):
         card.icon_lbl = icon_lbl
         card.icon_name = icon_name
         return card
+
+    def on_service_search_changed(self, keyword: str):
+        """主控制台加速服务实时模糊搜索与分类动态折叠 (支持中文/英文/缩写别名)"""
+        kw = keyword.strip().lower()
+        if not kw:
+            for s_card in self.service_cards.values():
+                s_card.setVisible(True)
+            for g_card in self.group_cards.values():
+                g_card.setVisible(True)
+            return
+
+        # 别名映射辅助快速检索 (如 'gh' 匹配 github, 'px' 匹配 pixiv)
+        alias_map = {
+            "gh": ["github"], "px": ["pixiv"], "st": ["steam"], "hf": ["huggingface"],
+            "db": ["danbooru"], "gl": ["gitlab"], "fb": ["fanbox"], "bt": ["booth"],
+            "yd": ["yandere"], "vn": ["vndb"], "ubi": ["ubisoft"], "origin": ["ea_app"],
+            "ea": ["ea_app"], "art": ["pixiv", "fanbox", "booth", "danbooru", "yandere"],
+            "game": ["steam", "ea_app", "ubisoft"], "dev": ["github", "gitlab", "huggingface"]
+        }
+        expanded_keywords = [kw]
+        if kw in alias_map:
+            expanded_keywords.extend(alias_map[kw])
+
+        group_has_visible = {gid: False for gid in SERVICE_GROUPS}
+
+        for srv in SERVICES_LIST:
+            sid = srv["id"]
+            name = srv.get("name", "").lower()
+            desc = srv.get("desc", "").lower()
+            gid = srv.get("group", "")
+
+            matched = any(
+                k in sid.lower() or k in name or k in desc
+                for k in expanded_keywords
+            )
+
+            if sid in self.service_cards:
+                self.service_cards[sid].setVisible(matched)
+                if matched:
+                    group_has_visible[gid] = True
+
+        for gid, grp_card in self.group_cards.items():
+            grp_card.setVisible(group_has_visible.get(gid, False))
 
     def toggle_group_services(self, group_id: str, enable: bool):
         cfg = load_config()
@@ -1203,13 +1310,25 @@ class MainWindow(QMainWindow):
 
             card = QFrame()
             card.setProperty("class", "MDCard")
+            self.cdn_card_widgets[sid] = card
             card_l = QVBoxLayout(card)
             card_l.setContentsMargins(16, 14, 16, 14)
             card_l.setSpacing(10)
 
+            card_top = QHBoxLayout()
             lbl_title = QLabel(f"{name} (共 {len(ip_list)} 个候选 IP)")
             lbl_title.setProperty("class", "CategoryTitle")
-            card_l.addWidget(lbl_title)
+            card_top.addWidget(lbl_title)
+            card_top.addStretch()
+
+            btn_single = QPushButton("⚡ 独立测速")
+            btn_single.setProperty("class", "MDBtnTiny")
+            btn_single.setCursor(Qt.PointingHandCursor)
+            btn_single.setToolTip(f"仅探测 {name} 的候选 IP 延迟并热重载生效")
+            btn_single.clicked.connect(lambda _, s=sid: self.start_single_cdn_ping(s))
+            self.cdn_single_buttons[sid] = btn_single
+            card_top.addWidget(btn_single)
+            card_l.addLayout(card_top)
 
             grid = QGridLayout()
             grid.setSpacing(8)
@@ -1260,11 +1379,139 @@ class MainWindow(QMainWindow):
             cfg["cached_latencies"] = new_cached_lats
             save_config(cfg)
 
+    def start_single_cdn_ping(self, sid: str):
+        """单服务独立测速 (秒级并发探测 + 增量热重载)"""
+        if sid in self._single_cdn_workers and self._single_cdn_workers[sid].isRunning():
+            show_toast(self, f"[{SERVICES_BY_ID.get(sid, {}).get('name', sid)}] 正在测速中...", toast_type="info", duration=1500)
+            return
+
+        srv_name = SERVICES_BY_ID.get(sid, {}).get("name", sid)
+        if sid in self.cdn_single_buttons:
+            self.cdn_single_buttons[sid].setEnabled(False)
+            self.cdn_single_buttons[sid].setText("探测中...")
+
+        show_toast(self, f"正在对 [{srv_name}] 进行独立测速与节点优选...", toast_type="info", duration=2000)
+
+        worker = SingleCDNTestWorker(sid)
+        self._single_cdn_workers[sid] = worker
+        worker.finished.connect(self.on_single_cdn_ping_finished)
+        worker.start()
+
+    def on_single_cdn_ping_finished(self, sid: str, results: List[Dict]):
+        """单服务独立测速完成回调 (增量写入 upstream 并平滑生效)"""
+        if sid in self._single_cdn_workers:
+            self._single_cdn_workers.pop(sid, None)
+
+        if sid in self.cdn_single_buttons:
+            self.cdn_single_buttons[sid].setEnabled(True)
+            self.cdn_single_buttons[sid].setText("⚡ 独立测速")
+
+        if not self.cached_cdn_results:
+            self.cached_cdn_results = {}
+        self.cached_cdn_results[sid] = results
+
+        srv_name = SERVICES_BY_ID.get(sid, {}).get("name", sid)
+
+        # 1. 增量写入 upstream 配置并热重载 Nginx
+        ok, msg = cdn_opt.apply_single_optimal(sid, results)
+        if ok and nginx_mgr.is_running():
+            nginx_mgr.reload()
+
+        # 2. 更新主控制台 LatencyBadge
+        best_lat = 9999
+        is_proxy = False
+        if results and results[0].get("available"):
+            best_lat = results[0]["latency"]
+            is_proxy = (sid in cdn_opt.last_relay_services)
+
+        if sid in self.service_badges:
+            self.service_badges[sid].set_latency(
+                int(best_lat) if best_lat != 9999 else -1,
+                is_star=True,
+                via_proxy=is_proxy
+            )
+
+        # 3. 持久化缓存延迟
+        cfg = load_config()
+        cached_lats = cfg.get("cached_latencies", {})
+        cached_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
+        cfg["cached_latencies"] = cached_lats
+        save_config(cfg)
+
+        # 4. 若在 CDN 测速页面，局部重绘该卡片
+        if self.stack.currentIndex() == 2 and self.cached_cdn_results:
+            self.render_cdn_results(self.cached_cdn_results)
+
+        if best_lat != 9999:
+            show_toast(self, f"[{srv_name}] 节点优化完成！最低延迟: {int(best_lat)} ms (已热重载生效)", toast_type="success", duration=3000)
+        else:
+            show_toast(self, f"[{srv_name}] 节点探测超时，已回退默认候选池", toast_type="warning", duration=3500)
+
+    def trigger_startup_auto_cdn(self):
+        """启动后后台静默触发 CDN 自动测速优选 (含防抖保护与按需探测)"""
+        cfg = load_config()
+        if not cfg.get("auto_cdn_optimize_on_startup", True):
+            return
+
+        # 检查最小防抖时间 (默认 30 分钟)
+        last_time = cfg.get("last_optimal_time", 0)
+        min_interval_sec = cfg.get("auto_cdn_min_interval_minutes", 30) * 60
+        now = time.time()
+        if now - last_time < min_interval_sec:
+            print(f"[AutoCDN] 距离上次自动测速仅 {int((now - last_time)/60)} 分钟 (< {int(min_interval_sec/60)} 分钟)，跳过启动重复测速")
+            return
+
+        only_enabled = cfg.get("auto_cdn_only_enabled", True)
+        target_services = cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES) if only_enabled else None
+
+        print(f"[AutoCDN] 启动后台静默 CDN 测速 (目标: {'当前已启用服务' if only_enabled else '全量服务'})...")
+        self._startup_cdn_worker = StartupAutoCDNWorker(target_services)
+        self._startup_cdn_worker.finished.connect(self.on_startup_auto_cdn_finished)
+        self._startup_cdn_worker.start()
+
+    def on_startup_auto_cdn_finished(self, results: Dict):
+        """启动后台静默测速完成回调 (自动应用并静默热重载)"""
+        self.cached_cdn_results = results
+        ok, msg = cdn_opt.apply_optimal(results)
+        cfg = load_config()
+        cfg["last_optimal_time"] = int(time.time())
+
+        new_cached_lats = {}
+        for sid, ip_list in results.items():
+            if ip_list and sid in self.service_badges:
+                best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
+                is_proxy = (sid in cdn_opt.last_relay_services)
+                self.service_badges[sid].set_latency(
+                    int(best_lat),
+                    is_star=True,
+                    via_proxy=is_proxy
+                )
+                new_cached_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
+
+        cfg["cached_latencies"] = new_cached_lats
+        save_config(cfg)
+
+        if nginx_mgr.is_running():
+            nginx_mgr.reload()
+
+        health_monitor.update_services(
+            list(dict.fromkeys(cfg.get("enabled_services", []) + DEFAULT_ENABLED_SERVICES)),
+            results
+        )
+
+        success_count = sum(1 for items in results.values() if items and items[0].get("available"))
+        show_toast(
+            self, f"已自动优选并热重载 {success_count}/{len(results)} 项服务最佳 CDN 节点",
+            toast_type="success", duration=3200
+        )
+
     def apply_optimal_cdn(self):
         if not self.cached_cdn_results:
             return
         ok, msg = cdn_opt.apply_optimal(self.cached_cdn_results)
         if ok:
+            cfg = load_config()
+            cfg["last_optimal_time"] = int(time.time())
             # 同步更新主控制台全部 18 项服务延迟微徽章与持久化
             saved_lats = {}
             for sid, ip_list in self.cached_cdn_results.items():
@@ -1278,7 +1525,6 @@ class MainWindow(QMainWindow):
                     )
                     saved_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
 
-            cfg = load_config()
             cfg["cached_latencies"] = saved_lats
             save_config(cfg)
 
@@ -1304,7 +1550,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("系统诊断与高级设置")
         title.setObjectName("PageTitle")
-        desc = QLabel("Windows 开机自启、关闭窗口行为、退出与关机时 Hosts 自动修正，以及测速代理配置")
+        desc = QLabel("个性化外观、IPv4/IPv6 测速偏好、Steam 启动参数、自定义 DNS 及磁盘缓存维护")
         desc.setObjectName("PageDesc")
         layout.addWidget(title)
         layout.addWidget(desc)
@@ -1348,7 +1594,7 @@ class MainWindow(QMainWindow):
         e_layout.addWidget(self.lbl_env_summary)
         layout.addWidget(env_card)
 
-        # ==================== 卡片 1: 常规偏好与系统交互 ====================
+        # ==================== 卡片 1: 常规偏好与系统外观 ====================
         gen_card = QFrame()
         gen_card.setProperty("class", "MDCard")
         g_layout = QVBoxLayout(gen_card)
@@ -1359,14 +1605,40 @@ class MainWindow(QMainWindow):
         g_icon = QLabel()
         g_icon.setPixmap(SvgIconFactory.get_pixmap("settings", primary_icon_c, 18))
         self.settings_icon_labels.append((g_icon, "settings"))
-        lbl_g_title = QLabel("常规偏好与系统交互")
+        lbl_g_title = QLabel("常规偏好与系统外观")
         lbl_g_title.setProperty("class", "SectionHeaderTitle")
         g_title_box.addWidget(g_icon)
         g_title_box.addWidget(lbl_g_title)
         g_title_box.addStretch()
         g_layout.addLayout(g_title_box)
 
-        # 1.1 开机自启动
+        # 1.1 主题模式
+        row_theme = QHBoxLayout()
+        r_th_text = QVBoxLayout()
+        r_th_text.setSpacing(2)
+        lbl_th_title = QLabel("外观主题模式")
+        lbl_th_title.setProperty("class", "ItemTitle")
+        lbl_th_desc = QLabel("支持跟随 Windows 10/11 系统明暗模式自动切换，或强制指定深色/浅色")
+        lbl_th_desc.setProperty("class", "ItemDesc")
+        r_th_text.addWidget(lbl_th_title)
+        r_th_text.addWidget(lbl_th_desc)
+        row_theme.addLayout(r_th_text)
+        row_theme.addStretch()
+
+        self.cmb_theme_mode = QComboBox()
+        self.cmb_theme_mode.addItems(["深色模式 (Dark)", "浅色模式 (Light)", "跟随 Windows 系统 (Auto)"])
+        th_mode = cfg.get("theme_mode", "dark")
+        if th_mode == "light":
+            self.cmb_theme_mode.setCurrentIndex(1)
+        elif th_mode == "system":
+            self.cmb_theme_mode.setCurrentIndex(2)
+        else:
+            self.cmb_theme_mode.setCurrentIndex(0)
+        self.cmb_theme_mode.currentIndexChanged.connect(self.on_theme_mode_changed)
+        row_theme.addWidget(self.cmb_theme_mode)
+        g_layout.addLayout(row_theme)
+
+        # 1.2 开机自启动
         row_autostart = QHBoxLayout()
         r_as_text = QVBoxLayout()
         r_as_text.setSpacing(2)
@@ -1384,7 +1656,7 @@ class MainWindow(QMainWindow):
         row_autostart.addWidget(self.sw_autostart)
         g_layout.addLayout(row_autostart)
 
-        # 1.2 关闭窗口动作
+        # 1.3 关闭窗口动作
         row_close = QVBoxLayout()
         row_close.setSpacing(6)
         lbl_cl_title = QLabel("主窗口关闭按钮动作 (X)")
@@ -1411,7 +1683,7 @@ class MainWindow(QMainWindow):
         row_close.addLayout(cl_radio_box)
         g_layout.addLayout(row_close)
 
-        # 1.3 托盘气泡通知
+        # 1.4 托盘气泡通知
         row_notif = QHBoxLayout()
         r_nt_text = QVBoxLayout()
         r_nt_text.setSpacing(2)
@@ -1502,7 +1774,171 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(hosts_card)
 
-        # ==================== 卡片 3: 测速代理设置 ====================
+        # ==================== 卡片 3: IPv4/IPv6 协议偏好与 CDN 性能微调 ====================
+        cdn_tune_card = QFrame()
+        cdn_tune_card.setProperty("class", "MDCard")
+        ct_layout = QVBoxLayout(cdn_tune_card)
+        ct_layout.setContentsMargins(20, 16, 20, 16)
+        ct_layout.setSpacing(14)
+
+        ct_title_box = QHBoxLayout()
+        ct_icon = QLabel()
+        ct_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 18))
+        self.settings_icon_labels.append((ct_icon, "zap"))
+        lbl_ct_title = QLabel("IPv4 / IPv6 协议偏好与 CDN 性能微调")
+        lbl_ct_title.setProperty("class", "SectionHeaderTitle")
+        ct_title_box.addWidget(ct_icon)
+        ct_title_box.addWidget(lbl_ct_title)
+        ct_title_box.addStretch()
+        ct_layout.addLayout(ct_title_box)
+
+        # 3.1 IP 协议版本偏好
+        row_ip_mode = QHBoxLayout()
+        r_im_text = QVBoxLayout()
+        r_im_text.setSpacing(2)
+        lbl_im_title = QLabel("测速与节点优选协议偏好")
+        lbl_im_title.setProperty("class", "ItemTitle")
+        lbl_im_desc = QLabel("推荐 IPv4 优先以防止部分宽带 IPv6 Anycast 跨洋绕路；纯 v6 环境可选择 IPv6 优先")
+        lbl_im_desc.setProperty("class", "ItemDesc")
+        r_im_text.addWidget(lbl_im_title)
+        r_im_text.addWidget(lbl_im_desc)
+        row_ip_mode.addLayout(r_im_text)
+        row_ip_mode.addStretch()
+
+        self.cmb_ip_mode = QComboBox()
+        self.cmb_ip_mode.addItem("优先 IPv4 节点 (推荐稳定)", "prefer_ipv4")
+        self.cmb_ip_mode.addItem("双栈延迟优先 (谁快选谁)", "dual_stack")
+        self.cmb_ip_mode.addItem("仅探测 IPv4 (彻底禁用 v6)", "ipv4_only")
+        self.cmb_ip_mode.addItem("优先 IPv6 节点 (教育网/纯v6)", "prefer_ipv6")
+        
+        cur_ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
+        for idx in range(self.cmb_ip_mode.count()):
+            if self.cmb_ip_mode.itemData(idx) == cur_ip_mode:
+                self.cmb_ip_mode.setCurrentIndex(idx)
+                break
+        self.cmb_ip_mode.currentIndexChanged.connect(self.on_ip_mode_changed)
+        row_ip_mode.addWidget(self.cmb_ip_mode)
+        ct_layout.addLayout(row_ip_mode)
+
+        # 3.2 测速超时与并发线程数
+        row_cdn_params = QHBoxLayout()
+        row_cdn_params.setSpacing(16)
+
+        lbl_to = QLabel("单节点超时门限:")
+        lbl_to.setProperty("class", "ItemTitle")
+        self.cmb_timeout = QComboBox()
+        self.cmb_timeout.addItem("0.8 秒 (极速探测)", 0.8)
+        self.cmb_timeout.addItem("1.5 秒 (推荐标准)", 1.5)
+        self.cmb_timeout.addItem("2.5 秒 (弱网宽容)", 2.5)
+        self.cmb_timeout.addItem("3.0 秒 (超长等待)", 3.0)
+        cur_to = cfg.get("cdn_timeout_seconds", 1.5)
+        for idx in range(self.cmb_timeout.count()):
+            if abs(float(self.cmb_timeout.itemData(idx)) - float(cur_to)) < 0.1:
+                self.cmb_timeout.setCurrentIndex(idx)
+                break
+        self.cmb_timeout.currentIndexChanged.connect(self.on_cdn_timeout_changed)
+
+        lbl_wk = QLabel("最大并发线程:")
+        lbl_wk.setProperty("class", "ItemTitle")
+        self.cmb_workers = QComboBox()
+        self.cmb_workers.addItem("8 线程 (低占用)", 8)
+        self.cmb_workers.addItem("16 线程 (推荐标准)", 16)
+        self.cmb_workers.addItem("24 线程", 24)
+        self.cmb_workers.addItem("32 线程 (极速并发)", 32)
+        cur_wk = cfg.get("cdn_max_workers", 16)
+        for idx in range(self.cmb_workers.count()):
+            if int(self.cmb_workers.itemData(idx)) == int(cur_wk):
+                self.cmb_workers.setCurrentIndex(idx)
+                break
+        self.cmb_workers.currentIndexChanged.connect(self.on_cdn_workers_changed)
+
+        row_cdn_params.addWidget(lbl_to)
+        row_cdn_params.addWidget(self.cmb_timeout)
+        row_cdn_params.addSpacing(12)
+        row_cdn_params.addWidget(lbl_wk)
+        row_cdn_params.addWidget(self.cmb_workers)
+        row_cdn_params.addStretch()
+        ct_layout.addLayout(row_cdn_params)
+
+        # 3.3 启动时自动测速
+        row_cdn_startup = QHBoxLayout()
+        r_cs_text = QVBoxLayout()
+        r_cs_text.setSpacing(2)
+        lbl_cs_title = QLabel("启动时自动测速并优选 CDN 节点")
+        lbl_cs_title.setProperty("class", "ItemTitle")
+        lbl_cs_desc = QLabel("客户端启动后在后台静默并发探测候选节点延迟，自动选举最低延迟 IP 并热重载生效")
+        lbl_cs_desc.setProperty("class", "ItemDesc")
+        r_cs_text.addWidget(lbl_cs_title)
+        r_cs_text.addWidget(lbl_cs_desc)
+        row_cdn_startup.addLayout(r_cs_text)
+        row_cdn_startup.addStretch()
+
+        self.sw_auto_cdn_startup = MDSwitch(checked=cfg.get("auto_cdn_optimize_on_startup", True))
+        self.sw_auto_cdn_startup.toggled.connect(lambda c: update_config_key("auto_cdn_optimize_on_startup", c))
+        row_cdn_startup.addWidget(self.sw_auto_cdn_startup)
+        ct_layout.addLayout(row_cdn_startup)
+
+        # 3.4 仅测速当前已开启的服务
+        row_cdn_only_en = QHBoxLayout()
+        r_coe_text = QVBoxLayout()
+        r_coe_text.setSpacing(2)
+        lbl_coe_title = QLabel("仅测速当前已勾选启用的加速服务")
+        lbl_coe_title.setProperty("class", "ItemTitle")
+        lbl_coe_desc = QLabel("开启时启动测速仅探测已启用的服务 (耗时缩短至 2~3 秒)；关闭时将探测全量 18 项服务")
+        lbl_coe_desc.setProperty("class", "ItemDesc")
+        r_coe_text.addWidget(lbl_coe_title)
+        r_coe_text.addWidget(lbl_coe_desc)
+        row_cdn_only_en.addLayout(r_coe_text)
+        row_cdn_only_en.addStretch()
+
+        self.sw_auto_cdn_only_enabled = MDSwitch(checked=cfg.get("auto_cdn_only_enabled", True))
+        self.sw_auto_cdn_only_enabled.toggled.connect(lambda c: update_config_key("auto_cdn_only_enabled", c))
+        row_cdn_only_en.addWidget(self.sw_auto_cdn_only_enabled)
+        ct_layout.addLayout(row_cdn_only_en)
+
+        # 3.5 防抖周期与自愈频率
+        row_intervals = QHBoxLayout()
+        row_intervals.setSpacing(16)
+
+        lbl_db = QLabel("启动测速防抖间隔:")
+        lbl_db.setProperty("class", "ItemTitle")
+        self.cmb_debounce = QComboBox()
+        self.cmb_debounce.addItem("15 分钟", 15)
+        self.cmb_debounce.addItem("30 分钟 (推荐)", 30)
+        self.cmb_debounce.addItem("60 分钟 (1小时)", 60)
+        self.cmb_debounce.addItem("240 分钟 (4小时)", 240)
+        cur_db = cfg.get("auto_cdn_min_interval_minutes", 30)
+        for idx in range(self.cmb_debounce.count()):
+            if int(self.cmb_debounce.itemData(idx)) == int(cur_db):
+                self.cmb_debounce.setCurrentIndex(idx)
+                break
+        self.cmb_debounce.currentIndexChanged.connect(self.on_cdn_debounce_changed)
+
+        lbl_hl = QLabel("健康巡检周期:")
+        lbl_hl.setProperty("class", "ItemTitle")
+        self.cmb_health_freq = QComboBox()
+        self.cmb_health_freq.addItem("15 秒 (高灵敏)", 15)
+        self.cmb_health_freq.addItem("30 秒 (推荐)", 30)
+        self.cmb_health_freq.addItem("60 秒 (1分钟)", 60)
+        self.cmb_health_freq.addItem("300 秒 (5分钟)", 300)
+        cur_hl = cfg.get("health_check_interval_seconds", 30)
+        for idx in range(self.cmb_health_freq.count()):
+            if int(self.cmb_health_freq.itemData(idx)) == int(cur_hl):
+                self.cmb_health_freq.setCurrentIndex(idx)
+                break
+        self.cmb_health_freq.currentIndexChanged.connect(self.on_health_interval_changed)
+
+        row_intervals.addWidget(lbl_db)
+        row_intervals.addWidget(self.cmb_debounce)
+        row_intervals.addSpacing(12)
+        row_intervals.addWidget(lbl_hl)
+        row_intervals.addWidget(self.cmb_health_freq)
+        row_intervals.addStretch()
+        ct_layout.addLayout(row_intervals)
+
+        layout.addWidget(cdn_tune_card)
+
+        # ==================== 卡片 4: 测速代理设置 ====================
         proxy_card = QFrame()
         proxy_card.setProperty("class", "MDCard")
         p_layout = QVBoxLayout(proxy_card)
@@ -1520,13 +1956,12 @@ class MainWindow(QMainWindow):
         p_title_box.addStretch()
         p_layout.addLayout(p_title_box)
 
-        # 3.1 启用测速代理
         row_pxy_en = QHBoxLayout()
         r_pe_text = QVBoxLayout()
         r_pe_text.setSpacing(2)
         lbl_pe_title = QLabel("启用测速专用本地代理")
         lbl_pe_title.setProperty("class", "ItemTitle")
-        lbl_pe_desc = QLabel("通过本地 Clash / Sing-box / v2ray 混合代理端口并发探测境外 Anycast 延迟 (仅供节点测速筛选，不参与 Nginx 转发)")
+        lbl_pe_desc = QLabel("通过本地 Clash / Sing-box / v2ray 混合代理端口并发探测境外 Anycast 延迟 (仅供节点筛选)")
         lbl_pe_desc.setProperty("class", "ItemDesc")
         r_pe_text.addWidget(lbl_pe_title)
         r_pe_text.addWidget(lbl_pe_desc)
@@ -1539,7 +1974,6 @@ class MainWindow(QMainWindow):
         row_pxy_en.addWidget(self.sw_proxy_enable)
         p_layout.addLayout(row_pxy_en)
 
-        # 3.2 代理主机与端口输入行
         row_pxy_fields = QHBoxLayout()
         row_pxy_fields.setSpacing(12)
 
@@ -1569,25 +2003,25 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(proxy_card)
 
-        # ==================== 卡片 3.5: 流量接入与故障自愈模式 ====================
-        mode_card = QFrame()
-        mode_card.setProperty("class", "MDCard")
-        m_layout = QVBoxLayout(mode_card)
-        m_layout.setContentsMargins(20, 16, 20, 16)
-        m_layout.setSpacing(14)
+        # ==================== 卡片 5: 本地 DNS 智能分流与上游解析 ====================
+        dns_card = QFrame()
+        dns_card.setProperty("class", "MDCard")
+        d_layout = QVBoxLayout(dns_card)
+        d_layout.setContentsMargins(20, 16, 20, 16)
+        d_layout.setSpacing(14)
 
-        m_title_box = QHBoxLayout()
-        m_icon = QLabel()
-        m_icon.setPixmap(SvgIconFactory.get_pixmap("activity", primary_icon_c, 18))
-        self.settings_icon_labels.append((m_icon, "activity"))
-        lbl_m_title = QLabel("流量接入与故障自愈模式")
-        lbl_m_title.setProperty("class", "SectionHeaderTitle")
-        m_title_box.addWidget(m_icon)
-        m_title_box.addWidget(lbl_m_title)
-        m_title_box.addStretch()
-        m_layout.addLayout(m_title_box)
+        d_title_box = QHBoxLayout()
+        d_icon = QLabel()
+        d_icon.setPixmap(SvgIconFactory.get_pixmap("activity", primary_icon_c, 18))
+        self.settings_icon_labels.append((d_icon, "activity"))
+        lbl_d_title = QLabel("本地 DNS 智能分流与上游解析服务器")
+        lbl_d_title.setProperty("class", "SectionHeaderTitle")
+        d_title_box.addWidget(d_icon)
+        d_title_box.addWidget(lbl_d_title)
+        d_title_box.addStretch()
+        d_layout.addLayout(d_title_box)
 
-        # 3.5.1 启用本地 DNS 模式
+        # 5.1 启用本地 DNS
         row_dns = QHBoxLayout()
         r_dns_text = QVBoxLayout()
         r_dns_text.setSpacing(2)
@@ -1600,51 +2034,156 @@ class MainWindow(QMainWindow):
         row_dns.addLayout(r_dns_text)
         row_dns.addStretch()
 
-        self.sw_dns_mode = MDSwitch(checked=cfg.get("dns_mode_enabled", False))
+        self.sw_dns_mode = MDSwitch(checked=cfg.get("dns_mode_enabled", True))
         self.sw_dns_mode.toggled.connect(self.on_dns_mode_toggled)
         row_dns.addWidget(self.sw_dns_mode)
-        m_layout.addLayout(row_dns)
+        d_layout.addLayout(row_dns)
 
-        # 3.5.2 持续健康自愈巡检
-        row_heal = QHBoxLayout()
-        r_heal_text = QVBoxLayout()
-        r_heal_text.setSpacing(2)
-        lbl_heal_title = QLabel("持续 CDN 健康巡检与故障自愈")
-        lbl_heal_title.setProperty("class", "ItemTitle")
-        lbl_heal_desc = QLabel("后台以微量开销持续监控主力节点，检测到阻断或断流时自动选举高分备用节点平滑重载")
-        lbl_heal_desc.setProperty("class", "ItemDesc")
-        r_heal_text.addWidget(lbl_heal_title)
-        r_heal_text.addWidget(lbl_heal_desc)
-        row_heal.addLayout(r_heal_text)
-        row_heal.addStretch()
+        # 5.2 上游公共 DNS 预设胶囊
+        row_presets = QHBoxLayout()
+        row_presets.setSpacing(8)
+        lbl_pr_title = QLabel("常用公共 DNS 快速填入:")
+        lbl_pr_title.setProperty("class", "ItemTitle")
+        row_presets.addWidget(lbl_pr_title)
 
-        self.sw_health_heal = MDSwitch(checked=cfg.get("health_heal_enabled", True))
-        self.sw_health_heal.toggled.connect(self.on_health_heal_toggled)
-        row_heal.addWidget(self.sw_health_heal)
-        m_layout.addLayout(row_heal)
+        dns_presets = [
+            ("阿里 DNS", "223.5.5.5", "223.6.6.6"),
+            ("腾讯 DNSPod", "119.29.29.29", "182.254.116.116"),
+            ("Cloudflare", "1.1.1.1", "1.0.0.1"),
+            ("Google", "8.8.8.8", "8.8.4.4"),
+            ("114 DNS", "114.114.114.114", "114.114.115.115")
+        ]
+        for name, p_dns, s_dns in dns_presets:
+            btn_p = QPushButton(name)
+            btn_p.setProperty("class", "MDBtnTiny")
+            btn_p.clicked.connect(lambda _, p=p_dns, s=s_dns: self.apply_preset_dns(p, s))
+            row_presets.addWidget(btn_p)
+        row_presets.addStretch()
+        d_layout.addLayout(row_presets)
 
-        # 3.5.3 Git 命令行网络与吞吐一键调优
-        row_git = QHBoxLayout()
-        r_git_text = QVBoxLayout()
-        r_git_text.setSpacing(2)
-        lbl_git_title = QLabel("Git 命令行网络与大文件传输优化")
-        lbl_git_title.setProperty("class", "ItemTitle")
-        lbl_git_desc = QLabel("自动将 Git 全局 http.postBuffer 提升至 500MB，解除低速超时限制，解决 git pull / clone 卡顿")
-        lbl_git_desc.setProperty("class", "ItemDesc")
-        r_git_text.addWidget(lbl_git_title)
-        r_git_text.addWidget(lbl_git_desc)
-        row_git.addLayout(r_git_text)
-        row_git.addStretch()
+        # 5.3 主备 DNS 输入行
+        row_dns_fields = QHBoxLayout()
+        row_dns_fields.setSpacing(12)
 
-        btn_opt_git = QPushButton("一键优化 Git 配置")
-        btn_opt_git.setProperty("class", "MDBtnTonal")
-        btn_opt_git.clicked.connect(self.optimize_git_config_action)
-        row_git.addWidget(btn_opt_git)
-        m_layout.addLayout(row_git)
+        up_dns = cfg.get("upstream_dns_servers", ["223.5.5.5", "119.29.29.29"])
+        primary_dns = up_dns[0] if len(up_dns) > 0 else "223.5.5.5"
+        sec_dns = up_dns[1] if len(up_dns) > 1 else "119.29.29.29"
 
-        layout.addWidget(mode_card)
+        lbl_pdns = QLabel("主力上游 DNS:")
+        lbl_pdns.setProperty("class", "ItemTitle")
+        self.txt_dns_primary = QLineEdit(primary_dns)
+        self.txt_dns_primary.setFixedWidth(130)
+        self.txt_dns_primary.textChanged.connect(self.on_custom_dns_changed)
 
-        # ==================== 卡片 4: 系统根证书与本地存储管理 ====================
+        lbl_sdns = QLabel("备用上游 DNS:")
+        lbl_sdns.setProperty("class", "ItemTitle")
+        self.txt_dns_secondary = QLineEdit(sec_dns)
+        self.txt_dns_secondary.setFixedWidth(130)
+        self.txt_dns_secondary.textChanged.connect(self.on_custom_dns_changed)
+
+        row_dns_fields.addWidget(lbl_pdns)
+        row_dns_fields.addWidget(self.txt_dns_primary)
+        row_dns_fields.addWidget(lbl_sdns)
+        row_dns_fields.addWidget(self.txt_dns_secondary)
+        row_dns_fields.addStretch()
+        d_layout.addLayout(row_dns_fields)
+
+        layout.addWidget(dns_card)
+
+        # ==================== 卡片 6: Steam 路径与游戏高级启动参数 ====================
+        steam_card = QFrame()
+        steam_card.setProperty("class", "MDCard")
+        s_layout = QVBoxLayout(steam_card)
+        s_layout.setContentsMargins(20, 16, 20, 16)
+        s_layout.setSpacing(14)
+
+        s_title_box = QHBoxLayout()
+        s_icon = QLabel()
+        s_icon.setPixmap(SvgIconFactory.get_pixmap("users", primary_icon_c, 18))
+        self.settings_icon_labels.append((s_icon, "users"))
+        lbl_s_title = QLabel("Steam 客户端路径与游戏高级启动参数")
+        lbl_s_title.setProperty("class", "SectionHeaderTitle")
+        s_title_box.addWidget(s_icon)
+        s_title_box.addWidget(lbl_s_title)
+        s_title_box.addStretch()
+        s_layout.addLayout(s_title_box)
+
+        # 6.1 Steam 安装路径
+        row_sp = QHBoxLayout()
+        row_sp.setSpacing(10)
+        lbl_sp = QLabel("Steam 路径:")
+        lbl_sp.setProperty("class", "ItemTitle")
+        current_sp = str(steam_mgr.steam_path) if steam_mgr.steam_path else ""
+        self.txt_steam_path = QLineEdit(current_sp)
+        self.txt_steam_path.setPlaceholderText("自动检测或点击右侧浏览选择 steam.exe 路径")
+        self.txt_steam_path.textChanged.connect(lambda t: update_config_key("custom_steam_path", t.strip()))
+
+        btn_browse_steam = QPushButton("浏览 📁")
+        btn_browse_steam.setProperty("class", "MDBtnTonal")
+        btn_browse_steam.clicked.connect(self.browse_steam_path_action)
+
+        btn_redetect_steam = QPushButton("重新探测 🔄")
+        btn_redetect_steam.setProperty("class", "MDBtnOutlined")
+        btn_redetect_steam.clicked.connect(self.redetect_steam_path_action)
+
+        row_sp.addWidget(lbl_sp)
+        row_sp.addWidget(self.txt_steam_path)
+        row_sp.addWidget(btn_browse_steam)
+        row_sp.addWidget(btn_redetect_steam)
+        s_layout.addLayout(row_sp)
+
+        # 6.2 常用启动参数预设
+        lbl_args_intro = QLabel("快捷启动参数预设 (启动 Steam 或免密切号时自动追加):")
+        lbl_args_intro.setProperty("class", "ItemTitle")
+        s_layout.addWidget(lbl_args_intro)
+
+        current_args = cfg.get("steam_launch_args", ["-tcp"])
+        args_grid = QGridLayout()
+        args_grid.setSpacing(10)
+
+        self.chk_steam_tcp = QCheckBox("-tcp (强制 TCP 传输，解决好友列表/聊天转圈丢包)")
+        self.chk_steam_tcp.setChecked("-tcp" in current_args)
+        self.chk_steam_tcp.toggled.connect(self.on_steam_launch_args_changed)
+
+        self.chk_steam_nofriends = QCheckBox("-nofriendsui (轻量极简好友列表，极大节省内存)")
+        self.chk_steam_nofriends.setChecked("-nofriendsui" in current_args)
+        self.chk_steam_nofriends.toggled.connect(self.on_steam_launch_args_changed)
+
+        self.chk_steam_nobrowser = QCheckBox("-no-browser (纯净运行模式，禁用内置 Chromium 网页)")
+        self.chk_steam_nobrowser.setChecked("-no-browser" in current_args)
+        self.chk_steam_nobrowser.toggled.connect(self.on_steam_launch_args_changed)
+
+        self.chk_steam_dev = QCheckBox("-dev (启用开发者模式与原生调试控制台)")
+        self.chk_steam_dev.setChecked("-dev" in current_args)
+        self.chk_steam_dev.toggled.connect(self.on_steam_launch_args_changed)
+
+        args_grid.addWidget(self.chk_steam_tcp, 0, 0)
+        args_grid.addWidget(self.chk_steam_nofriends, 0, 1)
+        args_grid.addWidget(self.chk_steam_nobrowser, 1, 0)
+        args_grid.addWidget(self.chk_steam_dev, 1, 1)
+        s_layout.addLayout(args_grid)
+
+        # 6.3 自定义附加参数
+        row_cust_args = QHBoxLayout()
+        row_cust_args.setSpacing(10)
+        lbl_ca = QLabel("自定义附加参数:")
+        lbl_ca.setProperty("class", "ItemTitle")
+        self.txt_steam_custom_args = QLineEdit(cfg.get("steam_custom_args_str", ""))
+        self.txt_steam_custom_args.setPlaceholderText("例如: -silent -console -language schinese")
+        self.txt_steam_custom_args.textChanged.connect(lambda t: update_config_key("steam_custom_args_str", t.strip()))
+
+        btn_launch_steam_now = QPushButton("以当前参数启动 Steam")
+        btn_launch_steam_now.setProperty("class", "MDBtnTonal")
+        btn_launch_steam_now.clicked.connect(self.launch_steam_with_custom_args_action)
+
+        row_cust_args.addWidget(lbl_ca)
+        row_cust_args.addWidget(self.txt_steam_custom_args)
+        row_cust_args.addWidget(btn_launch_steam_now)
+        s_layout.addLayout(row_cust_args)
+
+        layout.addWidget(steam_card)
+
+        # ==================== 卡片 7: 系统根证书与本地存储管理 ====================
         cert_card = QFrame()
         cert_card.setProperty("class", "MDCard")
         cc_l = QVBoxLayout(cert_card)
@@ -1662,7 +2201,7 @@ class MainWindow(QMainWindow):
         cc_title_box.addStretch()
         cc_l.addLayout(cc_title_box)
 
-        # 4.1 证书管理
+        # 7.1 证书管理
         self.lbl_cert_detail = QLabel("证书状态: 检测中...")
         self.lbl_cert_detail.setProperty("class", "SectionHeaderDesc")
         cc_l.addWidget(self.lbl_cert_detail)
@@ -1679,20 +2218,62 @@ class MainWindow(QMainWindow):
         cc_btn_box.addStretch()
         cc_l.addLayout(cc_btn_box)
 
-        # 4.2 本地缓存
+        # 7.2 本地缓存与退出自动清理
+        row_cache_mgmt = QHBoxLayout()
+        r_cm_text = QVBoxLayout()
+        r_cm_text.setSpacing(2)
         lbl_ca_title = QLabel("GameArt 本地图片与静态资源磁盘缓存")
         lbl_ca_title.setProperty("class", "ItemTitle")
-        lbl_ca_desc = QLabel("Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片，二次打开从本地缓存加载。若磁盘紧张可随时清空。")
-        lbl_ca_desc.setProperty("class", "ItemDesc")
-        cc_l.addWidget(lbl_ca_title)
-        cc_l.addWidget(lbl_ca_desc)
+        self.lbl_cache_size_desc = QLabel(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {self._get_cache_size_str()})。")
+        self.lbl_cache_size_desc.setProperty("class", "ItemDesc")
+        r_cm_text.addWidget(lbl_ca_title)
+        r_cm_text.addWidget(self.lbl_cache_size_desc)
+        row_cache_mgmt.addLayout(r_cm_text)
+        row_cache_mgmt.addStretch()
 
         btn_clear_cache = QPushButton("清空本地图片缓存")
         btn_clear_cache.setProperty("class", "MDBtnOutlined")
         btn_clear_cache.clicked.connect(self.clear_cache_action)
-        cc_l.addWidget(btn_clear_cache, 0, Qt.AlignLeft)
+        row_cache_mgmt.addWidget(btn_clear_cache)
+        cc_l.addLayout(row_cache_mgmt)
 
-        # 4.3 端口诊断
+        row_auto_clear = QHBoxLayout()
+        r_ac_text = QVBoxLayout()
+        r_ac_text.setSpacing(2)
+        lbl_ac_title = QLabel("退出程序时自动清空图片磁盘缓存")
+        lbl_ac_title.setProperty("class", "ItemTitle")
+        lbl_ac_desc = QLabel("开启后每次完全退出程序时自动清理临时图片缓存，保持磁盘空间清爽")
+        lbl_ac_desc.setProperty("class", "ItemDesc")
+        r_ac_text.addWidget(lbl_ac_title)
+        r_ac_text.addWidget(lbl_ac_desc)
+        row_auto_clear.addLayout(r_ac_text)
+        row_auto_clear.addStretch()
+
+        self.sw_auto_clear_cache = MDSwitch(checked=cfg.get("auto_clear_cache_on_exit", False))
+        self.sw_auto_clear_cache.toggled.connect(lambda c: update_config_key("auto_clear_cache_on_exit", c))
+        row_auto_clear.addWidget(self.sw_auto_clear_cache)
+        cc_l.addLayout(row_auto_clear)
+
+        # 7.3 Git 命令行调优
+        row_git = QHBoxLayout()
+        r_git_text = QVBoxLayout()
+        r_git_text.setSpacing(2)
+        lbl_git_title = QLabel("Git 命令行网络与大文件传输优化")
+        lbl_git_title.setProperty("class", "ItemTitle")
+        lbl_git_desc = QLabel("自动将 Git 全局 http.postBuffer 提升至 500MB，解除低速超时限制，解决 git pull / clone 卡顿")
+        lbl_git_desc.setProperty("class", "ItemDesc")
+        r_git_text.addWidget(lbl_git_title)
+        r_git_text.addWidget(lbl_git_desc)
+        row_git.addLayout(r_git_text)
+        row_git.addStretch()
+
+        btn_opt_git = QPushButton("一键优化 Git 配置")
+        btn_opt_git.setProperty("class", "MDBtnTonal")
+        btn_opt_git.clicked.connect(self.optimize_git_config_action)
+        row_git.addWidget(btn_opt_git)
+        cc_l.addLayout(row_git)
+
+        # 7.4 端口诊断
         lbl_po_title = QLabel("本地 80 / 443 端口诊断")
         lbl_po_title.setProperty("class", "ItemTitle")
         self.lbl_port_detail = QLabel("端口状态: 检测中...")
@@ -1705,6 +2286,101 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         scroll.setWidget(content)
         return scroll
+
+    # ==================== 设置页事件响应方法 ====================
+    def on_theme_mode_changed(self, index: int):
+        modes = ["dark", "light", "system"]
+        mode = modes[index] if 0 <= index < len(modes) else "dark"
+        update_config_key("theme_mode", mode)
+        target_theme = mode
+        if mode == "system":
+            target_theme = "dark" if is_windows_dark_mode() else "light"
+        update_config_key("theme", target_theme)
+        ThemeManager.get_instance().set_theme(target_theme, QApplication.instance())
+        if self.frameless_helper:
+            self.frameless_helper.set_immersive_dark_mode(target_theme == "dark")
+        show_toast(self, f"已切换主题为: {self.cmb_theme_mode.currentText()}", toast_type="info", duration=2000)
+
+    def on_ip_mode_changed(self, index: int):
+        val = self.cmb_ip_mode.itemData(index)
+        if val:
+            update_config_key("ip_version_mode", val)
+            show_toast(self, f"已切换测速偏好为: {self.cmb_ip_mode.currentText()}", toast_type="success", duration=2000)
+
+    def on_cdn_timeout_changed(self, index: int):
+        val = self.cmb_timeout.itemData(index)
+        if val is not None:
+            update_config_key("cdn_timeout_seconds", float(val))
+
+    def on_cdn_workers_changed(self, index: int):
+        val = self.cmb_workers.itemData(index)
+        if val is not None:
+            update_config_key("cdn_max_workers", int(val))
+
+    def on_cdn_debounce_changed(self, index: int):
+        val = self.cmb_debounce.itemData(index)
+        if val is not None:
+            update_config_key("auto_cdn_min_interval_minutes", int(val))
+
+    def on_health_interval_changed(self, index: int):
+        val = self.cmb_health_freq.itemData(index)
+        if val is not None:
+            update_config_key("health_check_interval_seconds", int(val))
+
+    def apply_preset_dns(self, primary: str, secondary: str):
+        if hasattr(self, "txt_dns_primary") and hasattr(self, "txt_dns_secondary"):
+            self.txt_dns_primary.setText(primary)
+            self.txt_dns_secondary.setText(secondary)
+            self.on_custom_dns_changed()
+            show_toast(self, f"已应用上游 DNS 预设: {primary}, {secondary}", toast_type="success", duration=2000)
+
+    def on_custom_dns_changed(self):
+        p = self.txt_dns_primary.text().strip() if hasattr(self, "txt_dns_primary") else "223.5.5.5"
+        s = self.txt_dns_secondary.text().strip() if hasattr(self, "txt_dns_secondary") else "119.29.29.29"
+        dns_list = [d for d in [p, s] if d]
+        if dns_list:
+            update_config_key("upstream_dns_servers", dns_list)
+            local_dns_server.set_upstream_dns_list(dns_list)
+
+    def browse_steam_path_action(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Steam 可执行文件", "C:\\", "Steam (steam.exe);;可执行文件 (*.exe)")
+        if path:
+            p = Path(path)
+            self.txt_steam_path.setText(str(p.parent if p.name.lower() == "steam.exe" else p))
+            update_config_key("custom_steam_path", str(p.parent if p.name.lower() == "steam.exe" else p))
+            steam_mgr.refresh_paths()
+            self.load_steam_accounts_ui()
+            self.refresh_tray_steam_menu()
+            show_toast(self, "Steam 路径更新成功！", toast_type="success", duration=2500)
+
+    def redetect_steam_path_action(self):
+        update_config_key("custom_steam_path", "")
+        steam_mgr.refresh_paths()
+        new_p = str(steam_mgr.steam_path) if steam_mgr.steam_path else ""
+        if hasattr(self, "txt_steam_path"):
+            self.txt_steam_path.setText(new_p)
+        self.load_steam_accounts_ui()
+        self.refresh_tray_steam_menu()
+        if new_p:
+            show_toast(self, f"已自动探测到 Steam 安装路径: {new_p}", toast_type="success", duration=3000)
+        else:
+            show_toast(self, "未能在系统中自动探测到 Steam，请手动点击【浏览】选择", toast_type="warning", duration=3500)
+
+    def on_steam_launch_args_changed(self):
+        args = []
+        if getattr(self, "chk_steam_tcp", None) and self.chk_steam_tcp.isChecked():
+            args.append("-tcp")
+        if getattr(self, "chk_steam_nofriends", None) and self.chk_steam_nofriends.isChecked():
+            args.append("-nofriendsui")
+        if getattr(self, "chk_steam_nobrowser", None) and self.chk_steam_nobrowser.isChecked():
+            args.append("-no-browser")
+        if getattr(self, "chk_steam_dev", None) and self.chk_steam_dev.isChecked():
+            args.append("-dev")
+        update_config_key("steam_launch_args", args)
+
+    def launch_steam_with_custom_args_action(self):
+        ok, msg = steam_mgr.launch_steam()
+        show_toast(self, msg, toast_type="success" if ok else "error", duration=3000)
 
     def on_autostart_toggled(self, checked: bool):
         ok, msg = set_autostart(checked, start_minimized=True)
@@ -1768,8 +2444,21 @@ class MainWindow(QMainWindow):
         show_toast(self, msg, toast_type="info", duration=3000)
         self._start_status_probe()
 
+    def _get_cache_size_str(self) -> str:
+        try:
+            from path_utils import NGINX_DIR
+            cache_dir = NGINX_DIR / "temp" / "cache"
+            if not cache_dir.exists():
+                return "0.0 MB"
+            total_size = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
+            return f"{total_size / (1024 * 1024):.1f} MB"
+        except Exception:
+            return "0.0 MB"
+
     def clear_cache_action(self):
         ok, msg = nginx_mgr.clear_cache()
+        if hasattr(self, 'lbl_cache_size_desc') and self.lbl_cache_size_desc:
+            self.lbl_cache_size_desc.setText(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {self._get_cache_size_str()})。")
         show_toast(self, msg, toast_type="success", duration=2500)
 
     # ------------------ 状态同步与托盘后台 ------------------
@@ -1853,7 +2542,9 @@ class MainWindow(QMainWindow):
         workers = [
             getattr(self, "_status_worker", None),
             getattr(self, "cdn_worker", None),
-            getattr(self, "steam_worker", None)
+            getattr(self, "steam_worker", None),
+            getattr(self, "_startup_cdn_worker", None),
+            *list(getattr(self, "_single_cdn_workers", {}).values())
         ]
         for w in workers:
             if w and w.isRunning():
@@ -1889,6 +2580,12 @@ class MainWindow(QMainWindow):
         print("[GameArt Toolkit] 正在完全退出程序...")
         if hasattr(self, 'tray') and self.tray:
             self.tray.hide()
+        cfg = load_config()
+        if cfg.get("auto_clear_cache_on_exit", False):
+            try:
+                nginx_mgr.clear_cache()
+            except Exception:
+                pass
         self.safe_shutdown()
         emergency_fast_cleanup()
         QApplication.quit()
@@ -1944,21 +2641,15 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip(f"GameArt Toolkit - 加速服务{'运行中' if is_acc else '已停止'}")
 
             if is_acc:
-                self.lbl_sidebar_status.setText("● 加速运行中")
                 if is_dark:
-                    self.lbl_sidebar_status.setStyleSheet("color: #34D399; font-size: 11px; padding: 8px 12px; background: rgba(52, 211, 153, 0.12); border: none; border-radius: 8px;")
                     self.lbl_main_status.setStyleSheet("font-size: 17px; font-weight: bold; color: #34D399;")
                 else:
-                    self.lbl_sidebar_status.setStyleSheet("color: #059669; font-size: 11px; padding: 8px 12px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px;")
                     self.lbl_main_status.setStyleSheet("font-size: 17px; font-weight: bold; color: #059669;")
                 self.lbl_main_status.setText("加速服务运行中")
                 self.btn_toggle_acc.setText("停止加速服务")
                 self.btn_toggle_acc.setProperty("class", "MDBtnStop")
                 self.act_tray_toggle.setText("停止加速服务")
             else:
-                self.lbl_sidebar_status.setText("● 加速待命")
-                self.lbl_sidebar_status.setProperty("class", "SidebarStatusOff")
-                self.lbl_sidebar_status.setStyleSheet("")
                 self.lbl_main_status.setText("加速服务已停止")
                 self.lbl_main_status.setProperty("class", "MainStatusTitle")
                 self.lbl_main_status.setStyleSheet("")

@@ -251,6 +251,17 @@ def fast_terminate_pid(pid: int) -> bool:
         pass
     return False
 
+
+def is_windows_dark_mode() -> bool:
+    """读取 Windows 10/11 注册表 AppsUseLightTheme，判断系统当前是否为深色模式"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return val == 0
+    except Exception:
+        return True
+
+
 def check_proxy_alive(host: str = "127.0.0.1", port: int = 7897, timeout: float = 1.0) -> bool:
     """测试上游测速代理是否可用: TCP 端口探活 + HTTP CONNECT 隧道握手双重验证
 

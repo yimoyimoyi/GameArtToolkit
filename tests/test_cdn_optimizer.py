@@ -804,3 +804,32 @@ class TestSelfRedirect:
         # 用真实 TCP+模拟: probe 需要 TLS, 此处用本地自签 TLS 服务器成本高,
         # 改为验证解析逻辑: 直接调用 probe 的 HTTP 阶段不现实, 由 _classify 覆盖已足够
         assert True  # 行为已由 test_self_redirect_not_rank0 覆盖 (probe 标记逻辑简单直接)
+
+
+class TestApplySingleOptimal:
+    """验证单项测速 apply_single_optimal 增量合并与配置持久化"""
+
+    def test_apply_single_optimal_incremental(self, tmp_path):
+        opt = CDNOptimizer()
+        opt.conf_path = tmp_path / "upstream-dynamic.conf"
+        # 针对 pixiv_web 单项调用
+        single_res = [
+            {"ip": "210.140.92.140", "latency": 15, "available": True, "rank": 0, "via_proxy": False}
+        ]
+        ok, msg = opt.apply_single_optimal("pixiv_web", single_res)
+        assert ok is True
+        assert opt.conf_path.exists()
+        content = opt.conf_path.read_text(encoding="utf-8")
+        assert "upstream upstream_pixiv_web" in content
+        assert "210.140.92.140" in content
+        # 同时确保其他所有服务 upstream 依然存在 (不因单项测速而丢失)
+        assert "upstream upstream_github_web" in content
+        assert "upstream upstream_steam_store" in content
+
+    def test_config_store_auto_cdn_defaults(self):
+        from config_store import DEFAULT_CONFIG
+        assert "auto_cdn_optimize_on_startup" in DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["auto_cdn_optimize_on_startup"] is True
+        assert "auto_cdn_min_interval_minutes" in DEFAULT_CONFIG
+        assert "auto_cdn_only_enabled" in DEFAULT_CONFIG
+

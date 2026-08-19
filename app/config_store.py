@@ -17,6 +17,7 @@ _CONFIG_LOCK = threading.RLock()
 DEFAULT_CONFIG = {
     # 界面与交互外观
     "theme": "dark",
+    "theme_mode": "dark",  # "system" | "dark" | "light"
     "tray_notifications": True,
 
     # 运行生命周期与托盘行为
@@ -32,8 +33,26 @@ DEFAULT_CONFIG = {
     # 服务与路由规则 (默认开启 18 项已验证服务)
     "enabled_services": list(DEFAULT_ENABLED_SERVICES),
     "steam_account_aliases": {},
+    "custom_steam_path": "",
+    "steam_launch_args": ["-tcp"],
+    "steam_custom_args_str": "",
+
+    # CDN 测速与自愈参数
     "auto_cdn_optimize": True,
+    "auto_cdn_optimize_on_startup": True,
+    "auto_cdn_min_interval_minutes": 30,
+    "auto_cdn_only_enabled": True,
+    "ip_version_mode": "prefer_ipv4",  # "prefer_ipv4" | "prefer_ipv6" | "dual_stack" | "ipv4_only"
+    "cdn_timeout_seconds": 1.5,
+    "cdn_max_workers": 16,
+    "health_check_interval_seconds": 30,
     "last_optimal_time": 0,
+
+    # 本地 DNS 与网络缓存维护
+    "dns_mode_enabled": True,
+    "upstream_dns_servers": ["223.5.5.5", "119.29.29.29"],
+    "cache_max_size_mb": 1024,
+    "auto_clear_cache_on_exit": False,
 
     # 测速探测专用本地代理 (Clash/v2ray/Sing-box mixed 端口, 仅作真实节点筛选, 不参与 nginx 转发)
     "upstream_proxy": {"enabled": False, "host": "127.0.0.1", "port": 7897},

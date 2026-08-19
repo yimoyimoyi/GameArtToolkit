@@ -102,14 +102,29 @@ class LocalDnsServer:
                  upstream_dns: str = "223.5.5.5", upstream_port: int = 53):
         self.host = host
         self.port = port
-        self.upstream_dns_list = [upstream_dns, "119.29.29.29", "1.1.1.1"]
-        self.upstream_dns = upstream_dns
+        try:
+            from config_store import load_config
+            cfg_dns = load_config().get("upstream_dns_servers")
+            if cfg_dns and isinstance(cfg_dns, list):
+                self.upstream_dns_list = list(cfg_dns)
+            else:
+                self.upstream_dns_list = [upstream_dns, "119.29.29.29", "1.1.1.1"]
+        except Exception:
+            self.upstream_dns_list = [upstream_dns, "119.29.29.29", "1.1.1.1"]
+
+        self.upstream_dns = self.upstream_dns_list[0] if self.upstream_dns_list else upstream_dns
         self.upstream_port = upstream_port
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._is_running = False
         self.custom_mappings: Dict[str, str] = {}
+
+    def set_upstream_dns_list(self, dns_list: List[str]):
+        """动态更新上游公共 DNS 服务器列表"""
+        if dns_list:
+            self.upstream_dns_list = list(dns_list)
+            self.upstream_dns = dns_list[0]
 
     def is_running(self) -> bool:
         return self._is_running

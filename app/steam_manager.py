@@ -146,7 +146,19 @@ class SteamManager:
         self.steam_exe = self.detect_steam_exe()
 
     def detect_steam_path(self) -> Optional[Path]:
-        """多重探测 Steam 安装目录 (支持 64/32 位注册表与多盘符)"""
+        """多重探测 Steam 安装目录 (支持用户自定义路径、64/32 位注册表与多盘符)"""
+        # 0. 优先使用用户在设置中自定义指定的有效路径
+        try:
+            custom = load_config().get("custom_steam_path", "").strip()
+            if custom:
+                cp = Path(custom.replace("/", "\\"))
+                if cp.is_file() and cp.name.lower() == "steam.exe":
+                    return cp.parent
+                elif cp.is_dir() and (cp / "steam.exe").exists():
+                    return cp
+        except Exception:
+            pass
+
         # 1. 优先从 HKCU 注册表读取
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
@@ -352,10 +364,34 @@ class SteamManager:
         config["steam_account_aliases"] = aliases
         update_config_key("steam_account_aliases", aliases)
 
+    def refresh_paths(self):
+        """重新探测并刷新 Steam 路径引用"""
+        self.steam_path = self.detect_steam_path()
+        self.steam_exe = self.detect_steam_exe()
+
+    def _build_steam_launch_cmd(self) -> List[str]:
+        """根据配置项拼装带有 -tcp, -nofriendsui 等参数的完整启动指令"""
+        if not self.steam_exe:
+            return []
+        cmd = [str(self.steam_exe)]
+        cfg = load_config()
+        args = cfg.get("steam_launch_args", ["-tcp"])
+        if isinstance(args, list):
+            for arg in args:
+                arg_s = str(arg).strip()
+                if arg_s and arg_s not in cmd:
+                    cmd.append(arg_s)
+        custom_args = cfg.get("steam_custom_args_str", "").strip()
+        if custom_args:
+            for part in custom_args.split():
+                if part and part not in cmd:
+                    cmd.append(part)
+        return cmd
+
     def switch_account(self, steamid: str, restart_steam: bool = True) -> Tuple[bool, str]:
         """免密切换 Steam 账号并安全重启客户端"""
         if not self.steam_path or not self.steam_exe:
-            return False, "未检测到 Steam 安装路径，请确认 Steam 是否已安装。"
+            return False, "未检测到 Steam 安装路径，请确认 Steam 是否已安装或在设置中指定路径。"
 
         vdf_path = self.steam_path / "config" / "loginusers.vdf"
         if not vdf_path.exists():
@@ -380,17 +416,17 @@ class SteamManager:
             return False, "该账号数据缺失 AccountName。"
 
         # 2. 安全关闭正在运行的 Steam 及其子进程树
-        if not self.close_steam(timeout=6.0):
-            return False, "无法关闭当前运行的 Steam 进程，请手动关闭后重试。"
+        if restart_steam:
+            if not self.close_steam(timeout=6.0):
+                return False, "无法关闭当前运行的 Steam 进程，请手动关闭后重试。"
 
-        # 循环等待 Steam 进程完全退出，避免异步刷盘覆写注册表
-        for _ in range(25):  # 最多等待 2.5 秒
-            if not is_process_running("steam.exe"):
-                break
+            for _ in range(25):  # 最多等待 2.5 秒确保退出
+                if not is_process_running("steam.exe"):
+                    break
+                time.sleep(0.1)
             time.sleep(0.1)
-        time.sleep(0.1)  # 最终额外等待确保文件句柄释放
 
-        # 3. 修改 Windows 注册表
+        # 3. 修改 Windows 注册表 AutoLoginUser
         try:
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
                 winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, target_acc)
@@ -432,10 +468,11 @@ class SteamManager:
         except Exception as e:
             return False, f"更新 loginusers.vdf 失败: {e}"
 
-        # 5. 重新启动 Steam (带标准工作目录，不使用 shell=True)
+        # 5. 重新启动 Steam (带标准工作目录与参数，不使用 shell=True)
         if restart_steam:
             try:
-                subprocess.Popen([str(self.steam_exe)], cwd=str(self.steam_path), shell=False)
+                cmd = self._build_steam_launch_cmd()
+                subprocess.Popen(cmd, cwd=str(self.steam_path), shell=False)
             except Exception as e:
                 return True, f"账号切换成功，但自动拉起 Steam 失败: {e}"
 
@@ -444,9 +481,10 @@ class SteamManager:
 
     def launch_steam(self) -> Tuple[bool, str]:
         if not self.steam_exe:
-            return False, "未找到 Steam.exe"
+            return False, "未找到 Steam.exe (请在设置中指定有效路径)"
         try:
-            subprocess.Popen([str(self.steam_exe)], cwd=str(self.steam_path), shell=False)
-            return True, "已启动 Steam"
+            cmd = self._build_steam_launch_cmd()
+            subprocess.Popen(cmd, cwd=str(self.steam_path), shell=False)
+            return True, f"已启动 Steam ({' '.join(cmd[1:]) if len(cmd) > 1 else '默认参数'})"
         except Exception as e:
             return False, f"启动 Steam 失败: {e}"
