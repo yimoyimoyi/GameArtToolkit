@@ -70,7 +70,21 @@ nginx/temp/*
 !nginx/temp/.gitkeep
 nginx/cache/*
 !nginx/cache/.gitkeep
+nginx/ca/*
+!nginx/ca/.gitkeep
+nginx/conf/ca/*
+!nginx/conf/ca/.gitkeep
+nginx/ca.cer
+ca.cer
 *.pid
+
+# SSL Certificates & Private Keys (Auto-generated locally, NEVER commit)
+*.key
+*.cer
+*.crt
+*.pem
+*.pfx
+*.p12
 
 # Project runtime local configuration & cache
 config.json

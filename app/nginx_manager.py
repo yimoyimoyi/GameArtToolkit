@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
 from win_utils import is_process_running, is_port_in_use, get_pids_by_name, get_silent_startup_kwargs
 from nginx_generator import NginxConfGenerator
+from cert_manager import CertManager
 
 NGINX_EXE = NGINX_DIR / "nginx.exe"
 CACHE_DIR = NGINX_DIR / "cache"
@@ -88,7 +89,10 @@ class NginxManager:
             # 1. 自动从 ServiceProfile 单源渲染三大站点配置
             NginxConfGenerator.generate_all(self.nginx_dir / "conf")
 
-            # 2. 仅当 upstream-dynamic.conf 缺失时生成兜底配置 (避免覆盖已优选的节点)
+            # 2. 自动确保证书与私钥在本地按需自生成就绪 (零分发与自愈)
+            CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir).ensure_certificates()
+
+            # 3. 仅当 upstream-dynamic.conf 缺失时生成兜底配置 (避免覆盖已优选的节点)
             upstream_conf = self.nginx_dir / "conf" / "upstream-dynamic.conf"
             if not upstream_conf.exists():
                 from cdn_optimizer import CDNOptimizer

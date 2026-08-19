@@ -92,19 +92,20 @@ def build_exe():
     target_out_dir = dist_dir / "PixivToolkit"
     target_nginx_root = target_out_dir / "nginx"
 
-    # 忽略开发运行产生的脏日志与缓存
-    ignore_patterns = shutil.ignore_patterns("*.log", "*.pid", "cache", "temp")
+    # 忽略开发运行产生的脏日志、缓存以及任何本地生成的私钥/证书 (零私钥分发)
+    ignore_patterns = shutil.ignore_patterns(
+        "*.log", "*.pid", "cache", "temp",
+        "*.key", "*.crt", "*.cer", "*.pem", "*.pfx", "*.p12"
+    )
     shutil.copytree(BASE_DIR / "nginx", target_nginx_root, dirs_exist_ok=True, ignore=ignore_patterns)
 
-    # 确保生成纯净的 cache, logs 与 temp 缓冲子目录，防止大文件/大图反代报 500
+    # 确保生成纯净的 cache, logs, temp 与 ca 目录结构
+    (target_nginx_root / "ca").mkdir(parents=True, exist_ok=True)
+    (target_nginx_root / "conf" / "ca").mkdir(parents=True, exist_ok=True)
     (target_nginx_root / "cache").mkdir(parents=True, exist_ok=True)
     (target_nginx_root / "logs").mkdir(parents=True, exist_ok=True)
     for temp_sub in ["client_body_temp", "proxy_temp", "fastcgi_temp", "scgi_temp", "uwsgi_temp"]:
         (target_nginx_root / "temp" / temp_sub).mkdir(parents=True, exist_ok=True)
-
-    # 复制根目录 ca.cer 到发布根目录以供快捷手动导入
-    if (BASE_DIR / "nginx" / "ca.cer").exists():
-        shutil.copyfile(BASE_DIR / "nginx" / "ca.cer", target_out_dir / "ca.cer")
 
     # 复制应用专属图标到发布根目录
     if (BASE_DIR / "app" / "icon.ico").exists():
