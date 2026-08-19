@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 调色板与桌面 QSS 样式系统
+GameArt Toolkit - Material Design 3 调色板与桌面 QSS 样式系统
 提供:
 1. MD3 Tonal Elevation 层级色彩常量与语义定义
 2. 无边框标题栏 (TitleBar) 与 Windows 窗口控制按钮规范
@@ -720,24 +720,24 @@ MD3_LIGHT_OUTLINE_VARIANT = "#E2E8F0"
 
 MATERIAL_LIGHT_QSS = """
 /* ==========================================================================
-   全局基础重置与浅色基底 (Surface - Crisp White)
+   全局基础重置与浅色基底 (Surface - Soft Ice Blue 淡冰蓝基调)
    ========================================================================== */
 QWidget#CentralWidget, QWidget#ScrollContent, QWidget#AppRootWidget {
-    background-color: #F8FAFC;
+    background-color: #EEF5FD;
     color: #0F172A;
     font-family: "Segoe UI", "Microsoft YaHei", -apple-system, sans-serif;
     font-size: 13px;
 }
 
 QMainWindow {
-    background-color: #F8FAFC;
+    background-color: #EEF5FD;
 }
 
 /* 提示气泡 ToolTip */
 QToolTip {
-    background-color: #F1F5F9;
+    background-color: #E4EFFB;
     color: #0F172A;
-    border: 1px solid #CBD5E1;
+    border: 1px solid #BDD8F6;
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 12px;
@@ -747,8 +747,8 @@ QToolTip {
    无边框标题栏 (TitleBar)
    ========================================================================== */
 QFrame#TitleBar {
-    background-color: #F8FAFC;
-    border-bottom: 1px solid #E2E8F0;
+    background-color: #EEF5FD;
+    border-bottom: 1px solid #D8E8FA;
     min-height: 38px;
     max-height: 38px;
 }
@@ -770,13 +770,13 @@ QLabel#TitleBadge {
 }
 
 QLabel#TitleStatusPill {
-    background-color: rgba(16, 185, 129, 0.10);
+    background-color: rgba(16, 185, 129, 0.12);
     color: #059669;
-    border: none;
+    border: 1px solid rgba(16, 185, 129, 0.3);
     border-radius: 11px;
     padding: 2px 10px;
     font-size: 11px;
-    font-weight: 500;
+    font-weight: bold;
 }
 
 /* 标题栏主题切换按钮 (ThemeToggleBtn) */
@@ -855,13 +855,13 @@ QScrollBar:vertical {
 }
 
 QScrollBar::handle:vertical {
-    background: #CBD5E1;
+    background: #B8D3F2;
     min-height: 32px;
     border-radius: 4px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background: #94A3B8;
+    background: #92BDE8;
 }
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -880,17 +880,17 @@ QScrollBar:horizontal {
 }
 
 QScrollBar::handle:horizontal {
-    background: #CBD5E1;
+    background: #B8D3F2;
     min-width: 32px;
     border-radius: 4px;
 }
 
 QScrollBar::handle:horizontal:hover {
-    background: #CBD5E1;
+    background: #92BDE8;
 }
 
 QScrollBar::handle:horizontal:pressed {
-    background: #94A3B8;
+    background: #0284C7;
 }
 
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
@@ -898,18 +898,18 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 }
 
 /* ==========================================================================
-   侧边导航栏 (NavSidebar)
+   侧边导航栏 (NavSidebar) - 高质感浅霜蓝
    ========================================================================== */
 QFrame#NavSidebar {
-    background-color: #F1F5F9;
-    border-right: 1px solid #E2E8F0;
+    background-color: #E4EFFB;
+    border-right: 1px solid #D0E2F5;
     min-width: 220px;
     max-width: 220px;
 }
 
 QLabel#BrandTitle {
     color: #0284C7;
-    font-size: 18px;
+    font-size: 17px;
     font-weight: bold;
     letter-spacing: 0.5px;
 }
@@ -921,7 +921,7 @@ QLabel#BrandSubtitle {
 
 QPushButton[class="NavButton"] {
     background-color: transparent;
-    color: #475569;
+    color: #334155;
     border: none;
     border-radius: 12px;
     padding: 10px 14px;
@@ -931,13 +931,14 @@ QPushButton[class="NavButton"] {
 }
 
 QPushButton[class="NavButton"]:hover {
-    background-color: #E2E8F0;
+    background-color: #D4E6FA;
     color: #0F172A;
 }
 
 QPushButton[class="NavButton"]:checked {
-    background-color: #E0F2FE;
+    background-color: #BAE0FD;
     color: #0284C7;
+    border: 1px solid #7DD3FC;
     font-weight: bold;
 }
 
@@ -962,13 +963,13 @@ QLabel#PageDesc {
    ========================================================================== */
 QFrame[class="MDCard"] {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
+    border: 1px solid #D8E7F8;
     border-radius: 16px;
 }
 
 QFrame[class="MDCardHover"]:hover {
-    border: 1px solid #CBD5E1;
-    background-color: #F8FAFC;
+    border: 1px solid #C4DCF7;
+    background-color: #F9FBFE;
 }
 
 QLabel[class="CategoryTitle"] {
@@ -984,21 +985,21 @@ QLabel[class="CategoryDesc"] {
 
 /* 服务项目单行卡片 */
 QFrame[class="ServiceItem"] {
-    background-color: #F8FAFC;
-    border: 1px solid #E2E8F0;
+    background-color: #F4F8FD;
+    border: 1px solid #D8E7F8;
     border-radius: 10px;
     padding: 8px 12px;
 }
 
 QFrame[class="ServiceItem"]:hover {
-    border: 1px solid #CBD5E1;
-    background-color: #F1F5F9;
+    border: 1px solid #BDDAF8;
+    background-color: #E8F2FD;
 }
 
 /* 顶部指标卡片 */
 QFrame[class="StatCard"] {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
+    border: 1px solid #D8E7F8;
     border-radius: 12px;
 }
 
@@ -1023,17 +1024,17 @@ QLabel[class="StatHint"] {
    ========================================================================== */
 QFrame[class="AccountCard"] {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
+    border: 1px solid #D8E7F8;
     border-radius: 14px;
 }
 
 QFrame[class="AccountCard"]:hover {
-    border: 1px solid #CBD5E1;
-    background-color: #F8FAFC;
+    border: 1px solid #BDDAF8;
+    background-color: #EBF4FD;
 }
 
 QFrame[class="AccountCardActive"] {
-    background-color: #E0F2FE;
+    background-color: #D8EEFD;
     border: 1.5px solid #0284C7;
     border-radius: 14px;
 }
@@ -1063,7 +1064,7 @@ QLineEdit[class="InlineEditInput"] {
     border-radius: 6px;
     padding: 3px 8px;
     font-size: 12px;
-    selection-background-color: #E0F2FE;
+    selection-background-color: #BAE0FD;
 }
 
 QLabel[class="InlineBadge"] {
@@ -1087,7 +1088,7 @@ QLabel[class="InlineBadge"]:hover {
    ========================================================================== */
 QFrame[class="ToastFrame"] {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
+    border: 1px solid #D8E7F8;
     border-radius: 12px;
     padding: 6px 14px;
 }
@@ -1131,7 +1132,7 @@ QPushButton[class="ToastCloseBtn"]:hover {
    ========================================================================== */
 QFrame[class="EmptyStateCard"] {
     background-color: #FFFFFF;
-    border: 1px dashed #CBD5E1;
+    border: 1px dashed #BDD8F6;
     border-radius: 16px;
     padding: 32px 24px;
 }
@@ -1207,21 +1208,21 @@ QPushButton[class="MDBtnTonal"]:pressed {
 
 QPushButton[class="MDBtnOutlined"] {
     background-color: transparent;
-    color: #475569;
-    border: 1px solid #CBD5E1;
+    color: #334155;
+    border: 1px solid #BDD8F6;
     border-radius: 8px;
     padding: 6px 12px;
     font-size: 12px;
 }
 
 QPushButton[class="MDBtnOutlined"]:hover {
-    background-color: #F1F5F9;
+    background-color: #E0F0FE;
     color: #0F172A;
     border-color: #0284C7;
 }
 
 QPushButton[class="MDBtnOutlined"]:pressed {
-    background-color: #E2E8F0;
+    background-color: #BAE0FD;
 }
 
 /* ==========================================================================
@@ -1230,7 +1231,7 @@ QPushButton[class="MDBtnOutlined"]:pressed {
 QLineEdit {
     background-color: #FFFFFF;
     color: #0F172A;
-    border: 1px solid #CBD5E1;
+    border: 1px solid #BDD8F6;
     border-radius: 8px;
     padding: 7px 12px;
     font-size: 12px;
@@ -1238,7 +1239,7 @@ QLineEdit {
 
 QLineEdit:focus {
     border: 1.5px solid #0284C7;
-    background-color: #F8FAFC;
+    background-color: #F8FAFD;
 }
 
 QRadioButton {
@@ -1257,7 +1258,7 @@ QRadioButton::indicator {
 
 QRadioButton::indicator:checked {
     background-color: #0284C7;
-    border: 3px solid #F8FAFC;
+    border: 3px solid #EEF5FD;
 }
 
 QCheckBox {
@@ -1281,7 +1282,7 @@ QCheckBox::indicator:checked {
 
 QMenu {
     background-color: #FFFFFF;
-    border: 1px solid #E2E8F0;
+    border: 1px solid #D8E7F8;
     border-radius: 10px;
     padding: 6px 0px;
     color: #0F172A;
@@ -1299,7 +1300,7 @@ QMenu::item:selected {
 
 QMenu::separator {
     height: 1px;
-    background: #E2E8F0;
+    background: #D8E7F8;
     margin: 4px 8px;
 }
 
@@ -1344,8 +1345,8 @@ QLabel[class="CdnIpText"] {
 }
 
 QFrame[class="CdnIpCard"] {
-    background-color: #F8FAFC;
-    border: 1px solid #E2E8F0;
+    background-color: #F4F8FD;
+    border: 1px solid #D8E7F8;
     border-radius: 6px;
     padding: 6px 10px;
 }

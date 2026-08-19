@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Windows 原生 API 工具集 (进程与端口探测)
+GameArt Toolkit - Windows 原生 API 工具集 (进程与端口探测)
 """
 
 import socket
@@ -160,7 +160,7 @@ def flush_dns_native() -> bool:
 
 # ==================== Windows 开机自启管理 (HKCU 注册表免管理员权限) ====================
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-DEFAULT_APP_NAME = "PixivToolkit"
+DEFAULT_APP_NAME = "GameArtToolkit"
 
 def is_autostart_enabled(app_name: str = DEFAULT_APP_NAME) -> bool:
     """查询当前用户注册表是否已配置开机自启动"""

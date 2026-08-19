@@ -60,7 +60,7 @@ class TestCertManager:
         
         # 验证自签名
         assert cert.subject == cert.issuer
-        assert "PixivToolkit Universal Root CA" in cert.subject.rfc4514_string()
+        assert "GameArt Toolkit Universal Root CA" in cert.subject.rfc4514_string()
 
         # 验证 CA 约束
         bc = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.BASIC_CONSTRAINTS).value

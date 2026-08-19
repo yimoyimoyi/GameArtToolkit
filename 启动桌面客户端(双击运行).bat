@@ -1,6 +1,6 @@
 ﻿@echo off
 chcp 65001 >nul
-title PixivToolkit 桌面客户端
+title GameArt Toolkit 桌面客户端
 cd /d "%~dp0"
 
 :: 优先使用无黑框控制台的 pythonw 静默启动应用程序
@@ -23,4 +23,4 @@ echo   请确保已安装 Python 3.10+ 并将其勾选添加到系统 PATH 环�
 echo ========================================================
 echo.
 pause
-exit /b 1
+exit /b 1

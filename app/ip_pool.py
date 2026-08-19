@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 加速服务元数据、域名映射与 CDN 候选池 (对接 Service Profile 架构)
+GameArt Toolkit - 加速服务元数据、域名映射与 CDN 候选池 (对接 Service Profile 架构)
 
 向后兼容导出:
 - SERVICE_GROUPS: 服务分组字典
@@ -33,6 +33,7 @@ SERVICES_LIST = [
         "name": p.name,
         "domains": p.domains,
         "desc": p.desc,
+        "icon": getattr(p, "icon", "zap"),
         "mode": p.mode.value,
         "enable_cache": p.enable_cache
     }

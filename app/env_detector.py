@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 系统网络环境与代理冲突检测器 (Env & Proxy Conflict Detector)
+GameArt Toolkit - 系统网络环境与代理冲突检测器 (Env & Proxy Conflict Detector)
 
 核心原则:
 - 不修改系统代理设置
@@ -98,7 +98,7 @@ class EnvDetector:
 
     @staticmethod
     def check_hosts_conflicts(hosts_content: str) -> List[Dict[str, str]]:
-        """检测 Hosts 文件中是否存在非 PixivToolkit 写入但可能冲突的域名规则"""
+        """检测 Hosts 文件中是否存在非 GameArt Toolkit 写入但可能冲突的域名规则"""
         conflicts = []
         all_managed_domains = set()
         for p in PROFILES:
@@ -111,9 +111,9 @@ class EnvDetector:
         for line in lines:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
-                if ">>>>> PixivToolkit Rules Start" in stripped:
+                if ">>>>> GameArt Toolkit Rules Start" in stripped or ">>>>> PixivToolkit Rules Start" in stripped:
                     in_ptk_block = True
-                elif "<<<<< PixivToolkit Rules End" in stripped:
+                elif "<<<<< GameArt Toolkit Rules End" in stripped or "<<<<< PixivToolkit Rules End" in stripped:
                     in_ptk_block = False
                 continue
 
@@ -147,7 +147,7 @@ class EnvDetector:
 
         if sys_proxy["enabled"]:
             warnings.append(f"检测到系统代理已激活: {sys_proxy['server']}")
-            suggestions.append("PixivToolkit 仅接管指定加速域名，若与您的代理规则冲突，可在代理客户端中为 Pixiv/Steam 设置直连(Direct)。")
+            suggestions.append("GameArt Toolkit 仅接管指定加速域名，若与您的代理规则冲突，可在代理客户端中为对应域名设置直连(Direct)。")
 
         if active_ports:
             port_desc_list = [f"{p['port']} ({p['desc']})" for p in active_ports]
@@ -155,7 +155,7 @@ class EnvDetector:
 
         if hosts_conflicts:
             warnings.append(f"检测到 Hosts 中存在 {len(hosts_conflicts)} 条外部冲突条目")
-            suggestions.append("建议在 PixivToolkit 中一键覆盖注入，或清理第三方工具遗留的旧规则。")
+            suggestions.append("建议在 GameArt Toolkit 中一键覆盖注入，或清理第三方工具遗留的旧规则。")
 
         return {
             "system_proxy": sys_proxy,

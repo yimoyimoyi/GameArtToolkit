@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 本地轻量 DNS 解析与递归转发服务 (Local DNS Resolver)
+GameArt Toolkit - 本地轻量 DNS 解析与递归转发服务 (Local DNS Resolver)
 
 核心特性:
 - 零外部依赖 (纯标准库 socket / struct 实现 RFC 1035 DNS 协议)

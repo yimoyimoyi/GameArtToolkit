@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Nginx 进程与端口生命周期管理引擎 (配置预检与精准 PID 版)
+GameArt Toolkit - Nginx 进程与端口生命周期管理引擎 (配置预检与精准 PID 版)
 """
 
 import sys

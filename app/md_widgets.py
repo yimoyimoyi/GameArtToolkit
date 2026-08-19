@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Material Design 3 自绘控件库
+GameArt Toolkit - Material Design 3 自绘控件库
 包含:
 1. TitleBar: 无边框标题栏组件 (Win11 Snap 联动、状态胶囊、三联窗口控制按钮)
 2. ToastManager / ToastNotification: 全局悬浮非阻塞通知系统 (Success/Info/Warning/Error)
@@ -211,13 +211,9 @@ class TitleBar(QFrame):
         self._render_brand_icon()
         layout.addWidget(self.icon_label)
 
-        self.title_label = QLabel("PixivToolkit")
+        self.title_label = QLabel("GameArt Toolkit")
         self.title_label.setObjectName("TitleBrand")
         layout.addWidget(self.title_label)
-
-        self.badge_label = QLabel("MD3 Native")
-        self.badge_label.setObjectName("TitleBadge")
-        layout.addWidget(self.badge_label)
 
         # 运行状态胶囊指示器
         self.status_pill = QLabel("● 加速待命")
@@ -268,38 +264,54 @@ class TitleBar(QFrame):
         layout.addWidget(self.btn_close)
 
     def _render_brand_icon(self):
-        """自绘 20x20 品牌 Pixiv 柔和蔚蓝微图标"""
+        """自绘 20x20 GameArt Toolkit 极光渐变品牌矢量微徽标"""
         from PySide6.QtGui import QPixmap
         pixmap = QPixmap(20, 20)
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
         is_dark = ThemeManager.get_instance().is_dark
-        # 圆角背景 (Pixiv 柔和蔚蓝高光渐变)
+        # 圆角背景 (极光深蓝紫到天蓝渐变)
         painter.setPen(Qt.NoPen)
         grad = QLinearGradient(0, 0, 20, 20)
         if is_dark:
-            grad.setColorAt(0, QColor("#7EB9F5"))
-            grad.setColorAt(1, QColor("#1D8CF8"))
+            grad.setColorAt(0.0, QColor("#0B132B"))
+            grad.setColorAt(0.5, QColor("#1C2541"))
+            grad.setColorAt(1.0, QColor("#7EB9F5"))
+            border_c = QColor(255, 255, 255, 30)
         else:
-            grad.setColorAt(0, QColor("#38BDF8"))
-            grad.setColorAt(1, QColor("#0284C7"))
-        painter.setBrush(QBrush(grad))
-        painter.drawRoundedRect(QRectF(1, 1, 18, 18), 5, 5)
+            grad.setColorAt(0.0, QColor("#0369A1"))
+            grad.setColorAt(0.5, QColor("#0284C7"))
+            grad.setColorAt(1.0, QColor("#38BDF8"))
+            border_c = QColor("#BAE0FD")
 
-        # 中心闪电/加速微图腾
-        painter.setPen(QPen(QColor("#FFFFFF"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        path = QPainterPath()
-        path.moveTo(11, 4)
-        path.lineTo(6, 11)
-        path.lineTo(10, 11)
-        path.lineTo(9, 16)
-        path.lineTo(14, 9)
-        path.lineTo(10, 9)
-        path.closeSubpath()
+        painter.setBrush(QBrush(grad))
+        painter.setPen(QPen(border_c, 0.8))
+        painter.drawRoundedRect(QRectF(1, 1, 18, 18), 5.5, 5.5)
+
+        # 居中纯白极速火箭与双翼徽标
+        scale = 20.0 / 24.0
+        rocket_path = QPainterPath()
+        rocket_path.moveTo(12.0 * scale, 4.5 * scale)
+        rocket_path.cubicTo(14.5 * scale, 7.5 * scale, 16.5 * scale, 12.0 * scale, 16.5 * scale, 15.0 * scale)
+        rocket_path.lineTo(14.5 * scale, 15.0 * scale)
+        rocket_path.lineTo(13.5 * scale, 18.0 * scale)
+        rocket_path.lineTo(10.5 * scale, 18.0 * scale)
+        rocket_path.lineTo(9.5 * scale, 15.0 * scale)
+        rocket_path.lineTo(7.5 * scale, 15.0 * scale)
+        rocket_path.cubicTo(7.5 * scale, 12.0 * scale, 9.5 * scale, 7.5 * scale, 12.0 * scale, 4.5 * scale)
+        rocket_path.closeSubpath()
+
         painter.setBrush(QBrush(QColor("#FFFFFF")))
-        painter.drawPath(path)
+        painter.setPen(Qt.NoPen)
+        painter.drawPath(rocket_path)
+
+        # 尾翼发光粒子
+        painter.setBrush(QBrush(QColor("#38BDF8") if is_dark else QColor("#BAE6FD")))
+        painter.drawEllipse(QRectF(11.0 * scale, 18.5 * scale, 2.0 * scale, 2.0 * scale))
+
         painter.end()
         self.icon_label.setPixmap(pixmap)
 
@@ -307,7 +319,7 @@ class TitleBar(QFrame):
         """更新标题栏状态胶囊"""
         is_dark = ThemeManager.get_instance().is_dark
         if is_running:
-            msg = text if text else "● 代理加速中"
+            msg = text if text else "● 加速运行中"
             self.status_pill.setText(msg)
             if is_dark:
                 self.status_pill.setStyleSheet("""
@@ -319,14 +331,14 @@ class TitleBar(QFrame):
                 """)
             else:
                 self.status_pill.setStyleSheet("""
-                    background-color: rgba(16, 185, 129, 0.10);
+                    background-color: rgba(16, 185, 129, 0.12);
                     color: #059669;
-                    border: none;
+                    border: 1px solid rgba(16, 185, 129, 0.3);
                     border-radius: 11px;
                     padding: 2px 10px;
                 """)
         else:
-            msg = text if text else "○ 服务已停止"
+            msg = text if text else "● 加速待命"
             self.status_pill.setText(msg)
             if is_dark:
                 self.status_pill.setStyleSheet("""
@@ -338,9 +350,9 @@ class TitleBar(QFrame):
                 """)
             else:
                 self.status_pill.setStyleSheet("""
-                    background-color: rgba(100, 116, 139, 0.08);
+                    background-color: rgba(100, 116, 139, 0.10);
                     color: #64748B;
-                    border: none;
+                    border: 1px solid rgba(100, 116, 139, 0.2);
                     border-radius: 11px;
                     padding: 2px 10px;
                 """)
@@ -1187,20 +1199,27 @@ class TrafficMonitorChart(QWidget):
 # 6. 延迟微徽章 (LatencyBadge)
 # ==============================================================================
 class LatencyBadge(QWidget):
-    """动态延迟微徽章控件"""
+    """动态延迟微徽章控件 (支持双主题高对比度自适应与动态宽度)"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.latency_ms = -1
         self.is_star = False
         self.via_proxy = False
         self.setFixedHeight(24)
-        self.setMinimumWidth(70)
-        ThemeManager.get_instance().theme_changed.connect(self.update)
+        self.setMinimumWidth(72)
+        # 解耦带参信号槽，确保在主题广播时稳定触发重绘
+        ThemeManager.get_instance().theme_changed.connect(lambda _: self.update())
 
     def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False):
         self.latency_ms = ms
         self.is_star = is_star
         self.via_proxy = via_proxy
+        if is_star or via_proxy:
+            self.setMinimumWidth(98)
+            self.setMaximumWidth(115)
+        else:
+            self.setMinimumWidth(72)
+            self.setMaximumWidth(90)
         self.update()
 
     def paintEvent(self, event):
@@ -1214,42 +1233,42 @@ class LatencyBadge(QWidget):
         if self.latency_ms < 0:
             bg_color = QColor("#182032") if is_dark else QColor("#F1F5F9")
             border_color = QColor("#273752") if is_dark else QColor("#CBD5E1")
-            text_color = QColor("#75879E") if is_dark else QColor("#64748B")
+            text_color = QColor("#75879E") if is_dark else QColor("#475569")
             txt = "检测中"
             dot_color = QColor("#75879E") if is_dark else QColor("#94A3B8")
         elif self.latency_ms >= 9999:
-            bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("rgba(239, 68, 68, 0.10)")
-            border_color = QColor("#EF4444")
+            bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
+            border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
             text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
             txt = "超时"
-            dot_color = QColor("#EF4444")
+            dot_color = QColor("#EF4444") if is_dark else QColor("#EF4444")
         else:
             if self.latency_ms < 60:
-                bg_color = QColor("rgba(52, 211, 153, 0.12)") if is_dark else QColor("rgba(16, 185, 129, 0.08)")
-                border_color = QColor("transparent")
+                bg_color = QColor("rgba(52, 211, 153, 0.12)") if is_dark else QColor("#ECFDF5")
+                border_color = QColor("rgba(52, 211, 153, 0.25)") if is_dark else QColor("#34D399")
                 text_color = QColor("#34D399") if is_dark else QColor("#059669")
-                dot_color = QColor("#10B981")
+                dot_color = QColor("#10B981") if is_dark else QColor("#10B981")
             elif self.latency_ms < 150:
-                bg_color = QColor("rgba(245, 158, 11, 0.15)") if is_dark else QColor("rgba(245, 158, 11, 0.10)")
-                border_color = QColor("#D97706")
+                bg_color = QColor("rgba(245, 158, 11, 0.15)") if is_dark else QColor("#FFFBEB")
+                border_color = QColor("#D97706") if is_dark else QColor("#FBBF24")
                 text_color = QColor("#FBBF24") if is_dark else QColor("#D97706")
-                dot_color = QColor("#F59E0B")
+                dot_color = QColor("#F59E0B") if is_dark else QColor("#F59E0B")
             else:
-                bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("rgba(239, 68, 68, 0.10)")
-                border_color = QColor("#EF4444")
+                bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
+                border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
                 text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
-                dot_color = QColor("#EF4444")
+                dot_color = QColor("#EF4444") if is_dark else QColor("#EF4444")
 
             if self.via_proxy:
-                txt = f"{int(self.latency_ms)} ms [代理转发]"
+                txt = f"{int(self.latency_ms)} ms [代理]"
             elif self.is_star:
                 txt = f"{int(self.latency_ms)} ms [优选]"
             else:
                 txt = f"{int(self.latency_ms)} ms"
 
-        # 胶囊外框
+        # 胶囊外框 (1.2px 边框)
         rect = QRectF(1, 1, w - 2, h - 2)
-        painter.setPen(QPen(border_color, 1))
+        painter.setPen(QPen(border_color, 1.2))
         painter.setBrush(QBrush(bg_color))
         painter.drawRoundedRect(rect, h / 2.0, h / 2.0)
 

@@ -165,6 +165,7 @@ def run_full_verification():
     report.print_section("第 3 部分：Material Design 3 原生自绘高级现代控件单元验证")
 
     from frameless_helper import NativeFramelessHelper
+    from material_theme import ThemeManager
     from md_widgets import (
         TitleBar, ToastNotification, ToastManager, show_toast,
         InlineEditableLabel, MDSwitch, TrafficMonitorChart,
@@ -193,12 +194,14 @@ def run_full_verification():
     report.assert_true(title_bar.btn_max is not None, "TitleBar 最大化按钮存在")
     report.assert_true(title_bar.btn_close is not None, "TitleBar 关闭按钮存在")
     report.assert_equal(title_bar.height(), 38, "TitleBar 高度规范为 38px")
+    report.assert_equal(title_bar.title_label.text(), "GameArt Toolkit", "TitleBar 品牌标题为 GameArt Toolkit")
+    report.assert_true(not hasattr(title_bar, "badge_label"), "TitleBar 已移除多余的 MD3 Native 标签")
 
     # 状态胶囊更新测试
-    title_bar.update_status(True, "● 代理加速中")
-    report.assert_true("代理加速中" in title_bar.status_pill.text(), "TitleBar 状态胶囊更新为加速中")
-    title_bar.update_status(False, "○ 服务已停止")
-    report.assert_true("服务已停止" in title_bar.status_pill.text(), "TitleBar 状态胶囊更新为已停止")
+    title_bar.update_status(True, "● 加速运行中")
+    report.assert_true("加速运行中" in title_bar.status_pill.text(), "TitleBar 状态胶囊更新为加速运行中")
+    title_bar.update_status(False, "● 加速待命")
+    report.assert_true("加速待命" in title_bar.status_pill.text(), "TitleBar 状态胶囊更新为加速待命")
 
     # 最大化图标切换测试
     title_bar.update_max_icon(True)
@@ -347,6 +350,16 @@ def run_full_verification():
     badge.set_latency(28, is_star=True)
     report.assert_equal(badge.latency_ms, 28, "LatencyBadge 延迟设置成功")
     report.assert_equal(badge.is_star, True, "LatencyBadge 优选星标标记成功")
+    report.assert_true(badge.minimumWidth() >= 98, "LatencyBadge 优选态自适应宽度 >= 98px")
+
+    badge.set_latency(85, via_proxy=True)
+    report.assert_equal(badge.via_proxy, True, "LatencyBadge 代理转发状态设置成功")
+
+    # 验证主题切换信号槽触发无异常
+    ThemeManager.get_instance().set_theme("light")
+    report.assert_equal(ThemeManager.get_instance().is_dark, False, "主题成功切换为 Light 浅色模式")
+    ThemeManager.get_instance().set_theme("dark")
+    report.assert_equal(ThemeManager.get_instance().is_dark, True, "主题成功切换为 Dark 深色模式")
 
     badge.set_latency(-1)
     report.assert_equal(badge.latency_ms, -1, "LatencyBadge 检测中状态设置成功")
@@ -399,6 +412,27 @@ def run_full_verification():
     from pyside_app import MainWindow, emergency_fast_cleanup
     main_win = MainWindow()
     report.assert_true(main_win is not None, "MainWindow 实例化成功")
+    report.assert_true(len(main_win.service_icon_labels) >= 18, "主控制台服务卡片专属矢量图标全部注册成功")
+
+    # 4.7 测试服务卡片开关动态变色
+    main_win.on_service_toggled("pixiv_web", False)
+    report.assert_true(True, "关闭服务开关成功触发图标待命变色")
+    main_win.on_service_toggled("pixiv_web", True)
+    report.assert_true(True, "开启服务开关成功触发图标高亮变色")
+
+    # 4.8 测试四合一状态卡片图标就绪
+    report.assert_true(hasattr(main_win.card_stat_nginx, 'icon_lbl'), "Nginx 状态卡片具备专属矢量图标")
+    report.assert_true(hasattr(main_win.card_stat_cert, 'icon_lbl'), "证书状态卡片具备专属矢量图标")
+    report.assert_true(hasattr(main_win.card_stat_hosts, 'icon_lbl'), "Hosts 状态卡片具备专属矢量图标")
+    report.assert_true(hasattr(main_win.card_stat_steam, 'icon_lbl'), "Steam 状态卡片具备专属矢量图标")
+    report.assert_true(main_win.lbl_main_icon is not None, "巨型主控卡片具备动态状态大图标")
+    report.assert_true(main_win.lbl_sidebar_logo is not None, "侧边栏具备 34x34 专属极光渐变品牌 Logo")
+
+    # 4.9 测试亮色模式淡冰蓝调色板
+    from material_theme import MATERIAL_LIGHT_QSS
+    report.assert_true("#EEF5FD" in MATERIAL_LIGHT_QSS, "亮色模式全局底色已升级为淡冰蓝 #EEF5FD")
+    report.assert_true("#E4EFFB" in MATERIAL_LIGHT_QSS, "亮色模式侧边栏底色已升级为浅霜蓝 #E4EFFB")
+
     main_win.start_acceleration(show_toast_on_fail=False)
     report.assert_true(True, "MainWindow.start_acceleration 执行无未定义异常 (enabled_services 回归)")
     main_win.stop_acceleration()

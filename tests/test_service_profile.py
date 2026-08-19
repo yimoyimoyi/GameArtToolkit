@@ -83,17 +83,17 @@ class TestEnvDetector(unittest.TestCase):
         self.assertIsInstance(active_ports, list)
 
     def test_hosts_conflict_check(self):
-        """测试 Hosts 外部冲突检测逻辑"""
+        """测试 Hosts 外部冲突检测逻辑 (兼容 GameArt Toolkit 与历史标签)"""
         sample_hosts = (
             "127.0.0.1 localhost\n"
             "0.0.0.0 steamcommunity.com\n"
-            "# >>>>> PixivToolkit Rules Start >>>>>\n"
+            "# >>>>> GameArt Toolkit Rules Start >>>>>\n"
             "127.0.0.1 pixiv.net\n"
-            "# <<<<< PixivToolkit Rules End <<<<<\n"
+            "# <<<<< GameArt Toolkit Rules End <<<<<\n"
             "1.2.3.4 github.com\n"
         )
         conflicts = EnvDetector.check_hosts_conflicts(sample_hosts)
-        # steamcommunity.com 和 github.com 在 PTK block 之外，应被精准捕获为冲突
+        # steamcommunity.com 和 github.com 在 block 之外，应被精准捕获为冲突
         conflict_domains = [c["domain"] for c in conflicts]
         self.assertIn("steamcommunity.com", conflict_domains)
         self.assertIn("github.com", conflict_domains)

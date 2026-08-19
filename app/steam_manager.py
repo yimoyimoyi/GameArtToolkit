@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Steam 快速账号切换管理引擎 (词法解析与原子备份)
+GameArt Toolkit - Steam 快速账号切换管理引擎 (词法解析与原子备份)
 """
 
 import os

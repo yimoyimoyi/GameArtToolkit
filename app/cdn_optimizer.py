@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 高并发 CDN 测速与动态 Upstream 优选引擎 (双通道三态探测)
+GameArt Toolkit - 高并发 CDN 测速与动态 Upstream 优选引擎 (双通道三态探测)
 
 核心改进:
 - 双通道探测: 直连 + 经本地代理(默认 127.0.0.1:7897 Clash mixed) HTTP CONNECT 隧道
@@ -212,7 +212,7 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 1.5,
         try:
             ssock.settimeout(max(deadline - time.monotonic(), 0.5))
             ssock.sendall(f"GET / HTTP/1.1\r\nHost: {domain}\r\n"
-                          f"User-Agent: PixivToolkit/1.0\r\nConnection: close\r\n\r\n".encode("utf-8"))
+                          f"User-Agent: GameArtToolkit/1.0\r\nConnection: close\r\n\r\n".encode("utf-8"))
             hdr = b""
             while b"\r\n\r\n" not in hdr:
                 chunk = ssock.recv(4096)
@@ -445,7 +445,7 @@ class CDNOptimizer:
         """
         lines = [
             "# ==============================================================================",
-            "# PixivToolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)",
+            "# GameArt Toolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)",
             f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "# 仅写入 rank0 (直连三态全通) 节点, 排除假节点导致 502",
             "# max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
@@ -765,7 +765,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     print("=" * 80)
-    print(">>> PixivToolkit - CDN 节点全网深度探测与动态优选 CLI <<<")
+    print(">>> GameArt Toolkit - CDN 节点全网深度探测与动态优选 CLI <<<")
     print("=" * 80)
 
     conf_file = Path(__file__).resolve().parent.parent / "nginx" / "conf" / "upstream-dynamic.conf"

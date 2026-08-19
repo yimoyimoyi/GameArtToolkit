@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 全面自动化回归验证与针对性测试脚本
+GameArt Toolkit - 全面自动化回归验证与针对性测试脚本
 包含 6 大专项测试域：
 1. Nginx 语法预检与 Upstream 对齐测试
 2. CryptoAPI 原生证书检测与防误判测试
@@ -384,7 +384,7 @@ class TestRegressionSuite:
     def run_all(self):
         self.setup_method()
         print("\n" + "#"*70)
-        print("   PixivToolkit 全面自动化测试与回归验证套件 (Regression Test Suite)")
+        print("   GameArt Toolkit 全面自动化测试与回归验证套件 (Regression Test Suite)")
         print("#"*70)
 
         self.test_nginx_syntax_and_upstream_alignment()

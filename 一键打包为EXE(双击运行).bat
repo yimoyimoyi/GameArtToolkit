@@ -1,6 +1,6 @@
 ﻿@echo off
 chcp 65001 >nul
-title PixivToolkit - 打包为 EXE
+title GameArt Toolkit - 打包为 EXE
 cd /d "%~dp0"
 
 echo ========================================================
@@ -10,6 +10,6 @@ python build.py
 echo.
 echo 打包结束，按任意键打开发布目录...
 pause >nul
-if exist "%~dp0dist\PixivToolkit" (
-    start explorer "%~dp0dist\PixivToolkit"
-)
+if exist "%~dp0dist\GameArtToolkit" (
+    start explorer "%~dp0dist\GameArtToolkit"
+)

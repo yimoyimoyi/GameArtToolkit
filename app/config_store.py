@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 配置持久化存储模块 (原子安全写入与备份)
+GameArt Toolkit - 配置持久化存储模块 (原子安全写入与备份)
 """
 
 import os
@@ -36,7 +36,8 @@ DEFAULT_CONFIG = {
     "last_optimal_time": 0,
 
     # 测速探测专用本地代理 (Clash/v2ray/Sing-box mixed 端口, 仅作真实节点筛选, 不参与 nginx 转发)
-    "upstream_proxy": {"enabled": False, "host": "127.0.0.1", "port": 7897}
+    "upstream_proxy": {"enabled": False, "host": "127.0.0.1", "port": 7897},
+    "cached_latencies": {}
 }
 
 # 旧版粗粒度服务 ID 到细粒度 ID 的映射转换字典 (自动兼容历史配置)

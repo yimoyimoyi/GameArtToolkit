@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Win32 原生无边框窗口与 DWM 拦截器
+GameArt Toolkit - Win32 原生无边框窗口与 DWM 拦截器
 提供:
 1. 无外部依赖的原生无边框 (去掉系统白色边框与标题栏)
 2. 保留 Windows 硬件阴影与 Windows 11 原生圆角

@@ -139,7 +139,7 @@ def test_fast_remove_performance():
     print("  => 关机快速清理性能与幂等性验证通过 [PASS]")
 
 def test_proxy_alive_probe():
-    print("\n[Test 5/5] 测试上游测速代理连通性探测与关机钩子注册...")
+    print("\n[Test 5/6] 测试上游测速代理连通性探测与关机钩子注册...")
     # 测试本机无效端口
     res_dead = check_proxy_alive("127.0.0.1", 59999, timeout=0.1)
     print(f"  - 探测无效端口 59999 连通性: {res_dead} (预期 False)")
@@ -155,17 +155,61 @@ def test_proxy_alive_probe():
     assert ok, "注册关机钩子失败"
     print("  => 上游测速代理探测与关机钩子注册测试通过 [PASS]")
 
+def test_hosts_backup_rotation_and_subfolder():
+    print("\n[Test 6/6] 测试 Hosts 备份子目录收敛与自动轮转上限 (保留 5 份)...")
+    test_hosts_path = BASE_DIR / "temp_test_hosts_bak"
+    test_backup_dir = BASE_DIR / "backups" / "test_hosts"
+    test_hosts_path.write_text("127.0.0.1 test.local\n", encoding="utf-8")
+
+    try:
+        if test_backup_dir.exists():
+            shutil.rmtree(test_backup_dir, ignore_errors=True)
+
+        hm = HostsManager(hosts_file=test_hosts_path, backup_dir=test_backup_dir)
+
+        # 连续生成 10 次备份 (设置 max_keep=5)
+        created_paths = []
+        for i in range(10):
+            test_hosts_path.write_text(f"127.0.0.1 test{i}.local\n", encoding="utf-8")
+            time.sleep(0.01)  # 确保时间戳微差
+            p = hm.create_backup(max_keep=5)
+            assert p is not None, f"第 {i+1} 次创建备份失败"
+            assert p.parent == test_backup_dir, "备份文件未保存在指定的子目录中"
+            created_paths.append(p)
+
+        # 检查最终保留的备份
+        remaining_baks = hm.list_backups()
+        print(f"  - 连续生成 10 次备份后，子目录中实际保留数量: {len(remaining_baks)} (预期: 5)")
+        assert len(remaining_baks) == 5, f"备份数量超过上限: {len(remaining_baks)}"
+
+        # 验证保留的文件全在最后生成的批次中
+        remaining_names = {f.name for f in remaining_baks}
+        latest_5_names = {p.name for p in created_paths[-5:]}
+        assert remaining_names == latest_5_names, "旧备份淘汰错误，未保留最新生成的 5 份"
+
+        # 验证根目录没有散落文件
+        legacy_scattered = list(BASE_DIR.glob("temp_test_hosts_bak.ptk_bak_*.bak"))
+        assert len(legacy_scattered) == 0, "根目录发现散落的旧版 bak 文件"
+
+        print("  => Hosts 备份子目录隔离与数量自动轮转验证通过 [PASS]")
+    finally:
+        if test_hosts_path.exists():
+            test_hosts_path.unlink(missing_ok=True)
+        if test_backup_dir.exists():
+            shutil.rmtree(test_backup_dir, ignore_errors=True)
+
 def run_all():
     print("==================================================")
-    print("   PixivToolkit 设置扩展与关机自动恢复自动化验证")
+    print("   GameArt Toolkit 设置扩展与关机自动恢复自动化验证")
     print("==================================================")
     test_config_expansion()
     test_autostart_registry()
     test_hosts_diagnosis_and_restore()
     test_fast_remove_performance()
     test_proxy_alive_probe()
+    test_hosts_backup_rotation_and_subfolder()
     print("\n==================================================")
-    print("  [SUCCESS] 5 大专项生命周期与设置验证全部通过！")
+    print("  [SUCCESS] 6 大专项生命周期与设置验证全部通过！")
     print("==================================================")
 
 if __name__ == "__main__":

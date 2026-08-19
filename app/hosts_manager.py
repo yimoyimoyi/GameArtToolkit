@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 标签化 Hosts 管理引擎 (原子替换与只读自动修复)
+GameArt Toolkit - 标签化 Hosts 管理引擎 (原子替换与只读自动修复)
 """
 
 import os
@@ -8,23 +8,102 @@ import re
 import sys
 import stat
 import shutil
+import datetime
+import time
 from pathlib import Path
-from typing import List, Tuple, Set, Dict
+from typing import List, Tuple, Set, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ip_pool import SERVICES_LIST, SERVICES_BY_ID
 from service_profile import ServiceMode, get_profile_by_id
 from win_utils import flush_dns_native
+from path_utils import BASE_DIR, HOSTS_BACKUP_DIR
 
 HOSTS_PATH = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
 HOSTS_BAK_PATH = HOSTS_PATH.with_suffix(".ptk.bak")
 
-BLOCK_START = "# >>>>> PixivToolkit Rules Start >>>>>"
-BLOCK_END = "# <<<<< PixivToolkit Rules End <<<<<"
+BLOCK_START = "# >>>>> GameArt Toolkit Rules Start >>>>>"
+BLOCK_END = "# <<<<< GameArt Toolkit Rules End <<<<<"
+LEGACY_BLOCK_START = "# >>>>> PixivToolkit Rules Start >>>>>"
+LEGACY_BLOCK_END = "# <<<<< PixivToolkit Rules End <<<<<"
+
+DEFAULT_MAX_BACKUPS = 5
 
 class HostsManager:
-    def __init__(self, hosts_file: Path = HOSTS_PATH):
+    def __init__(self, hosts_file: Path = HOSTS_PATH, backup_dir: Optional[Path] = None):
         self.hosts_file = hosts_file
+        self.backup_dir = backup_dir if backup_dir is not None else HOSTS_BACKUP_DIR
+
+    def get_backup_dir(self) -> Path:
+        """获取并确保备份子文件夹存在"""
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        return self.backup_dir
+
+    def create_backup(self, max_keep: int = DEFAULT_MAX_BACKUPS) -> Optional[Path]:
+        """为当前 hosts 创建结构化时间戳备份并自动执行旧备份轮转淘汰"""
+        if not self.hosts_file.exists():
+            return None
+        try:
+            b_dir = self.get_backup_dir()
+            ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            bak_filename = f"hosts_bak_{ts_str}.bak"
+            bak_target = b_dir / bak_filename
+
+            shutil.copy(self.hosts_file, bak_target)
+
+            # 自动执行轮转清理
+            self.cleanup_old_backups(max_keep=max_keep)
+            # 清理根目录遗留的历史散落 bak 文件
+            self.clean_legacy_scattered_backups()
+
+            return bak_target
+        except Exception:
+            return None
+
+    def list_backups(self) -> List[Path]:
+        """获取所有备份文件列表 (按生成时间戳/字典序从新到旧精确排序)"""
+        if not self.backup_dir.exists():
+            return []
+        try:
+            files = [f for f in self.backup_dir.glob("*.bak") if f.is_file()]
+            # 优先按文件名字典序 (包含毫秒/纳秒时间戳) 降序排序，消除文件系统 mtime 精度差
+            files.sort(key=lambda x: x.name, reverse=True)
+            return files
+        except Exception:
+            return []
+
+    def cleanup_old_backups(self, max_keep: int = DEFAULT_MAX_BACKUPS) -> int:
+        """轮转淘汰旧备份，确保备份总数不超过 max_keep"""
+        all_baks = self.list_backups()
+        if len(all_baks) <= max_keep:
+            return 0
+
+        deleted_count = 0
+        for old_file in all_baks[max_keep:]:
+            try:
+                old_file.unlink(missing_ok=True)
+                deleted_count += 1
+            except Exception:
+                pass
+        return deleted_count
+
+    def clean_legacy_scattered_backups(self) -> int:
+        """清理项目根目录与宿主目录下遗留的旧版散落 bak 文件"""
+        deleted_count = 0
+        patterns = [
+            "hosts.ptk_bak_*.bak",
+            "temp_test_hosts.ptk_bak_*.bak",
+            "hosts.ptk.bak",
+            "hosts.ptk_bak_*"
+        ]
+        for pat in patterns:
+            for f in BASE_DIR.glob(pat):
+                try:
+                    f.unlink(missing_ok=True)
+                    deleted_count += 1
+                except Exception:
+                    pass
+        return deleted_count
 
     def is_writable(self) -> bool:
         """检查 hosts 文件是否可写"""
@@ -38,20 +117,25 @@ class HostsManager:
             return False
 
     def is_applied(self) -> bool:
-        """检查 PixivToolkit 规则是否已注入 hosts"""
+        """检查 GameArt Toolkit 规则是否已注入 hosts"""
         if not self.hosts_file.exists():
             return False
         try:
             with open(self.hosts_file, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-                return BLOCK_START in content and BLOCK_END in content
+                is_current = (BLOCK_START in content and BLOCK_END in content)
+                is_legacy = (LEGACY_BLOCK_START in content and LEGACY_BLOCK_END in content)
+                return is_current or is_legacy
         except Exception:
             return False
 
     def remove_rules_from_content(self, text: str) -> str:
-        """从 hosts 文本中安全剥离 PixivToolkit 规则块，保持原有排版"""
+        """从 hosts 文本中安全剥离 GameArt Toolkit / PixivToolkit 规则块，保持原有排版"""
         pattern = re.compile(rf"{re.escape(BLOCK_START)}.*?{re.escape(BLOCK_END)}\r?\n?", re.DOTALL)
         text = pattern.sub("", text)
+
+        legacy_ptk_pattern = re.compile(rf"{re.escape(LEGACY_BLOCK_START)}.*?{re.escape(LEGACY_BLOCK_END)}\r?\n?", re.DOTALL)
+        text = legacy_ptk_pattern.sub("", text)
 
         legacy_pattern = re.compile(r"# Pixiv Start.*?# Pixiv End\r?\n?", re.DOTALL)
         text = legacy_pattern.sub("", text)
@@ -66,12 +150,9 @@ class HostsManager:
 
     def _safe_write_hosts(self, content: str):
         """写入 hosts 文件，支持 Windows 原生属性修复与多重备份写入机制"""
-        # 1. 创建前置备份副本
-        if self.hosts_file.exists() and not HOSTS_BAK_PATH.exists():
-            try:
-                shutil.copy2(self.hosts_file, HOSTS_BAK_PATH)
-            except Exception:
-                pass
+        # 1. 创建前置备份副本 (收敛于 backups/hosts/ 子目录并自动轮转，最多保留 5 份)
+        if self.hosts_file.exists():
+            self.create_backup(max_keep=DEFAULT_MAX_BACKUPS)
 
         # 2. 清除只读、系统、隐藏等 Windows 文件属性 (FILE_ATTRIBUTE_NORMAL = 0x80)
         if self.hosts_file.exists():
@@ -179,7 +260,7 @@ class HostsManager:
                 return True, "已清空所有加速 Hosts 规则"
 
             # 构造全新的注入规则块 (按域名排序输出)
-            lines = [BLOCK_START, "# 本规则由 PixivToolkit 自动安全托管，退出程序时将自动完全清理"]
+            lines = [BLOCK_START, "# 本规则由 GameArt Toolkit 自动安全托管，退出程序时将自动完全清理"]
             for dom in sorted(domain_ip_map.keys()):
                 ip = domain_ip_map[dom]
                 lines.append(f"{ip} {dom}")
@@ -201,7 +282,7 @@ class HostsManager:
             return False, f"修改 Hosts 异常: {e}"
 
     def remove_rules(self) -> Tuple[bool, str]:
-        """安全移除 PixivToolkit 注入的全部规则"""
+        """安全移除 GameArt Toolkit 注入的全部规则"""
         if not self.hosts_file.exists():
             return True, "Hosts 文件不存在"
 
@@ -209,7 +290,7 @@ class HostsManager:
             with open(self.hosts_file, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            if BLOCK_START not in content and "# Pixiv Start" not in content:
+            if BLOCK_START not in content and LEGACY_BLOCK_START not in content and "# Pixiv Start" not in content:
                 return True, "Hosts 中无残留规则"
 
             clean_content = self.remove_rules_from_content(content)
@@ -311,17 +392,19 @@ class HostsManager:
 
                 has_start = BLOCK_START in content
                 has_end = BLOCK_END in content
-                has_ptk = has_start and has_end
+                has_legacy_start = LEGACY_BLOCK_START in content
+                has_legacy_end = LEGACY_BLOCK_END in content
+                has_ptk = (has_start and has_end) or (has_legacy_start and has_legacy_end)
 
-                if has_start != has_end:
-                    issues.append("检测到不对称破损的 PixivToolkit 规则标签")
+                if (has_start != has_end) or (has_legacy_start != has_legacy_end):
+                    issues.append("检测到不对称破损的加速规则标签")
                     if auto_fix:
                         content = self.remove_rules_from_content(content)
                         fixes.append("已修复并剥离损坏的不对称标签")
 
                 # 检测遗留的旧版/第三方工具劫持残留
                 for kw in ["pixiv.net", "steamcommunity.com", "github.com", "huggingface.co"]:
-                    if f"127.0.0.1 {kw}" in content and not (has_start and has_end):
+                    if f"127.0.0.1 {kw}" in content and not has_ptk:
                         has_conflicts = True
                         issues.append(f"发现外部/旧版残留规则: {kw}")
         except Exception as e:
@@ -382,15 +465,9 @@ class HostsManager:
             "#\t::1             localhost\r\n"
         )
         try:
-            # 1. 生成时间戳备份副本
+            # 1. 生成时间戳备份副本 (收敛于 backups/hosts/ 子目录并自动轮转)
             if self.hosts_file.exists():
-                import time
-                ts = int(time.time())
-                bak_path = self.hosts_file.with_name(f"hosts.ptk_bak_{ts}.bak")
-                try:
-                    shutil.copy2(self.hosts_file, bak_path)
-                except Exception:
-                    pass
+                self.create_backup(max_keep=DEFAULT_MAX_BACKUPS)
 
             # 2. 强清文件属性
             try:

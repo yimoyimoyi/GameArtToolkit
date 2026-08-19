@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - PySide6 客户端 PyInstaller 编译与打包脚本 (防占用与自动清理)
+GameArt Toolkit - PySide6 客户端 PyInstaller 编译与打包脚本 (防占用与自动清理)
 """
 
 import os
@@ -14,17 +14,17 @@ BASE_DIR = Path(__file__).resolve().parent
 
 def build_exe():
     print("========================================================")
-    print("   PixivToolkit (PySide6) 开始编译打包为 EXE")
+    print("   GameArt Toolkit (PySide6) 开始编译打包为 EXE")
     print("========================================================")
 
     dist_dir = BASE_DIR / "dist"
     build_dir = BASE_DIR / "build"
     app_entry = BASE_DIR / "app" / "pyside_app.py"
 
-    # 1. 终止可能正在运行的 Nginx 或 PixivToolkit 进程，防止文件锁定
+    # 1. 终止可能正在运行的 Nginx 或 GameArtToolkit 进程，防止文件锁定
     print("\n[1/4] 清理正在运行的后台进程与锁文件...")
-    subprocess.run("taskkill /F /IM nginx.exe /IM PixivToolkit.exe", shell=True, capture_output=True)
-    ps_kill = "Start-Process taskkill -ArgumentList '/F /IM nginx.exe /IM PixivToolkit.exe' -Verb RunAs -Wait"
+    subprocess.run("taskkill /F /IM nginx.exe /IM GameArtToolkit.exe /IM PixivToolkit.exe", shell=True, capture_output=True)
+    ps_kill = "Start-Process taskkill -ArgumentList '/F /IM nginx.exe /IM GameArtToolkit.exe /IM PixivToolkit.exe' -Verb RunAs -Wait"
     try:
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_kill], capture_output=True, timeout=5)
     except Exception:
@@ -41,7 +41,7 @@ def build_exe():
                     break
                 except Exception as e:
                     time.sleep(0.5)
-                    subprocess.run("taskkill /F /IM nginx.exe /IM PixivToolkit.exe", shell=True, capture_output=True)
+                    subprocess.run("taskkill /F /IM nginx.exe /IM GameArtToolkit.exe /IM PixivToolkit.exe", shell=True, capture_output=True)
 
     # 3. 构造 PyInstaller 指令与图标配置
     icon_file = BASE_DIR / "app" / "icon.ico"
@@ -68,7 +68,7 @@ def build_exe():
         "--onedir",
         "--windowed",
         "--uac-admin",
-        "--name", "PixivToolkit",
+        "--name", "GameArtToolkit",
     ]
 
     if icon_file.exists():
@@ -89,7 +89,7 @@ def build_exe():
 
     # 4. 复制 Nginx 运行时、SSL 证书与默认配置到发布目录
     print("\n[4/4] 部署便携式 Nginx 数据平面与依赖文件...")
-    target_out_dir = dist_dir / "PixivToolkit"
+    target_out_dir = dist_dir / "GameArtToolkit"
     target_nginx_root = target_out_dir / "nginx"
 
     # 忽略开发运行产生的脏日志、缓存以及任何本地生成的私钥/证书 (零私钥分发)
@@ -116,7 +116,7 @@ def build_exe():
     print("\n========================================================")
     print("  [SUCCESS] 打包完成！发布目录:")
     print(f"  {target_out_dir}")
-    print("  可执行文件: PixivToolkit.exe (自带 UAC 管理员清单，启动无需 Python 环境)")
+    print("  可执行文件: GameArtToolkit.exe (自带 UAC 管理员清单，启动无需 Python 环境)")
     print("========================================================")
     return True
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 统一声明式服务元数据模型与配置体系 (Service Profile)
+GameArt Toolkit - 统一声明式服务元数据模型与配置体系 (Service Profile)
 
 核心功能:
 - 声明式定义各加速服务的元数据、域名、路径规则、加速模式 (L7 Nginx / L4 Relay / Direct)
@@ -45,6 +45,7 @@ class ServiceProfile:
     name: str                                # 友好中文名称
     desc: str                                # 服务描述说明
     domains: List[str]                       # 关联的域名列表
+    icon: str = "zap"                        # MD3 矢量图标标识
     mode: ServiceMode = ServiceMode.L7_NGINX # 默认处理模式
     upstream_name: str = ""                  # Nginx upstream 标识符 (如 upstream_pixiv_web)
     ssl_sni_mode: str = "host"               # SNI 模式: 'host', 'empty', 或自定义伪装域名
@@ -101,6 +102,7 @@ PROFILES: List[ServiceProfile] = [
         name="Steam 商店与结账",
         desc="解决 Steam 商店首页白屏、愿望单与购物车结账卡死",
         domains=["store.steampowered.com", "checkout.steampowered.com", "help.steampowered.com", "login.steampowered.com"],
+        icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_store",
         ssl_sni_mode="host",
@@ -112,6 +114,7 @@ PROFILES: List[ServiceProfile] = [
         name="Steam 社区与个人资料",
         desc="解决 118 错误代码、玩家动态、讨论区与徽章展示",
         domains=["steamcommunity.com", "api.steampowered.com"],
+        icon="gamepad",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_community",
         ssl_sni_mode="statuspage.akamaized.net",  # 伪 SNI 绕过 GFW
@@ -127,6 +130,7 @@ PROFILES: List[ServiceProfile] = [
                  "community.akamai.steamstatic.com",
                  "steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",  # 创意工坊封面/用户上传图
                  "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"],  # 静态资源 CDN
+        icon="zap",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_akamai",
         ssl_sni_mode="community.steamstatic.com",
@@ -138,6 +142,7 @@ PROFILES: List[ServiceProfile] = [
         name="Ubisoft 育碧商城",
         desc="解决育碧“无法建立连接”、Club 奖励加载超时",
         domains=["store.ubi.com", "ubisoftconnect.com", "api-ubiservices.ubi.com"],
+        icon="rocket",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_ubisoft",
         ssl_sni_mode="host",
@@ -149,6 +154,7 @@ PROFILES: List[ServiceProfile] = [
         name="EA App / Origin",
         desc="解决 EA 登录凭据验证超时、商城加载失败",
         domains=["api.origin.com", "signin.ea.com", "api1.origin.com"],
+        icon="rocket",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_ea_app",
         ssl_sni_mode="host",
@@ -171,6 +177,7 @@ PROFILES: List[ServiceProfile] = [
             "source.pixiv.net", "i1.pixiv.net", "i2.pixiv.net", "i3.pixiv.net", "i4.pixiv.net",
             "app-api.pixiv.net", "lc-event.pixiv.net"
         ],
+        icon="palette",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_web",
         ssl_sni_mode="empty",  # 空 SNI 直通
@@ -189,6 +196,7 @@ PROFILES: List[ServiceProfile] = [
             "hlsa1.pixivsketch.net", "hlsa2.pixivsketch.net", "hlsa3.pixivsketch.net", "hlsa4.pixivsketch.net",
             "hlsc1.pixivsketch.net", "hlsc2.pixivsketch.net", "hlse1.pixivsketch.net", "hlse2.pixivsketch.net"
         ],
+        icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_img",
         ssl_sni_mode="empty",
@@ -201,6 +209,7 @@ PROFILES: List[ServiceProfile] = [
         name="Pixiv Fanbox 创作者赞助",
         desc="解决创作者赞助平台、图文帖子与赞助列表加载",
         domains=["fanbox.cc", "www.fanbox.cc", "api.fanbox.cc", "downloads.fanbox.cc"],
+        icon="star",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_fanbox",
         ssl_sni_mode="host",
@@ -212,6 +221,7 @@ PROFILES: List[ServiceProfile] = [
         name="BOOTH 同人商城",
         desc="Pixiv 旗下同人志、3D 模型与独立周边商城",
         domains=["booth.pm", "www.booth.pm", "api.booth.pm", "assets.booth.pm"],
+        icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_booth_pm",
         ssl_sni_mode="host",
@@ -223,6 +233,7 @@ PROFILES: List[ServiceProfile] = [
         name="Danbooru 动漫图库",
         desc="解决动漫插画检索图库缩略图与大图加载缓慢",
         domains=["danbooru.donmai.us", "cdn.donmai.us"],
+        icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_danbooru",
         ssl_sni_mode="host",
@@ -234,6 +245,7 @@ PROFILES: List[ServiceProfile] = [
         name="Yande.re 高清动漫壁纸",
         desc="解决超高清壁纸原图下载超时与死循环重定向",
         domains=["yande.re", "www.yande.re", "files.yande.re", "assets.yande.re"],
+        icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_yandere",
         ssl_sni_mode="host",
@@ -245,6 +257,7 @@ PROFILES: List[ServiceProfile] = [
         name="VNDB 视觉小说资料库",
         desc="解决 Galgame/视觉小说综合数据库及其封面原图",
         domains=["vndb.org", "t.vndb.org"],
+        icon="book",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_vndb",
         ssl_sni_mode="host",
@@ -266,6 +279,7 @@ PROFILES: List[ServiceProfile] = [
             "community.github.com", "docs.github.com", "education.github.com", "enterprise.github.com",
             "classroom.github.com", "redirect.github.com"
         ],
+        icon="terminal",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_web",
         ssl_sni_mode="host",
@@ -282,6 +296,7 @@ PROFILES: List[ServiceProfile] = [
             "avatars2.githubusercontent.com", "avatars3.githubusercontent.com", "avatars4.githubusercontent.com",
             "avatars5.githubusercontent.com", "camo.githubusercontent.com", "desktop.githubusercontent.com"
         ],
+        icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_raw",
         ssl_sni_mode="host",
@@ -295,6 +310,7 @@ PROFILES: List[ServiceProfile] = [
         name="GitHub Releases 附件与文件对象",
         desc="解决 Release 软件安装包下载卡在 0% 或极慢",
         domains=["objects.githubusercontent.com", "github-releases.githubusercontent.com", "media.githubusercontent.com"],
+        icon="rocket",
         mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载
         upstream_name="upstream_github_release",
         ssl_sni_mode="host",
@@ -306,6 +322,7 @@ PROFILES: List[ServiceProfile] = [
         name="GitHub 前端 JS/CSS 静态 CDN",
         desc="解决 GitHub 前端 CSS/JS 静态资源与文档页加载",
         domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev"],
+        icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_assets",
         ssl_sni_mode="host",
@@ -319,6 +336,7 @@ PROFILES: List[ServiceProfile] = [
         name="GitLab 国际版",
         desc="解决 GitLab 国际版网页与 Raw 源码直连",
         domains=["gitlab.com", "assets.gitlab-static.net"],
+        icon="terminal",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_gitlab",
         ssl_sni_mode="host",
@@ -331,6 +349,7 @@ PROFILES: List[ServiceProfile] = [
         name="HuggingFace AI 平台",
         desc="解决开源大模型权重文件与 Space 空间直连加速 (L4 极速直通)",
         domains=["huggingface.co", "www.huggingface.co", "cdn-lfs.huggingface.co", "cdn-thumbnails.huggingface.co", "hf.co"],
+        icon="cpu",
         mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载，突破 Nginx 缓冲与体积限制
         upstream_name="upstream_huggingface",
         ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",

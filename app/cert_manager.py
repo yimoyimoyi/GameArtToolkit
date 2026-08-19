@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Windows 本地根证书与服务端证书自生成与静默管理模块
+GameArt Toolkit - Windows 本地根证书与服务端证书自生成与静默管理模块
 支持：
 - 零私钥分发：本地运行时按需自生成唯一 Root CA 与多域名 SAN 通配服务端证书
 - 兼容 Windows 原生 CryptoAPI 与 SChannel 证书库
@@ -151,8 +151,8 @@ class CertManager:
             ca_subject = x509.Name([
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
                 x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Shanghai"),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PixivToolkit Authority"),
-                x509.NameAttribute(NameOID.COMMON_NAME, "PixivToolkit Universal Root CA"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "GameArt Toolkit Authority"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "GameArt Toolkit Universal Root CA"),
             ])
 
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -237,7 +237,7 @@ class CertManager:
             server_subject = x509.Name([
                 x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
                 x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Shanghai"),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PixivToolkit Accelerator"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "GameArt Toolkit Accelerator"),
                 x509.NameAttribute(NameOID.COMMON_NAME, "*.pixiv.net"),
             ])
 
@@ -472,20 +472,31 @@ class CertManager:
         return False, "未能成功导入根证书，请以管理员身份运行本程序以完成受信任授权。"
 
     def uninstall_cert(self) -> Tuple[bool, str]:
-        """从系统和用户根证书库中安全卸载 (全静默无黑框)"""
+        """从系统和用户根证书库中安全卸载 (全静默无黑框，同时兼容清理旧版根证书)"""
         thumbprint = self.get_cert_thumbprint()
-        if not thumbprint:
-            return False, "未能识别证书指纹"
 
         try:
-            subprocess.run(
-                ["certutil", "-delstore", "ROOT", thumbprint],
-                capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-            )
-            subprocess.run(
-                ["certutil", "-delstore", "-user", "ROOT", thumbprint],
-                capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-            )
+            if thumbprint:
+                subprocess.run(
+                    ["certutil", "-delstore", "ROOT", thumbprint],
+                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
+                )
+                subprocess.run(
+                    ["certutil", "-delstore", "-user", "ROOT", thumbprint],
+                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
+                )
+            
+            # 同时尝试根据 Common Name 清理
+            for cn_name in ["GameArt Toolkit Universal Root CA", "PixivToolkit Universal Root CA"]:
+                subprocess.run(
+                    ["certutil", "-delstore", "ROOT", cn_name],
+                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
+                )
+                subprocess.run(
+                    ["certutil", "-delstore", "-user", "ROOT", cn_name],
+                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
+                )
+
             self._cached_installed = False
             return True, "已从系统卸载根证书"
         except Exception as e:

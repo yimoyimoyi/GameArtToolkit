@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - Nginx 站点配置声明式模板生成器 (Nginx Configuration Generator)
+GameArt Toolkit - Nginx 站点配置声明式模板生成器 (Nginx Configuration Generator)
 
 核心功能:
 - 基于 ServiceProfile 单源注册表，自动生成 site-gaming.conf / site-acg.conf / site-dev.conf
@@ -318,7 +318,7 @@ server {{
         gaming_profiles = [p for p in PROFILES if p.group == "gaming"]
         gaming_blocks = [
             "# ==============================================================================",
-            "# PixivToolkit - 游戏生态全平台加速规则 (由 ServiceProfile 模板自动生成)",
+            "# GameArt Toolkit - 游戏生态全平台加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
         for p in gaming_profiles:
@@ -331,7 +331,7 @@ server {{
         acg_profiles = [p for p in PROFILES if p.group == "acg"]
         acg_blocks = [
             "# ==============================================================================",
-            "# PixivToolkit - 二次元与创作者生态加速规则 (由 ServiceProfile 模板自动生成)",
+            "# GameArt Toolkit - 二次元与创作者生态加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
         for p in acg_profiles:
@@ -344,7 +344,7 @@ server {{
         dev_profiles = [p for p in PROFILES if p.group == "dev"]
         dev_blocks = [
             "# ==============================================================================",
-            "# PixivToolkit - 开发者与 AI 平台加速规则 (由 ServiceProfile 模板自动生成)",
+            "# GameArt Toolkit - 开发者与 AI 平台加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
         for p in dev_profiles:

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 极简 L4 TCP Relay 与 TLS SNI 嗅探路由引擎 (L4 Relay & SNI Router)
+GameArt Toolkit - 极简 L4 TCP Relay 与 TLS SNI 嗅探路由引擎 (L4 Relay & SNI Router)
 
 核心特性:
 - 极轻量 (<20MB 内存), 原生 asyncio 异步并发
