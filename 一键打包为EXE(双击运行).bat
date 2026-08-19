@@ -1,5 +1,4 @@
-﻿
-@echo off
+﻿@echo off
 chcp 65001 >nul
 title PixivToolkit - 打包为 EXE
 cd /d "%~dp0"
@@ -13,4 +12,4 @@ echo 打包结束，按任意键打开发布目录...
 pause >nul
 if exist "%~dp0dist\PixivToolkit" (
     start explorer "%~dp0dist\PixivToolkit"
-)
+)

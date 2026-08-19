@@ -55,13 +55,26 @@ class CertManager:
         # 1. 优先使用 Windows CryptoAPI 内存直接检索 (检查 CurrentUser 与 LocalMachine 的 Root/AuthRoot)
         try:
             crypt32 = ctypes.windll.crypt32
+
+            # 显式声明 64 位 API 函数签名，防止 64 位环境指针截断为 32 位整型 (0xC0000005 隐患)
+            crypt32.CertOpenStore.restype = wintypes.HANDLE
+            crypt32.CertOpenStore.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE, wintypes.DWORD, wintypes.LPCWSTR]
+            crypt32.CertEnumCertificatesInStore.restype = ctypes.c_void_p
+            crypt32.CertEnumCertificatesInStore.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+            crypt32.CertGetCertificateContextProperty.restype = wintypes.BOOL
+            crypt32.CertGetCertificateContextProperty.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+            crypt32.CertFreeCertificateContext.restype = wintypes.BOOL
+            crypt32.CertFreeCertificateContext.argtypes = [ctypes.c_void_p]
+            crypt32.CertCloseStore.restype = wintypes.BOOL
+            crypt32.CertCloseStore.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
             # 0x00010000 = CERT_SYSTEM_STORE_CURRENT_USER, 0x00020000 = CERT_SYSTEM_STORE_LOCAL_MACHINE
             flags_list = [0x00010000, 0x00020000]
             store_names = ["Root", "AuthRoot", "ROOT", "CA"]
 
             for flags in flags_list:
                 for store_name in store_names:
-                    h_store = crypt32.CertOpenStore(10, 0, 0, flags, store_name)
+                    h_store = crypt32.CertOpenStore(ctypes.c_void_p(10), 0, 0, flags, store_name)
                     if not h_store:
                         continue
                     try:

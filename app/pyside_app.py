@@ -11,6 +11,7 @@ PixivToolkit - Material Design 3 桌面客户端
 
 import os
 import sys
+import re
 import time
 import base64
 import random
@@ -45,7 +46,7 @@ from win_utils import (
     is_autostart_enabled, set_autostart, register_shutdown_handler,
     fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window
 )
-from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES
+from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT
 from frameless_helper import NativeFramelessHelper
 from md_widgets import (
     MDSwitch, TrafficMonitorChart, LatencyBadge, TitleBar,
@@ -119,21 +120,23 @@ def create_tray_icon(is_active: bool = False) -> QIcon:
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setRenderHint(QPainter.TextAntialiasing)
 
-    bg_color = QColor("#10B981") if is_active else QColor("#0284C7")
-    painter.setBrush(bg_color)
+    # 绘制状态圆球
+    color = QColor("#00E676") if is_active else QColor("#78909C")
+    painter.setBrush(color)
     painter.setPen(Qt.NoPen)
-    painter.drawRoundedRect(2, 2, 28, 28, 7, 7)
+    painter.drawEllipse(4, 4, 24, 24)
 
-    painter.setPen(QColor("#FFFFFF"))
-    font = QFont("Segoe UI", 16, QFont.Bold)
-    painter.setFont(font)
-    painter.drawText(pixmap.rect().adjusted(0, -1, 0, 0), Qt.AlignCenter, "P")
+    # 中心小圆环
+    painter.setBrush(QColor(255, 255, 255, 200))
+    painter.drawEllipse(12, 12, 8, 8)
     painter.end()
     return QIcon(pixmap)
 
 
+# ==============================================================================
+# 异步 Worker 线程与主窗口类
+# ==============================================================================
 class CDNTestWorker(QThread):
     finished = Signal(dict)
 
@@ -153,7 +156,16 @@ class CDNTestWorker(QThread):
 class StatusProbeWorker(QThread):
     probed = Signal(dict)
 
+    def __init__(self):
+        super().__init__()
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
     def run(self):
+        if self._stop_requested:
+            return
         result = {
             'is_nginx': nginx_mgr.is_running(),
             'is_hosts': hosts_mgr.is_applied(),
@@ -165,7 +177,8 @@ class StatusProbeWorker(QThread):
             'steam_path': str(steam_mgr.steam_path) if steam_mgr.steam_path else None,
             'has_admin': is_admin(),
         }
-        self.probed.emit(result)
+        if not self._stop_requested:
+            self.probed.emit(result)
 
 
 class SteamSwitchWorker(QThread):
@@ -556,7 +569,7 @@ class MainWindow(QMainWindow):
         # 页面标题
         title = QLabel("加速控制中心")
         title.setObjectName("PageTitle")
-        desc = QLabel("自动托管网络代理与 Hosts 规则，加速 18 项海外游戏、创作与开发服务")
+        desc = QLabel(f"自动托管网络代理与 Hosts 规则，加速 {TOTAL_SERVICES_COUNT} 项海外游戏、创作与开发服务")
         desc.setObjectName("PageDesc")
         layout.addWidget(title)
         layout.addWidget(desc)
@@ -571,7 +584,7 @@ class MainWindow(QMainWindow):
 
         self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存")
         self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "18 项服务规则隔离")
+        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", f"{TOTAL_SERVICES_COUNT} 项服务规则隔离")
         self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换")
 
         stat_grid.addWidget(self.card_stat_nginx, 0, 0)
@@ -909,7 +922,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("CDN 测速与动态 Upstream 优选")
         title.setObjectName("PageTitle")
-        desc = QLabel("多线程并发探测全部 18 项服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
+        desc = QLabel(f"多线程并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
         desc.setObjectName("PageDesc")
         title_box.addWidget(title)
         title_box.addWidget(desc)
@@ -947,7 +960,7 @@ class MainWindow(QMainWindow):
 
         lbl_ci_title = QLabel("测速引擎已就绪")
         lbl_ci_title.setProperty("class", "ItemTitle")
-        lbl_ci_desc = QLabel("点击右上角【开始全量测速】，系统将并发探测全部 18 项服务的延迟并筛选延迟最低的节点。")
+        lbl_ci_desc = QLabel(f"点击右上角【开始全量测速】，系统将并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的延迟并筛选延迟最低的节点。")
         lbl_ci_desc.setProperty("class", "ItemDesc")
         ci_layout.addWidget(ci_icon, 0, Qt.AlignCenter)
         ci_layout.addWidget(lbl_ci_title, 0, Qt.AlignCenter)
@@ -974,7 +987,7 @@ class MainWindow(QMainWindow):
         for _ in range(4):
             self.cdn_results_layout.addWidget(SkeletonCard())
 
-        show_toast(self, "正在并发探测全部 18 项服务的候选节点延迟...", toast_type="info", duration=2500)
+        show_toast(self, f"正在并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的候选节点延迟...", toast_type="info", duration=2500)
 
         self.cdn_worker = CDNTestWorker()
         self.cdn_worker.finished.connect(self.on_cdn_ping_finished)
@@ -1000,7 +1013,8 @@ class MainWindow(QMainWindow):
 
             if ip_list and sid in self.service_badges:
                 best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
-                self.service_badges[sid].set_latency(int(best_lat), is_star=True)
+                self.service_badges[sid].set_latency(int(best_lat), is_star=True,
+                                                     via_proxy=(sid in cdn_opt.last_relay_services))
 
             card = QFrame()
             card.setProperty("class", "MDCard")
@@ -1630,16 +1644,44 @@ class MainWindow(QMainWindow):
         """响应 Windows 关机/注销原生消息"""
         emergency_fast_cleanup()
 
+    def safe_shutdown(self):
+        """安全回收所有定时器与异步工作线程，防止进程退出时发生 0xC0000409 崩溃"""
+        # 1. 停止所有活跃定时器
+        for timer_name in ["status_timer", "traffic_timer", "watchdog_timer"]:
+            if hasattr(self, timer_name):
+                t = getattr(self, timer_name)
+                if t and t.isActive():
+                    t.stop()
+
+        # 2. 优雅终止所有 QThread 工作线程
+        workers = [
+            getattr(self, "_status_worker", None),
+            getattr(self, "cdn_worker", None),
+            getattr(self, "steam_worker", None)
+        ]
+        for w in workers:
+            if w and w.isRunning():
+                if hasattr(w, "request_stop"):
+                    w.request_stop()
+                w.quit()
+                w.wait(500)
+
     def closeEvent(self, event):
+        if getattr(self, "_is_force_quit", False):
+            self.safe_shutdown()
+            event.accept()
+            return
+
         cfg = load_config()
         action = cfg.get("close_action", "minimize_to_tray")
         if action == "quit_directly":
+            self.safe_shutdown()
             event.accept()
             self.quit_application()
         else:
             event.ignore()
             self.hide()
-            if cfg.get("tray_notifications", True) and self.tray.supportsMessages():
+            if cfg.get("tray_notifications", True) and hasattr(self, "tray") and self.tray and self.tray.supportsMessages():
                 self.tray.showMessage(
                     "PixivToolkit 后台运行中",
                     "程序已最小化至系统托盘，网络加速与自动托管将持续运行。",
@@ -1651,10 +1693,7 @@ class MainWindow(QMainWindow):
         print("[PixivToolkit] 正在完全退出程序...")
         if hasattr(self, 'tray') and self.tray:
             self.tray.hide()
-        if self.cdn_worker and self.cdn_worker.isRunning():
-            self.cdn_worker.request_stop()
-        if self.steam_worker and self.steam_worker.isRunning():
-            self.steam_worker.request_stop()
+        self.safe_shutdown()
         emergency_fast_cleanup()
         QApplication.quit()
 
@@ -1840,20 +1879,43 @@ class MainWindow(QMainWindow):
                 self.tray.showMessage("Nginx 启动提示", n_msg, QSystemTrayIcon.Warning, 2500)
             return
 
-        # 同步启动 L4 Relay 与持续健康巡检
-        relay_server.start()
+        # 同步启动 L4 Relay 代理转发器 (预检端口 + 恢复既有 relay 路由) 与持续健康巡检
+        relay_ok, relay_msg = self._start_relay()
         health_monitor.start(services)
 
         if show_toast_on_fail:
-            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！", toast_type="success", duration=2500)
+            extra = f" | {relay_msg}" if relay_ok else f" | ⚠ {relay_msg}"
+            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}", toast_type="success", duration=2500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
+
+    def _start_relay(self) -> Tuple[bool, str]:
+        """启动 L4 Relay 代理转发器: 端口预检 + 从现有 upstream 配置恢复 relay 端口路由"""
+        if is_port_in_use(relay_server.port) and not relay_server.is_running():
+            return False, f"L4 Relay 端口 {relay_server.port} 被占用, 代理转发服务不可用"
+        ok, msg = relay_server.start()
+        if not ok:
+            return False, msg
+        # 从现有 upstream-dynamic.conf 恢复 relay 端口映射 (上次会话的代理转发路由)
+        try:
+            from cdn_optimizer import CDNOptimizer
+            opt = CDNOptimizer()
+            if opt.conf_path.exists():
+                conf_text = opt.conf_path.read_text(encoding="utf-8", errors="ignore")
+                mapping = {int(m.group(2)): m.group(1)
+                           for m in re.finditer(r"relay=([^\s:]+):443 port=(\d+)", conf_text)}
+                if mapping:
+                    relay_server.set_proxy_tunnels(mapping)
+        except Exception:
+            pass
+        return True, msg
 
     def stop_acceleration(self):
         self._is_manually_stopped = True
         health_monitor.stop()
         relay_server.stop()
+        relay_server.clear_proxy_routes()
         hosts_mgr.remove_rules()
         nginx_mgr.stop()
         show_toast(self, "加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
@@ -1970,11 +2032,18 @@ class MainWindow(QMainWindow):
         if ok and nginx_mgr.is_running():
             nginx_mgr.reload()
 
-        # 刷新主页面角标
+        # 刷新主页面角标 (relay 代理转发服务标记 [代理转发])
+        relayed = len(cdn_opt.last_relay_services)
         for sid, ip_list in results.items():
             if ip_list and sid in self.service_badges:
                 best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
-                self.service_badges[sid].set_latency(int(best_lat), is_star=True)
+                self.service_badges[sid].set_latency(int(best_lat), is_star=True,
+                                                     via_proxy=(sid in cdn_opt.last_relay_services))
+
+        if hasattr(self, "lbl_st_desc"):
+            import time
+            relay_txt = f" | {relayed} 项经代理转发" if relayed else ""
+            self.lbl_st_desc.setText(f"上次优选时间: {time.strftime('%H:%M:%S')} | 已更新 {len(results)} 项服务最优路由{relay_txt}")
 
         show_toast(self, msg if ok else f"优选失败: {msg}",
                    toast_type="warning" if (not ok or "全部失败" in msg) else "success", duration=4000)

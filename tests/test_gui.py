@@ -41,7 +41,7 @@ from PySide6.QtCore import Qt, QPoint, QPointF, QEvent
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QMainWindow
 
-class TestReportCollector:
+class ReportCollector:
     def __init__(self):
         self.tests_run = 0
         self.tests_passed = 0
@@ -98,7 +98,7 @@ class BannedSymbolASTVisitor(ast.NodeVisitor):
 
 
 def run_full_verification():
-    report = TestReportCollector()
+    report = ReportCollector()
     print("\n" + "#"*75)
     print("      PixivToolkit 桌面端最新重构代码全面自动化测试与回归验证")
     print("#"*75)
@@ -403,8 +403,8 @@ def run_full_verification():
     report.assert_true(True, "MainWindow.start_acceleration 执行无未定义异常 (enabled_services 回归)")
     main_win.stop_acceleration()
     report.assert_true(True, "MainWindow.stop_acceleration 执行正常")
-    if hasattr(main_win, "_status_timer"):
-        main_win._status_timer.stop()
+    main_win._is_force_quit = True
+    main_win.safe_shutdown()
     main_win.close()
 
     # =========================================================================
@@ -429,6 +429,11 @@ def run_full_verification():
             print(f"  * {fail}")
         print("="*75 + "\n")
         return False
+
+
+def test_gui_full_verification():
+    """Pytest 标准用例挂载入口"""
+    assert run_full_verification() is True
 
 
 if __name__ == "__main__":

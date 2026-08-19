@@ -6,6 +6,7 @@ PixivToolkit - Windows 原生 API 工具集 (进程与端口探测)
 import socket
 import ctypes
 from ctypes import wintypes
+from typing import List
 
 TH32CS_SNAPPROCESS = 0x00000002
 
@@ -45,6 +46,25 @@ def is_process_running(proc_name: str) -> bool:
         ctypes.windll.kernel32.CloseHandle(h_snapshot)
 
     return found
+
+def get_pids_by_name(proc_name: str) -> List[int]:
+    """返回指定进程名的全部 PID 列表 (Toolhelp32, 与 is_process_running 同源)"""
+    pids: List[int] = []
+    h_snapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if h_snapshot == -1:
+        return pids
+    pe = PROCESSENTRY32()
+    pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+    has_next = ctypes.windll.kernel32.Process32First(h_snapshot, ctypes.byref(pe))
+    target = proc_name.lower().encode('utf-8')
+    try:
+        while has_next:
+            if target == pe.szExeFile.lower() or target in pe.szExeFile.lower():
+                pids.append(int(pe.th32ProcessID))
+            has_next = ctypes.windll.kernel32.Process32Next(h_snapshot, ctypes.byref(pe))
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h_snapshot)
+    return pids
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """使用 Socket 探测端口是否被监听"""

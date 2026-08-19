@@ -16,13 +16,13 @@ from typing import List, Dict, Optional, Tuple, Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config_store import load_config, update_config_key
-from win_utils import is_process_running
+from win_utils import is_process_running, get_silent_startup_kwargs
 
 def _escape_vdf_val(val: Any) -> str:
     """对 VDF 字符串中的反斜杠、双引号及特殊换行进行标准转义"""
     s = str(val)
     s = s.replace('\\', '\\\\').replace('"', '\\"')
-    s = s.replace('\n', '\\n').replace('\t', '\\t')
+    s = s.replace('\r', '\\r').replace('\n', '\\n').replace('\t', '\\t')
     return s
 
 def tokenize_vdf(text: str) -> List[str]:
@@ -227,8 +227,8 @@ class SteamManager:
         # 2. 超时强制终止整个进程树
         if self.is_steam_running():
             try:
-                subprocess.run("taskkill /F /T /IM steam.exe", shell=True, capture_output=True, **get_silent_startup_kwargs())
-                subprocess.run("taskkill /F /IM steamwebhelper.exe", shell=True, capture_output=True, **get_silent_startup_kwargs())
+                subprocess.run(["taskkill", "/F", "/T", "/IM", "steam.exe"], capture_output=True, **get_silent_startup_kwargs())
+                subprocess.run(["taskkill", "/F", "/IM", "steamwebhelper.exe"], capture_output=True, **get_silent_startup_kwargs())
                 time.sleep(0.4)
             except Exception:
                 pass
@@ -244,6 +244,23 @@ class SteamManager:
         except Exception:
             return None
 
+    def _find_users_container(self, data: dict) -> dict:
+        """递归/深度查找包含 17 位 SteamID 的用户字典容器 (支持 users/Users/loginusers 等不同结构)"""
+        if not isinstance(data, dict):
+            return {}
+        for key in ["users", "Users", "user", "User", "loginusers"]:
+            val = data.get(key)
+            if isinstance(val, dict) and any(isinstance(k, str) and k.isdigit() and len(k) == 17 for k in val):
+                return val
+        if any(isinstance(k, str) and k.isdigit() and len(k) == 17 for k in data):
+            return data
+        for v in data.values():
+            if isinstance(v, dict):
+                res = self._find_users_container(v)
+                if res:
+                    return res
+        return {}
+
     def parse_vdf(self, file_path: Path) -> dict:
         """使用 Token 词法解析器精准提取 loginusers.vdf 中的所有账号信息"""
         if not file_path.exists():
@@ -254,15 +271,12 @@ class SteamManager:
             tokens = tokenize_vdf(text)
             parsed = parse_vdf_structure(tokens)
 
-            # 寻找包含 17 位 SteamID64 的根结构或 users 结构
+            # 寻找包含 17 位 SteamID64 的容器结构
             users = {}
-            # 常见结构可能是 parsed["users"] 或直接 parsed
-            target_dict = parsed.get("users", parsed) if isinstance(parsed, dict) else {}
-            if not isinstance(target_dict, dict):
-                target_dict = parsed
+            target_dict = self._find_users_container(parsed)
 
             for k, v in target_dict.items():
-                if isinstance(v, dict) and (k.isdigit() and len(k) == 17):
+                if isinstance(v, dict) and (isinstance(k, str) and k.isdigit() and len(k) == 17):
                     user_data = {"SteamID64": k}
                     for sub_k, sub_v in v.items():
                         if not isinstance(sub_v, dict):
@@ -356,7 +370,7 @@ class SteamManager:
         except Exception as e:
             return False, f"读取 loginusers.vdf 失败: {e}"
 
-        target_container = full_data.get("users", full_data) if isinstance(full_data, dict) else {}
+        target_container = self._find_users_container(full_data)
         if steamid not in target_container or not isinstance(target_container[steamid], dict):
             return False, f"未在 Steam 本地记录中找到 SteamID: {steamid}"
 
@@ -378,7 +392,7 @@ class SteamManager:
 
         # 3. 修改 Windows 注册表
         try:
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_ALL_ACCESS) as key:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
                 winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, target_acc)
                 winreg.SetValueEx(key, "RememberPassword", 0, winreg.REG_DWORD, 1)
         except Exception as e:

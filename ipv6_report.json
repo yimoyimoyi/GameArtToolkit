@@ -1,0 +1,230 @@
+{
+ "danbooru": [
+  {
+   "ip": "2001::6ca0:a58b",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "fandom": [
+  {
+   "ip": "2a03:2880:f11c:8183:face:b00c:0:25de",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "github_assets": [
+  {
+   "ip": "2606:50c0:8000::215",
+   "tcp_ok": true,
+   "tcp_latency": 91.0,
+   "tls_ok": true,
+   "tls_latency": 87.1,
+   "http_ok": true,
+   "http_status": 500,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8003::215",
+   "tcp_ok": true,
+   "tcp_latency": 91.0,
+   "tls_ok": true,
+   "tls_latency": 93.4,
+   "http_ok": true,
+   "http_status": 500,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8002::215",
+   "tcp_ok": true,
+   "tcp_latency": 105.0,
+   "tls_ok": true,
+   "tls_latency": 92.4,
+   "http_ok": true,
+   "http_status": 500,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8001::215",
+   "tcp_ok": true,
+   "tcp_latency": 91.3,
+   "tls_ok": true,
+   "tls_latency": 96.6,
+   "http_ok": true,
+   "http_status": 500,
+   "error": ""
+  }
+ ],
+ "github_raw": [
+  {
+   "ip": "2606:50c0:8001::154",
+   "tcp_ok": true,
+   "tcp_latency": 87.8,
+   "tls_ok": true,
+   "tls_latency": 90.1,
+   "http_ok": true,
+   "http_status": 301,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8000::154",
+   "tcp_ok": true,
+   "tcp_latency": 90.7,
+   "tls_ok": true,
+   "tls_latency": 93.4,
+   "http_ok": true,
+   "http_status": 301,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8003::154",
+   "tcp_ok": true,
+   "tcp_latency": 89.4,
+   "tls_ok": true,
+   "tls_latency": 93.5,
+   "http_ok": true,
+   "http_status": 301,
+   "error": ""
+  },
+  {
+   "ip": "2606:50c0:8002::154",
+   "tcp_ok": true,
+   "tcp_latency": 105.2,
+   "tls_ok": true,
+   "tls_latency": 93.0,
+   "http_ok": true,
+   "http_status": 301,
+   "error": ""
+  }
+ ],
+ "gitlab": [
+  {
+   "ip": "2606:4700:90:0:f22e:fbec:5bed:a9b9",
+   "tcp_ok": true,
+   "tcp_latency": 183.8,
+   "tls_ok": true,
+   "tls_latency": 189.9,
+   "http_ok": true,
+   "http_status": 301,
+   "error": ""
+  }
+ ],
+ "google_translate": [
+  {
+   "ip": "2404:6800:4005:804::200a",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "huggingface": [
+  {
+   "ip": "2a03:2880:f134:183:face:b00c:0:25de",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "pixiv_fanbox": [
+  {
+   "ip": "2001::6ca0:a5d3",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "pixiv_img": [
+  {
+   "ip": "2a03:2880:f11b:83:face:b00c:0:25de",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "pixiv_web": [
+  {
+   "ip": "2a03:2880:f10f:83:face:b00c:0:25de",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "steam_community": [
+  {
+   "ip": "2a03:2880:f102:183:face:b00c:0:25de",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "vndb": [
+  {
+   "ip": "2001:1af8:5301:117:1c00:d7ff:fe00:ffd",
+   "tcp_ok": true,
+   "tcp_latency": 360.9,
+   "tls_ok": true,
+   "tls_latency": 358.9,
+   "http_ok": true,
+   "http_status": 200,
+   "error": ""
+  }
+ ],
+ "wikipedia": [
+  {
+   "ip": "2001::1",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ],
+ "yandere": [
+  {
+   "ip": "2001::681f:8e58",
+   "tcp_ok": false,
+   "tcp_latency": null,
+   "tls_ok": false,
+   "tls_latency": null,
+   "http_ok": false,
+   "http_status": null,
+   "error": "tcp error: timed out"
+  }
+ ]
+}

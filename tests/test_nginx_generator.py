@@ -38,15 +38,15 @@ class TestNginxGenerator(unittest.TestCase):
         self.assertIn("i.pximg.net", acg_text)
         self.assertIn("proxy_cache pixiv_img_cache", acg_text)
         self.assertIn("assets.yande.re", acg_text)
-        self.assertIn("fandom.com", acg_text)
-        self.assertIn("static.wikia.nocookie.net", acg_text)
+        self.assertNotIn("fandom.com", acg_text)  # fandom 服务已移除
+        self.assertNotIn("static.wikia.nocookie.net", acg_text)
 
         dev_text = results["site-dev.conf"]
         self.assertIn("github.com", dev_text)
         self.assertIn("objects.githubusercontent.com", dev_text)
         self.assertIn("proxy_buffering off", dev_text)
-        self.assertIn("wikipedia.org", dev_text)
-        self.assertIn("upload.wikimedia.org", dev_text)
+        self.assertNotIn("wikipedia.org", dev_text)  # wikipedia 服务已移除
+        self.assertNotIn("translate.googleapis.com", dev_text)  # google_translate 服务已移除
 
     def test_nginx_syntax_validation(self):
         """执行全量生成后通过 nginx -t 校验最终语法"""

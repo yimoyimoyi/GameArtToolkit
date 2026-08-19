@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 生成带有 UTF-8 BOM 编码与 cmd.exe 兼容前缀的批处理脚本 (桌面客户端版)
 """
@@ -7,8 +7,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # 1. 桌面客户端双击运行脚本 (无黑框静默拉起)
-start_gui_bat = """
-@echo off
+# 1. 桌面客户端双击运行脚本 (无黑框静默拉起)
+start_gui_bat = """@echo off
 chcp 65001 >nul
 title PixivToolkit 桌面客户端
 cd /d "%~dp0"
@@ -37,8 +37,7 @@ exit /b 1
 """
 
 # 2. 打包为 EXE
-build_exe_bat = """
-@echo off
+build_exe_bat = """@echo off
 chcp 65001 >nul
 title PixivToolkit - 打包为 EXE
 cd /d "%~dp0"
@@ -55,12 +54,19 @@ if exist "%~dp0dist\\PixivToolkit" (
 )
 """
 
-# 3. 辅助清理与安装脚本
-clean_hosts_bat = """
-@echo off
+# 3. 辅助清理与安装脚本 (自动申请管理员权限)
+clean_hosts_bat = """@echo off
 chcp 65001 >nul
 title PixivToolkit - 安全清理 Hosts
 cd /d "%~dp0.."
+
+:: 检查并自动请求管理员权限
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo [提示] 正在请求管理员权限以清理 Hosts...
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
 
 echo ========================================================
 echo   正在从系统 Hosts 中清理 PixivToolkit 加速规则...
@@ -69,11 +75,18 @@ python -c "import sys; sys.path.insert(0, 'app'); from hosts_manager import Host
 pause
 """
 
-install_cert_bat = """
-@echo off
+install_cert_bat = """@echo off
 chcp 65001 >nul
 title PixivToolkit - 安装根证书
 cd /d "%~dp0.."
+
+:: 检查并自动请求管理员权限
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo [提示] 正在请求管理员权限以导入根证书...
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
 
 echo ========================================================
 echo   正在向系统导入受信任根证书...
@@ -83,10 +96,10 @@ pause
 """
 
 files = {
-    BASE_DIR / "启动桌面客户端(双击运行).bat": start_gui_bat,
-    BASE_DIR / "一键打包为EXE(双击运行).bat": build_exe_bat,
-    BASE_DIR / "scripts" / "clean_hosts.bat": clean_hosts_bat,
-    BASE_DIR / "scripts" / "install_cert.bat": install_cert_bat,
+    BASE_DIR / "启动桌面客户端(双击运行).bat": start_gui_bat.strip() + "\r\n",
+    BASE_DIR / "一键打包为EXE(双击运行).bat": build_exe_bat.strip() + "\r\n",
+    BASE_DIR / "scripts" / "clean_hosts.bat": clean_hosts_bat.strip() + "\r\n",
+    BASE_DIR / "scripts" / "install_cert.bat": install_cert_bat.strip() + "\r\n",
 }
 
 for path, content in files.items():

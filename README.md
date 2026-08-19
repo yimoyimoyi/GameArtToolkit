@@ -20,11 +20,12 @@
 
 ### 核心特性
 
-- **本地反向代理 (支持 3 大分类 18 项服务)**
+- **本地反向代理 (支持 3 大分类 18 项加速服务)**
   - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、Yande.re 高清壁纸、VNDB 视觉小说资料库。
   - **游戏生态**：Steam 商店/结账、Steam 社区 118 修复、Steam Akamai 图片 CDN、Ubisoft 育碧商城、EA App / Origin。
   - **开发者与 AI**：GitHub 主站 Web/API、GitHub 静态资源/Raw 直连、GitHub Releases 附件与对象、GitHub 前端 CDN、GitLab 国际版、HuggingFace AI 模型库。
   - 基于 Nginx 本地磁盘缓存，二次加载插画与静态资源从本地缓存毫秒级读取。
+  - 直连不可用且本地代理在线的服务，自动经 L4 Relay 代理转发端口出网（无需系统代理配置）。
 
 - **CDN 节点双通道测速与热重载**
   - 多线程并发 TCP / TLS 握手连通性与延迟测速，支持直连与本地代理双通道探测。

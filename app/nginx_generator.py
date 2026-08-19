@@ -48,10 +48,6 @@ class NginxConfGenerator:
             domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
         elif profile.id == "yandere" and "*.yande.re" not in domains_list:
             domains_list.append("*.yande.re")
-        elif profile.id == "fandom" and "*.fandom.com" not in domains_list:
-            domains_list.extend(["*.fandom.com", "*.wikia.com", "*.nocookie.net"])
-        elif profile.id == "wikipedia" and "*.wikipedia.org" not in domains_list:
-            domains_list.extend(["*.wikipedia.org", "*.wikimedia.org", "*.wikidata.org"])
 
         # 保序去重
         domains_list = list(dict.fromkeys(domains_list))
@@ -113,8 +109,8 @@ class NginxConfGenerator:
             "        proxy_ssl_session_reuse on;",
         ])
 
-        # Steam 社区与图库/百科重定向防死循环自适应
-        if profile.id in ("steam_community", "yandere", "fandom", "wikipedia"):
+        # Steam 社区与图库重定向防死循环自适应
+        if profile.id in ("steam_community", "yandere"):
             if profile.id == "steam_community":
                 lines.insert(len(lines) - 4, '        proxy_set_header User-Agent "${http_user_agent} Googlebot/2.1 (+http://www.google.com/bot.html)";')
             lines.extend([

@@ -148,9 +148,14 @@ class AnimatedStackedWidget(QStackedWidget):
             super().setCurrentIndex(index)
             return
 
-        # 如果有正在进行的动画，先立即结束
+        # 如果有正在进行的动画，先立即结束并清理前一个目标效果
         if self._anim and self._anim.state() == QPropertyAnimation.Running:
             self._anim.stop()
+            if 0 <= self._target_index < self.count():
+                tw = self.widget(self._target_index)
+                if tw:
+                    tw.setGraphicsEffect(None)
+            self._target_index = -1
 
         current_widget = self.currentWidget()
         next_widget = self.widget(index)
@@ -174,7 +179,8 @@ class AnimatedStackedWidget(QStackedWidget):
 
         def _on_finished():
             super(AnimatedStackedWidget, self).setCurrentIndex(index)
-            next_widget.setGraphicsEffect(None)
+            if next_widget:
+                next_widget.setGraphicsEffect(None)
             self._target_index = -1
 
         self._anim.finished.connect(_on_finished)
@@ -1186,13 +1192,15 @@ class LatencyBadge(QWidget):
         super().__init__(parent)
         self.latency_ms = -1
         self.is_star = False
+        self.via_proxy = False
         self.setFixedHeight(24)
         self.setMinimumWidth(70)
         ThemeManager.get_instance().theme_changed.connect(self.update)
 
-    def set_latency(self, ms: int, is_star: bool = False):
+    def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False):
         self.latency_ms = ms
         self.is_star = is_star
+        self.via_proxy = via_proxy
         self.update()
 
     def paintEvent(self, event):
@@ -1232,7 +1240,9 @@ class LatencyBadge(QWidget):
                 text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
                 dot_color = QColor("#EF4444")
 
-            if self.is_star:
+            if self.via_proxy:
+                txt = f"{int(self.latency_ms)} ms [代理转发]"
+            elif self.is_star:
                 txt = f"{int(self.latency_ms)} ms [优选]"
             else:
                 txt = f"{int(self.latency_ms)} ms"

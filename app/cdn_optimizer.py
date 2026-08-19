@@ -14,6 +14,8 @@ import time
 import socket
 import ssl
 import re
+import struct
+import random
 import concurrent.futures
 import threading
 from pathlib import Path
@@ -22,19 +24,82 @@ from typing import Dict, List, Tuple, Optional, Callable, Any
 from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID
 from config_store import load_config
+from win_utils import is_port_in_use
 
 UPSTREAM_CONF_PATH = NGINX_DIR / "conf" / "upstream-dynamic.conf"
 
 # 默认本地代理 (Clash mixed 端口, HTTP CONNECT 隧道, 仅作探测筛选)
 DEFAULT_PROXY = ("127.0.0.1", 7897)
 
+# L4 Relay 代理转发端口基址: 44311 + CANDIDATE_IPS 顺序索引, 避开 SNI 主端口 44301
+RELAY_PORT_BASE = 44311
+
 from service_profile import PROFILES
 
 # 各服务的 SNI 模式自动由 ServiceProfile 单源导出
 SNI_MODES = {p.id: p.ssl_sni_mode for p in PROFILES}
 
+# 伪 SNI 服务: relay 转发时要求 rank1 (HTTP 干净) 才允许, 避免伪 SNI 触发 421/404
+PSEUDO_SNI_SERVICES = {p_id for p_id, m in SNI_MODES.items() if m not in ("host", "empty")}
+
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
 SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
+
+
+def relay_port_for(srv_id: str) -> int:
+    """确定性 relay 端口映射: RELAY_PORT_BASE + CANDIDATE_IPS 顺序索引 (零冲突, 跨会话稳定)"""
+    try:
+        return RELAY_PORT_BASE + list(CANDIDATE_IPS.keys()).index(srv_id)
+    except ValueError:
+        return RELAY_PORT_BASE
+
+
+# 公共 DNS 服务器 (用于绕过被注入 hosts 的动态候选解析)
+_DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
+
+
+def _resolve_dns_candidates(domain: str, timeout: float = 0.8) -> List[str]:
+    """UDP 直查公共 DNS 获取域名 A 记录 (绕过被注入的 hosts, 避免解析到 127.0.0.1)
+
+    候选池中的 IP 可能过期 (DNS 已换节点), 每次测速补充当前解析 IP,
+    让测速引擎能选到 DNS 的最新节点。失败静默返回空列表。
+    """
+    if not domain:
+        return []
+    results: List[str] = []
+    for dns in _DNS_SERVERS:
+        try:
+            qid = random.randint(0, 65535)
+            header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+            qname = b"".join(bytes([len(p)]) + p.encode() for p in domain.split(".")) + b"\x00"
+            q = header + qname + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.sendto(q, (dns, 53))
+            data, _ = s.recvfrom(4096)
+            s.close()
+            ancount = struct.unpack(">H", data[6:8])[0]
+            off = 12
+            while data[off] != 0:
+                off += data[off] + 1
+            off += 5
+            for _ in range(ancount):
+                if data[off] & 0xC0 == 0xC0:
+                    off += 2
+                else:
+                    while data[off] != 0:
+                        off += data[off] + 1
+                    off += 1
+                rtype, _, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+                off += 10
+                if rtype == 1 and rdlen == 4:
+                    results.append(socket.inet_ntoa(data[off:off + 4]))
+                off += rdlen
+            if results:
+                break
+        except Exception:
+            continue
+    return list(dict.fromkeys(results))
 
 
 def _load_proxy_config() -> Optional[Tuple[str, int]]:
@@ -59,10 +124,18 @@ def is_proxy_available(proxy: Optional[Tuple[str, int]], timeout: float = 0.3) -
         return False
 
 
+def _format_host_port(host: str, port: int) -> str:
+    """格式化 host:port, IPv6 地址必须加方括号 (HTTP 标准与 nginx 语法要求)"""
+    if ":" in host:
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeout: float) -> None:
     """向 HTTP 代理发送 CONNECT 隧道请求并读取响应头, 首行非 200 抛异常"""
     sock.settimeout(timeout)
-    sock.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode("utf-8"))
+    hp = _format_host_port(host, port)
+    sock.sendall(f"CONNECT {hp} HTTP/1.1\r\nHost: {hp}\r\n\r\n".encode("utf-8"))
     hdr = b""
     while b"\r\n\r\n" not in hdr:
         chunk = sock.recv(4096)
@@ -94,71 +167,92 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 1.5,
            "tls_latency": None, "http_ok": False, "http_status": None, "error": ""}
     deadline = time.monotonic() + timeout * 3 + 2.0  # 总预算兜底, 防慢节点拖垮并发池
 
-    # 1. TCP 握手 (直连或经 CONNECT 隧道)
+    sock = None
+    ssock = None
     try:
-        if proxy:
-            t0 = time.perf_counter()
-            sock = socket.create_connection(proxy, timeout=timeout)
-            _send_connect_and_read_200(sock, ip, 443, timeout)
-            out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
-        else:
-            t0 = time.perf_counter()
-            sock = socket.create_connection((ip, 443), timeout=timeout)
-            out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
-        out["tcp_ok"] = True
-    except Exception as e:
-        out["error"] = f"tcp:{e}"
-        return out
-
-    # 2. TLS 握手 (宽松校验: 本地证书链不可信, 以握手成功 + HTTP 状态码佐证真实性)
-    try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        # 复刻 nginx 的 SNI 行为: empty=空SNI host=域名SNI 其他=自定义伪SNI域名
-        if sni_mode == "host":
-            server_hostname = domain or None
-        elif sni_mode == "empty":
-            server_hostname = None
-        else:
-            server_hostname = sni_mode
-        sock.settimeout(max(deadline - time.monotonic(), 0.5))
-        t0 = time.perf_counter()
-        ssock = ctx.wrap_socket(sock, server_hostname=server_hostname)
-        out["tls_ok"] = True
-        out["tls_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
-    except Exception as e:
-        out["error"] = f"tls:{e}"
+        # 1. TCP 握手 (直连或经 CONNECT 隧道)
         try:
-            sock.close()
-        except Exception:
-            pass
-        return out
+            if proxy:
+                t0 = time.perf_counter()
+                sock = socket.create_connection(proxy, timeout=timeout)
+                _send_connect_and_read_200(sock, ip, 443, timeout)
+                out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
+            else:
+                t0 = time.perf_counter()
+                sock = socket.create_connection((ip, 443), timeout=timeout)
+                out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
+            out["tcp_ok"] = True
+        except Exception as e:
+            out["error"] = f"tcp error: {e}"
+            return out
 
-    # 3. HTTP 状态码探测 (5xx/421 仍记 http_ok=True, 由调用方判定 suspect)
-    try:
-        ssock.settimeout(max(deadline - time.monotonic(), 0.5))
-        ssock.sendall(f"GET / HTTP/1.1\r\nHost: {domain}\r\n"
-                      f"User-Agent: PixivToolkit/1.0\r\nConnection: close\r\n\r\n".encode("utf-8"))
-        hdr = b""
-        while b"\r\n\r\n" not in hdr:
-            chunk = ssock.recv(4096)
-            if not chunk:
-                break
-            hdr += chunk
-        line = hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-        if line.startswith("HTTP/"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                out["http_status"] = int(parts[1])
-                out["http_ok"] = True
+        # 2. TLS 握手 (宽松校验: 本地证书链不可信, 以握手成功 + HTTP 状态码佐证真实性)
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            # 复刻 nginx 的 SNI 行为: empty=空SNI host=域名SNI 其他=自定义伪SNI域名
+            if sni_mode == "host":
+                server_hostname = domain or None
+            elif sni_mode == "empty":
+                server_hostname = None
+            else:
+                server_hostname = sni_mode
+            sock.settimeout(max(deadline - time.monotonic(), 0.5))
+            t0 = time.perf_counter()
+            ssock = ctx.wrap_socket(sock, server_hostname=server_hostname)
+            sock = None  # 所有权转移至 ssock
+            out["tls_ok"] = True
+            out["tls_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        except Exception as e:
+            out["error"] = f"tls error: {e}"
+            return out
+
+        # 3. HTTP 状态码探测 (5xx/421 仍记 http_ok=True, 由调用方判定 suspect)
+        try:
+            ssock.settimeout(max(deadline - time.monotonic(), 0.5))
+            ssock.sendall(f"GET / HTTP/1.1\r\nHost: {domain}\r\n"
+                          f"User-Agent: PixivToolkit/1.0\r\nConnection: close\r\n\r\n".encode("utf-8"))
+            hdr = b""
+            while b"\r\n\r\n" not in hdr:
+                chunk = ssock.recv(4096)
+                if not chunk:
+                    break
+                hdr += chunk
+            line = hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+            if line.startswith("HTTP/"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    out["http_status"] = int(parts[1])
+                    out["http_ok"] = True
+                    # 自我重定向判定: 3xx 且 Location 指向同 host 同路径 (如 yande.re 被墙后的
+                    # 301 循环), 标记 self_redirect 供 _classify_result 按可疑节点处理
+                    if 300 <= out["http_status"] < 400:
+                        loc = ""
+                        for h in hdr.decode("utf-8", errors="replace").split("\r\n"):
+                            if h.lower().startswith("location:"):
+                                loc = h.split(":", 1)[1].strip()
+                                break
+                        if loc:
+                            loc_host = loc.split("://")[-1].split("/")[0].lower() if "://" in loc else domain.lower()
+                            loc_path = "/" + loc.split("://")[-1].split("/", 1)[1] if "://" in loc and "/" in loc.split("://")[1] else "/"
+                            if loc_host == domain.lower() and loc_path == "/":
+                                out["self_redirect"] = True
+        except Exception as e:
+            out["error"] = f"http error: {e}"
     except Exception as e:
-        out["error"] = f"http:{e}"
+        out["error"] = str(e)
     finally:
-        try:
-            ssock.close()
-        except Exception:
-            pass
+        if ssock:
+            try:
+                ssock.close()
+            except Exception:
+                pass
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return out
 
 
@@ -170,10 +264,16 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
     rank 2: 经代理 TCP+TLS 通但 HTTP 可疑 (5xx/421) → 仅兜底
     rank 3: 双通道全挂 → 不写入
     """
+    def _redirect_loop(result: Optional[Dict]) -> bool:
+        """3xx 自我重定向 (Location 指向同 host 同路径) 判定为可疑节点, 排除重定向死循环假节点"""
+        return bool(result and result.get("self_redirect"))
+
     d_clean = bool(direct and direct.get("tcp_ok") and direct.get("tls_ok")
-                   and direct.get("http_ok") and not _suspect_status(direct.get("http_status")))
+                   and direct.get("http_ok") and not _suspect_status(direct.get("http_status"))
+                   and not _redirect_loop(direct))
     p_clean = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
-                   and proxy.get("http_ok") and not _suspect_status(proxy.get("http_status")))
+                   and proxy.get("http_ok") and not _suspect_status(proxy.get("http_status"))
+                   and not _redirect_loop(proxy))
     p_suspect = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
                      and proxy.get("http_ok") and _suspect_status(proxy.get("http_status")))
 
@@ -195,6 +295,8 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
 class CDNOptimizer:
     def __init__(self, conf_path: Path = UPSTREAM_CONF_PATH):
         self.conf_path = Path(conf_path)
+        # 最近一次生成的 relay 代理转发服务集合 (供自愈探针分流与 UI 展示)
+        self.last_relay_services: set = set()
 
     def test_service_dual(self, srv_id: str, max_workers: int = 8) -> List[Dict]:
         """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)"""
@@ -202,9 +304,12 @@ class CDNOptimizer:
         return self.test_group(srv_id, ips, max_workers=max_workers)
 
     def test_group(self, group_name: str, ip_list: List[str], max_workers: int = 8) -> List[Dict]:
-        """测试指定服务的一组候选 IP (双通道三态探测)"""
+        """测试指定服务的一组候选 IP (双通道三态探测, 自动补充 DNS 当前解析节点)"""
         srv = SERVICES_BY_ID.get(group_name, {})
         domain = srv.get("domains", [""])[0] if srv else ""
+        # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
+        if domain:
+            ip_list = list(dict.fromkeys(list(ip_list) + _resolve_dns_candidates(domain)))
         sni_mode = SNI_MODES.get(group_name, "host")
         proxy = _load_proxy_config()
         proxy_ready = is_proxy_available(proxy)
@@ -254,6 +359,9 @@ class CDNOptimizer:
                 continue
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
+            # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
+            if domain:
+                ips = list(dict.fromkeys(list(ips) + _resolve_dns_candidates(domain)))
             sni_mode = SNI_MODES.get(srv_id, "host")
             for ip in ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode))
@@ -266,7 +374,8 @@ class CDNOptimizer:
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=1.5, sni_mode=sni_mode, proxy=proxy) if proxy else None
             return srv_id, ip, direct, proxy_res
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_map = {executor.submit(run_both, t): t for t in flat_tasks}
             try:
                 for future in concurrent.futures.as_completed(future_map, timeout=total_timeout):
@@ -283,6 +392,11 @@ class CDNOptimizer:
                                 "direct": None, "proxy": None, "proxy_used": proxy_ready}
                     results_by_srv[srv_id].append(item)
             except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
                 pass
 
         # 补齐超时未完成项并排序 (rank 升序, latency 升序; rank 3 全部排最后)
@@ -323,8 +437,10 @@ class CDNOptimizer:
 
         规则:
         - 每个服务永远生成 upstream 块 (保证 nginx 引用不缺失, 防 host not found 启动失败)
-        - 只写 rank0 (直连三态全通) 节点; rank1(经代理验证) 直连不可用, 不写入
-        - 全挂服务回退候选池默认 IP, 并加注释告警 (宁可用假节点也绝不让 nginx 起不来)
+        - 优先写 rank0 (直连三态全通) 节点
+        - 直连全挂但经代理验证可用 (rank1/2) 且本地代理在线时, 写 relay 代理转发端口
+          (127.0.0.1:<port>), 由 L4 Relay 经本地代理 CONNECT 域名出网
+        - 双通道全挂服务回退候选池默认 IP, 并加注释告警 (宁可用假节点也绝不让 nginx 起不来)
         - max_fails=3 fail_timeout=30s 减缓熔断雪崩; hash/least_conn 组不携带 backup 参数
         """
         lines = [
@@ -335,6 +451,9 @@ class CDNOptimizer:
             "# max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
             "# ==============================================================================\n"
         ]
+
+        # 每次生成重置 relay 服务集合 (由本轮决策重新填充)
+        self.last_relay_services = set()
 
         # 读取现有配置用于增量合并: 未参与本次测速的服务保留其已有 upstream 块,
         # 避免单服务自愈/局部重测顺带把其余服务重置回候选池
@@ -350,22 +469,54 @@ class CDNOptimizer:
                     continue
                 ip_items = [{"ip": ip} for ip in CANDIDATE_IPS.get(srv_id, [])]
 
+            rank0 = [it for it in ip_items if it.get("rank", 3) == 0]
+            rank12 = [it for it in ip_items if it.get("rank", 3) in (1, 2)]
+
+            # --------------------------------------------------------------
+            # relay 代理转发分支: 直连全挂但有经代理验证可用节点 (rank1/2) 且本地代理在线
+            # -> upstream 指向 L4 Relay 代理转发端口 (127.0.0.1:<port>), 由 relay CONNECT 域名出网
+            # 伪 SNI 服务 (自定义 SNI) 要求 rank1 (HTTP 干净), 避免伪 SNI 触发 421/404
+            # --------------------------------------------------------------
+            if not rank0 and rank12:
+                proxy_cfg = _load_proxy_config()
+                proxy_ready = bool(proxy_cfg) and is_proxy_available(proxy_cfg)
+                if proxy_ready:
+                    eligible = (srv_id not in PSEUDO_SNI_SERVICES) or \
+                               any(it.get("rank", 3) == 1 for it in rank12)
+                    if eligible:
+                        port = relay_port_for(srv_id)
+                        if not is_port_in_use(port):
+                            domain = (SERVICES_BY_ID.get(srv_id, {}).get("domains") or [""])[0]
+                            self.last_relay_services.add(srv_id)
+                            lines.append(f"upstream upstream_{srv_id} {{")
+                            lines.append(f"    # 经本地代理转发 relay={domain}:443 port={port}")
+                            lines.append(f"    server 127.0.0.1:{port} max_fails=3 fail_timeout=30s;")
+                            lines.append("    keepalive 32;")
+                            lines.append("    keepalive_timeout 120;")
+                            lines.append("    keepalive_requests 10000;")
+                            lines.append("}\n")
+                            continue
+
             # 只写 rank0 直连可用节点; 无 rank0 则回退候选池兜底 (保证 nginx 可启动)
-            usable = [it for it in ip_items if it.get("rank", 3) == 0]
+            usable = rank0
             fallback = not usable
             if not usable:
-                usable = [{"ip": it["ip"]} for it in ip_items]
+                usable = [{"ip": it["ip"]} for it in ip_items if "ip" in it and it["ip"]]
 
             # 防御性排序: 保证 rank0 在前、延迟升序, 不依赖调用方预排序
             usable.sort(key=lambda x: (x.get("rank", 3), x.get("latency") if x.get("latency") is not None else 99999))
-            valid_ips = [it["ip"] for it in usable]
+            valid_ips = [it["ip"] for it in usable if it.get("ip")]
             primary_ips = valid_ips[:2]
             backup_ips = valid_ips[2:4]
 
             lines.append(f"upstream upstream_{srv_id} {{")
             if fallback:
                 lines.append(f"    # 警告: 服务 {srv_id} 双通道探测全部失败, 回退候选池兜底")
-            if srv_id == "pixiv_web":
+            
+            if not valid_ips:
+                # 极端场景防护: 若完全无有效候选 IP，写入 down 节点保证 Nginx 语法不报错
+                lines.append("    server 127.0.0.1:443 down;  # 兜底占位，防止 upstream 为空导致 Nginx 语法解析失败")
+            elif srv_id == "pixiv_web":
                 lines.append("    hash $connection consistent;")
                 for ip in valid_ips[:6]:
                     lines.append(self._fmt_server(ip, "max_fails=3 fail_timeout=30s"))
@@ -416,12 +567,25 @@ class CDNOptimizer:
                 f.write(conf_str)
             tmp_path.replace(self.conf_path)
 
+            # 同步 relay 代理转发端口映射 (从最终 conf 解析注释行 token; 仅非空时推送, 防止清空运行中隧道)
+            try:
+                from l4_relay import relay_server
+                mapping = {int(m.group(2)): m.group(1)
+                           for m in re.finditer(r"relay=([^\s:]+):443 port=(\d+)", conf_str)}
+                if mapping:
+                    relay_server.set_proxy_tunnels(mapping)
+            except Exception:
+                pass
+
             failed = [srv_id for srv_id, items in test_results.items()
                       if not any(it.get("rank", 3) == 0 for it in items)]
+            relayed = [s for s in failed if s in self.last_relay_services]
+            fallback = [s for s in failed if s not in self.last_relay_services]
             msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
-            if failed:
-                msg += f" 注意: {len(failed)} 个服务直连探测全部失败已回退候选池({', '.join(sorted(failed))})"
-                # 代理可用但直连被阻断: 数据平面仍直连, 明确提示用户 (代理仅作测速筛选)
+            if relayed:
+                msg += f" {len(relayed)} 个服务直连不可用已切换本地代理转发({', '.join(sorted(relayed))})"
+            if fallback:
+                msg += f" {len(fallback)} 个服务双通道探测全部失败已回退候选池({', '.join(sorted(fallback))})"
                 proxy = _load_proxy_config()
                 if proxy and is_proxy_available(proxy):
                     msg += "。当前直连被阻断而本地代理可用, 但 Nginx 数据平面仍为直连, 请检查网络直连状态"
@@ -442,19 +606,22 @@ class CDNHealthMonitor:
         self.on_healed = on_healed
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._lock = threading.RLock()
         self._is_running = False
         self.enabled_services: List[str] = []
         self.cached_results: Dict[str, List[Dict]] = {}
         self.failure_counts: Dict[str, int] = {}
 
     def is_running(self) -> bool:
-        return self._is_running
+        with self._lock:
+            return self._is_running
 
     def update_services(self, enabled_services: List[str], current_results: Optional[Dict[str, List[Dict]]] = None):
         """更新当前监听的服务清单与基准测试结果"""
-        self.enabled_services = list(enabled_services)
-        if current_results:
-            self.cached_results = dict(current_results)
+        with self._lock:
+            self.enabled_services = list(enabled_services)
+            if current_results:
+                self.cached_results = dict(current_results)
 
     def check_and_heal_service(self, srv_id: str) -> bool:
         """检查单个服务的当前主力节点，并在故障时自动选举自愈"""
@@ -462,13 +629,39 @@ class CDNHealthMonitor:
         if not srv:
             return False
 
-        items = self.cached_results.get(srv_id)
+        with self._lock:
+            items = self.cached_results.get(srv_id)
         if not items:
             items = self.optimizer.test_service_dual(srv_id)
-            self.cached_results[srv_id] = items
+            with self._lock:
+                self.cached_results[srv_id] = items
 
         best_item = next((it for it in items if it.get("rank", 3) == 0), items[0] if items else None)
         if not best_item:
+            return False
+
+        # relay 代理转发服务: 数据平面经本地代理出网, 探针改查 relay 端口 TCP 可达性
+        # (直连探针必然失败, 若走原路径会导致无意义空转自愈)
+        if srv_id in getattr(self.optimizer, "last_relay_services", set()):
+            port = relay_port_for(srv_id)
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    pass
+                with self._lock:
+                    self.failure_counts[srv_id] = 0
+                return False  # relay 端口健康, 无需自愈
+            except Exception:
+                pass
+            # relay 端口不可达 (relay 停止/代理失效): 走失败计数与自愈路径
+            with self._lock:
+                self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
+                trigger_heal = (self.failure_counts[srv_id] >= 2)
+            if trigger_heal:
+                new_items = self.optimizer.test_service_dual(srv_id)
+                with self._lock:
+                    self.cached_results[srv_id] = new_items
+                    self.failure_counts[srv_id] = 0
+                return True
             return False
 
         # 轻量探针检查当前主力节点
@@ -477,24 +670,31 @@ class CDNHealthMonitor:
         probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain, timeout=2.0, sni_mode=sni_mode)
 
         if probe_res.get("tls_ok", False):
-            self.failure_counts[srv_id] = 0
+            with self._lock:
+                self.failure_counts[srv_id] = 0
             return False  # 主力节点健康，无需自愈
 
         # 连续失败计数累加
-        self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
-        if self.failure_counts[srv_id] >= 2:
+        with self._lock:
+            self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
+            trigger_heal = (self.failure_counts[srv_id] >= 2)
+
+        if trigger_heal:
             # 触发故障自愈：单服务重测并选举新节点
             new_items = self.optimizer.test_service_dual(srv_id)
-            self.cached_results[srv_id] = new_items
-            self.failure_counts[srv_id] = 0
+            with self._lock:
+                self.cached_results[srv_id] = new_items
+                self.failure_counts[srv_id] = 0
             return True
 
         return False
 
     def run_health_check_cycle(self) -> Tuple[bool, List[str]]:
         """执行一轮轻量健康巡检周期，返回 (是否有自愈发生, 自愈服务列表)"""
+        with self._lock:
+            targets = list(self.enabled_services)
         healed_services = []
-        for srv_id in self.enabled_services:
+        for srv_id in targets:
             if self._stop_event.is_set():
                 break
             try:
@@ -503,9 +703,13 @@ class CDNHealthMonitor:
             except Exception:
                 pass
 
-        if healed_services and self.cached_results:
+        with self._lock:
+            has_cache = bool(self.cached_results)
+            cache_snapshot = dict(self.cached_results)
+
+        if healed_services and has_cache:
             # 重新渲染 upstream 配置并应用
-            ok, _ = self.optimizer.apply_optimal(self.cached_results)
+            ok, _ = self.optimizer.apply_optimal(cache_snapshot)
             if ok and self.on_healed:
                 try:
                     self.on_healed()
@@ -517,7 +721,6 @@ class CDNHealthMonitor:
 
     def _worker_loop(self):
         """后台低开销巡检工作循环"""
-        self._is_running = True
         while not self._stop_event.is_set():
             # 休眠指定周期（支持快速唤醒退出）
             if self._stop_event.wait(timeout=self.check_interval):
@@ -526,26 +729,32 @@ class CDNHealthMonitor:
                 self.run_health_check_cycle()
             except Exception:
                 pass
-        self._is_running = False
+        with self._lock:
+            self._is_running = False
 
     def start(self, enabled_services: Optional[List[str]] = None):
         """启动后台健康巡检守护线程"""
-        if self._is_running:
-            return
-        if enabled_services is not None:
-            self.enabled_services = list(enabled_services)
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="CDNHealthMonitorThread")
-        self._thread.start()
+        with self._lock:
+            if self._is_running:
+                return
+            if enabled_services is not None:
+                self.enabled_services = list(enabled_services)
+            self._is_running = True
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="CDNHealthMonitorThread")
+            self._thread.start()
 
     def stop(self):
         """停止后台健康巡检"""
-        if not self._is_running:
-            return
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._is_running = False
+        with self._lock:
+            if not self._is_running:
+                return
+            self._stop_event.set()
+            thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        with self._lock:
+            self._is_running = False
 
 
 # ==============================================================================

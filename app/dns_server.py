@@ -81,6 +81,20 @@ def build_dns_a_response(raw_query: bytes, tx_id: int, ip_str: str, ttl: int = 6
     return header + question_bytes + answer
 
 
+def build_dns_empty_response(raw_query: bytes, tx_id: int) -> bytes:
+    """构建标准 DNS NOERROR 空应答 (用于屏蔽 AAAA / HTTPS 记录避免 IPv6 绕过代理)"""
+    pos = 12
+    while pos < len(raw_query):
+        length = raw_query[pos]
+        if length == 0:
+            pos += 5
+            break
+        pos += 1 + length
+    question_bytes = raw_query[12:pos]
+    header = struct.pack("!HHHHHH", tx_id, 0x8180, 1, 0, 0, 0)
+    return header + question_bytes
+
+
 class LocalDnsServer:
     """本地轻量 DNS 服务器与智能路由"""
 
@@ -88,6 +102,7 @@ class LocalDnsServer:
                  upstream_dns: str = "223.5.5.5", upstream_port: int = 53):
         self.host = host
         self.port = port
+        self.upstream_dns_list = [upstream_dns, "119.29.29.29", "1.1.1.1"]
         self.upstream_dns = upstream_dns
         self.upstream_port = upstream_port
         self._sock: Optional[socket.socket] = None
@@ -119,15 +134,18 @@ class LocalDnsServer:
         return None
 
     def _forward_upstream(self, raw_query: bytes) -> Optional[bytes]:
-        """将非目标 DNS 查询透明递归转发给上游公共 DNS"""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as up_sock:
-                up_sock.settimeout(1.5)
-                up_sock.sendto(raw_query, (self.upstream_dns, self.upstream_port))
-                resp, _ = up_sock.recvfrom(4096)
-                return resp
-        except Exception:
-            return None
+        """将非目标 DNS 查询透明递归转发给上游公共 DNS (支持多上游自动容灾)"""
+        for dns_ip in self.upstream_dns_list:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as up_sock:
+                    up_sock.settimeout(1.0)
+                    up_sock.sendto(raw_query, (dns_ip, self.upstream_port))
+                    resp, _ = up_sock.recvfrom(4096)
+                    if resp:
+                        return resp
+            except Exception:
+                continue
+        return None
 
     def _handle_request(self, data: bytes, client_addr: Tuple[str, int]):
         """处理单条 DNS 查询请求"""
@@ -135,10 +153,10 @@ class LocalDnsServer:
         if not domain or tx_id == 0:
             return
 
-        # 仅针对 A 记录 (qtype == 1) 执行本地分流
-        if qtype == 1:
-            local_ip = self._resolve_locally(domain)
-            if local_ip:
+        # 对命中加速规则的域名执行智能分流
+        local_ip = self._resolve_locally(domain)
+        if local_ip:
+            if qtype == 1:  # A 记录 (IPv4)
                 resp = build_dns_a_response(data, tx_id, local_ip)
                 try:
                     if self._sock:
@@ -146,8 +164,16 @@ class LocalDnsServer:
                 except Exception:
                     pass
                 return
+            elif qtype in (28, 65):  # 28=AAAA (IPv6), 65=HTTPS (SVCB) 屏蔽返回 NODATA，强制客户端降级 IPv4 A 记录
+                resp = build_dns_empty_response(data, tx_id)
+                try:
+                    if self._sock:
+                        self._sock.sendto(resp, client_addr)
+                except Exception:
+                    pass
+                return
 
-        # 其他情况透明转发给上游 DNS
+        # 其他未匹配情况透明转发给上游 DNS
         upstream_resp = self._forward_upstream(data)
         if upstream_resp and self._sock:
             try:

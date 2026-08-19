@@ -4,7 +4,7 @@ PixivToolkit - 加速服务元数据、域名映射与 CDN 候选池 (对接 Ser
 
 向后兼容导出:
 - SERVICE_GROUPS: 服务分组字典
-- SERVICES_LIST: 18 项服务列表
+- SERVICES_LIST: 21 项服务列表 (默认开启 18 项稳定直连服务)
 - SERVICES_BY_ID: 服务字典索引
 - CANDIDATE_IPS: 各服务优质候选 CDN IP 池
 - DEFAULT_ENABLED_SERVICES: 默认开启的服务列表
@@ -21,7 +21,8 @@ from service_profile import (
     ServiceProfile,
     ServiceMode,
     get_profile_by_id,
-    get_profile_by_domain
+    get_profile_by_domain,
+    TOTAL_SERVICES_COUNT
 )
 
 # 兼容现有数据结构的 SERVICES_LIST 字典列表
@@ -44,8 +45,9 @@ SERVICES_BY_ID = {s["id"]: s for s in SERVICES_LIST}
 # 各服务的优质 CDN Anycast IP 候选池
 CANDIDATE_IPS = {p.id: p.candidate_ips for p in PROFILES}
 
-# 默认开启已验证的优质稳定直连服务集合 (排除需要依赖海外中继代理的 fandom, wikipedia, yandere)
-EXPERIMENTAL_OR_PROXY_SERVICES = {"fandom", "wikipedia", "yandere"}
+# 默认开启全部已实测直连可用的服务 (需代理的 fandom/wikipedia/google_translate 已移除;
+# yandere 实测直连可用, 一并默认启用)
+EXPERIMENTAL_OR_PROXY_SERVICES = set()
 DEFAULT_ENABLED_SERVICES = [p.id for p in PROFILES if p.id not in EXPERIMENTAL_OR_PROXY_SERVICES]
 
 

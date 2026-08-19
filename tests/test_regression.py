@@ -42,8 +42,8 @@ from nginx_generator import NginxConfGenerator
 # 确保测试前最新站点配置文件已完全模板化渲染
 NginxConfGenerator.generate_all(WORKSPACE_DIR / "nginx" / "conf")
 
-class RegressionTestSuite:
-    def __init__(self):
+class TestRegressionSuite:
+    def setup_method(self):
         self.results = {}
         self.start_time = time.time()
 
@@ -83,7 +83,7 @@ class RegressionTestSuite:
         defined_upstreams = set(re.findall(r"upstream\s+([a-zA-Z0-9_-]+)\s*\{", dynamic_upstream_conf))
         self.log_sub(f"upstream-dynamic.conf 中解析到 {len(defined_upstreams)} 个负载均衡组")
 
-        # 校验 20 项服务是否全部在 upstream-dynamic.conf 中定义
+        # 校验 21 项服务是否全部在 upstream-dynamic.conf 中定义
         for srv in SERVICES_LIST:
             srv_id = srv["id"]
             expected_upstream = f"upstream_{srv_id}"
@@ -382,6 +382,7 @@ class RegressionTestSuite:
     # 运行全部验证
     # =========================================================================
     def run_all(self):
+        self.setup_method()
         print("\n" + "#"*70)
         print("   PixivToolkit 全面自动化测试与回归验证套件 (Regression Test Suite)")
         print("#"*70)
@@ -410,6 +411,6 @@ class RegressionTestSuite:
         return all_passed
 
 if __name__ == "__main__":
-    runner = RegressionTestSuite()
+    runner = TestRegressionSuite()
     success = runner.run_all()
     sys.exit(0 if success else 1)

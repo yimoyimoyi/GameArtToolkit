@@ -14,11 +14,13 @@ import struct
 import asyncio
 import threading
 import socket
+import functools
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Callable
+from typing import Dict, Optional, Tuple, Callable, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from service_profile import get_profile_by_domain, PROFILES_BY_ID
+from config_store import load_config
 
 
 def extract_sni_from_client_hello(data: bytes) -> Optional[str]:
@@ -98,14 +100,26 @@ def extract_sni_from_client_hello(data: bytes) -> Optional[str]:
 
 
 class L4RelayServer:
-    """L4 TCP 隧道与 SNI 路由转发服务"""
+    """L4 TCP 隧道与 SNI 路由转发服务 (支持经本地 HTTP 代理 CONNECT 转发)
+
+    双模式:
+    - SNI 直连模式 (默认端口): 嗅探 ClientHello SNI -> 匹配候选 IP 直连
+    - 代理转发模式 (端口静态映射): 端口 -> 目标域名, 经本地代理 (upstream_proxy)
+      CONNECT 域名:443 隧道转发, 兼容空 SNI / 伪 SNI / host SNI 三种模式
+    """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 44301):
         self.host = host
         self.port = port
         self.routes: Dict[str, Tuple[str, int]] = {}  # domain -> (target_ip, target_port)
         self.default_upstream: Optional[Tuple[str, int]] = None
+        # 代理转发模式: 监听端口 -> CONNECT 目标域名 (静态映射, 端口即路由)
+        self.proxy_routes: Dict[int, str] = {}
+        # 显式注入的代理地址 (测试用); None 时从 config.json 实时读取
+        self._proxy_addr_override: Optional[Tuple[str, int]] = None
         self._server: Optional[asyncio.Server] = None
+        # 多端口监听: 端口 -> asyncio.Server (含 SNI 主端口与代理转发端口)
+        self._servers: Dict[int, asyncio.Server] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._is_running = False
@@ -117,6 +131,42 @@ class L4RelayServer:
     def set_default_upstream(self, target_ip: str, target_port: int = 443):
         """设置未匹配到 SNI 时的兜底上游"""
         self.default_upstream = (target_ip, target_port)
+
+    # --------------------------------------------------------------------------
+    # 代理转发模式路由管理 (端口 -> CONNECT 目标域名)
+    # --------------------------------------------------------------------------
+    def add_proxy_route(self, port: int, domain: str):
+        """注册代理转发端口路由: 该端口收到的 TLS 流量经本地代理 CONNECT <domain>:443 转发"""
+        self.proxy_routes[port] = domain.lower()
+
+    def set_proxy_tunnels(self, mapping: Dict[int, str]):
+        """批量更新代理转发端口映射; 运行中则在线同步监听端口 (新增/移除)"""
+        self.proxy_routes = {int(p): str(d).lower() for p, d in mapping.items()}
+        if self._is_running and self._loop:
+            asyncio.run_coroutine_threadsafe(self._sync_tunnel_servers(), self._loop)
+
+    def clear_proxy_routes(self):
+        """清空全部代理转发端口映射 (运行中同步移除监听)"""
+        self.set_proxy_tunnels({})
+
+    def set_proxy_addr(self, host: Optional[str], port: Optional[int] = None):
+        """显式注入上游代理地址 (测试用); 传 None 恢复从 config.json 实时读取"""
+        if host is None:
+            self._proxy_addr_override = None
+        else:
+            self._proxy_addr_override = (host, int(port))
+
+    def _load_proxy_addr(self) -> Optional[Tuple[str, int]]:
+        """获取上游代理地址: 优先显式注入, 否则实时读取 config.json upstream_proxy"""
+        if self._proxy_addr_override is not None:
+            return self._proxy_addr_override
+        try:
+            cfg = load_config().get("upstream_proxy", {})
+            if not cfg.get("enabled", True):
+                return None
+            return (str(cfg.get("host", "127.0.0.1")), int(cfg.get("port", 7897)))
+        except Exception:
+            return None
 
     def is_running(self) -> bool:
         return self._is_running
@@ -133,7 +183,7 @@ class L4RelayServer:
             pass
 
     async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """双向单向数据泵 (带 128KB 缓冲高吞吐流式 copy)"""
+        """双向单向数据泵 (带 128KB 缓冲高吞吐流式 copy 与半关闭协同)"""
         try:
             while True:
                 buf = await reader.read(131072)
@@ -141,6 +191,11 @@ class L4RelayServer:
                     break
                 writer.write(buf)
                 await writer.drain()
+            try:
+                if hasattr(writer, "write_eof") and writer.can_write_eof():
+                    writer.write_eof()
+            except Exception:
+                pass
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
             pass
         except Exception:
@@ -152,27 +207,107 @@ class L4RelayServer:
             except Exception:
                 pass
 
-    async def _handle_connection(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
-        """处理入站 TCP 连接: 嗅探 SNI -> 匹配 Upstream -> 透明转发"""
+    @staticmethod
+    def _format_connect_target(domain: str, port: int = 443) -> str:
+        """格式化 CONNECT 目标, IPv6 地址必须加方括号 (HTTP 标准要求)"""
+        if ":" in domain:
+            return f"[{domain}]:{port}"
+        return f"{domain}:{port}"
+
+    async def _proxy_connect(self, proxy: Tuple[str, int], domain: str, timeout: float = 2.5):
+        """连接本地 HTTP 代理 -> 发送 CONNECT 隧道 -> 校验 200 -> 返回 (reader, writer, 隧道残留字节)
+
+        纯 asyncio 实现 (与 cdn_optimizer 同步版语义一致); 读取响应头时顺带吞入的
+        隧道数据通过 rest 返回, 由调用方回放, 防止丢字节
+        """
+        proxy_reader, proxy_writer = await asyncio.wait_for(
+            asyncio.open_connection(*proxy), timeout=timeout)
+        try:
+            target = self._format_connect_target(domain)
+            proxy_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("utf-8"))
+            await proxy_writer.drain()
+            hdr = b""
+            while b"\r\n\r\n" not in hdr:
+                chunk = await asyncio.wait_for(proxy_reader.read(4096), timeout=timeout)
+                if not chunk:
+                    raise ConnectionError("CONNECT 响应提前 EOF")
+                hdr += chunk
+                if len(hdr) > 8192:
+                    raise ConnectionError("CONNECT 响应头超长")
+            line = hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+            if " 200 " not in line:
+                raise ConnectionError(f"CONNECT 隧道建立失败: {line or '无响应'}")
+            rest = hdr.split(b"\r\n\r\n", 1)[1]  # 响应头之外顺带读入的隧道数据
+            return proxy_reader, proxy_writer, rest
+        except Exception:
+            try:
+                proxy_writer.close()
+            except Exception:
+                pass
+            raise
+
+    async def _handle_proxy_forward(self, client_reader: asyncio.StreamReader,
+                                    client_writer: asyncio.StreamWriter,
+                                    first_chunk: bytes, domain: str):
+        """代理转发模式: 经本地代理 CONNECT <domain>:443 隧道, 首包回放 + 双向管道"""
+        proxy = self._load_proxy_addr()
+        if not proxy:
+            # 代理未配置/禁用: 拒绝连接, 由 nginx upstream backup 直连兜底
+            client_writer.close()
+            return
+        try:
+            up_reader, up_writer, rest = await self._proxy_connect(proxy, domain)
+        except Exception:
+            client_writer.close()
+            return
+        self._tune_socket(up_writer)
+        try:
+            # 回放: CONNECT 响应头顺带吞入的隧道数据 + 客户端首包 (代理隧道无需 DPI 切片)
+            if rest:
+                up_writer.write(rest)
+            up_writer.write(first_chunk)
+            await up_writer.drain()
+            await asyncio.gather(
+                self._pipe(client_reader, up_writer),
+                self._pipe(up_reader, client_writer),
+                return_exceptions=True)
+        finally:
+            try:
+                up_writer.close()
+            except Exception:
+                pass
+
+    async def _handle_connection(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter,
+                                 listen_port: Optional[int] = None):
+        """处理入站 TCP 连接: 代理端口 -> CONNECT 域名隧道; SNI 端口 -> 嗅探 SNI -> 直连转发"""
         upstream_reader = None
         upstream_writer = None
         try:
             self._tune_socket(client_writer)
 
-            # 1. 尝试读取前导握手包 (最多等待 2.0 秒)
-            first_chunk = await asyncio.wait_for(client_reader.read(4096), timeout=2.0)
+            # 1. 尝试读取前导握手包 (代理端口无限等待以兼容 nginx keepalive 空闲; SNI 端口 2.0s)
+            if listen_port and listen_port in self.proxy_routes:
+                first_chunk = await client_reader.read(4096)
+            else:
+                first_chunk = await asyncio.wait_for(client_reader.read(4096), timeout=2.0)
             if not first_chunk:
                 client_writer.close()
                 return
 
+            # 2. 代理转发模式: 端口命中静态映射 -> CONNECT 域名 (不解析 SNI, 兼容三种 SNI 模式)
+            connect_domain = self.proxy_routes.get(listen_port) if listen_port else None
+            if connect_domain:
+                await self._handle_proxy_forward(client_reader, client_writer, first_chunk, connect_domain)
+                return
+
             # 2. 嗅探 SNI
             sni = extract_sni_from_client_hello(first_chunk)
-            target = None
+            candidate_list = []
 
             if sni:
                 # 1. 查自定义路由表 (精确匹配)
                 if sni in self.routes:
-                    target = self.routes[sni]
+                    candidate_list = [self.routes[sni]]
                 else:
                     # 2. 查 Service Profile (精确匹配或泛域名通配)
                     profile = get_profile_by_domain(sni)
@@ -185,23 +320,33 @@ class L4RelayServer:
                             if profile:
                                 break
                     if profile and profile.candidate_ips:
-                        target = (profile.candidate_ips[0], 443)
+                        candidate_list = [(ip, 443) for ip in profile.candidate_ips]
 
-            if not target:
-                target = self.default_upstream
+            if not candidate_list and self.default_upstream:
+                candidate_list = [self.default_upstream]
 
-            if not target:
+            if not candidate_list:
                 # 无上游可用，安全关闭
                 client_writer.close()
                 return
 
-            target_ip, target_port = target
+            # 3. 连接目标上游 (尝试候选列表，支持故障转移)
+            connected = False
+            for target_ip, target_port in candidate_list:
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(target_ip, target_port),
+                        timeout=2.5
+                    )
+                    connected = True
+                    break
+                except Exception:
+                    continue
 
-            # 3. 连接目标上游 (3.5s 超时适应跨国握手)
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(target_ip, target_port),
-                timeout=3.5
-            )
+            if not connected or not upstream_writer:
+                client_writer.close()
+                return
+
             self._tune_socket(upstream_writer)
 
             # 4. 回放首个握手包给上游 (支持 TLS 报文微切片分发以抵抗 SNI DPI 阻断)
@@ -232,6 +377,26 @@ class L4RelayServer:
                     except Exception:
                         pass
 
+    async def _sync_tunnel_servers(self):
+        """在线同步多端口监听: 按当前 proxy_routes 增删代理转发端口 (循环线程内调用)"""
+        desired = set(self.proxy_routes.keys())
+        current = set(self._servers.keys())
+        # 排除 SNI 主端口 (自举端口永不参与代理端口同步, 防止被误关闭)
+        for p in (current - desired) - {self.port}:
+            srv = self._servers.pop(p, None)
+            if srv:
+                srv.close()
+                await srv.wait_closed()
+        for p in sorted(desired - current):
+            try:
+                srv = await asyncio.start_server(
+                    functools.partial(self._handle_connection, listen_port=p),
+                    self.host, p, reuse_address=True)
+                self._servers[p] = srv
+            except OSError:
+                # 端口被第三方占用: 跳过该端口 (nginx 将 502, 由 backup 兜底)
+                self.proxy_routes.pop(p, None)
+
     def _run_event_loop(self):
         """后台独立线程运行 asyncio 事件循环"""
         self._loop = asyncio.new_event_loop()
@@ -239,16 +404,24 @@ class L4RelayServer:
         self._stop_event = asyncio.Event()
 
         async def _main():
-            self._server = await asyncio.start_server(
-                self._handle_connection, self.host, self.port, reuse_address=True
-            )
+            # SNI 主端口 + 全部代理转发端口
+            self._servers.clear()
+            try:
+                srv = await asyncio.start_server(
+                    functools.partial(self._handle_connection, listen_port=self.port),
+                    self.host, self.port, reuse_address=True)
+                self._servers[self.port] = srv
+            except OSError:
+                pass  # 主端口被占: 仅代理转发端口可用
+            await self._sync_tunnel_servers()
             self._is_running = True
             try:
                 await self._stop_event.wait()
             finally:
-                if self._server:
-                    self._server.close()
-                    await self._server.wait_closed()
+                for srv in list(self._servers.values()):
+                    srv.close()
+                    await srv.wait_closed()
+                self._servers.clear()
 
         try:
             self._loop.run_until_complete(_main())
@@ -269,17 +442,18 @@ class L4RelayServer:
             self._is_running = False
 
     def start(self) -> Tuple[bool, str]:
-        """在后台守护线程中启动 L4 Relay 服务"""
+        """在后台守护线程中启动 L4 Relay 服务 (SNI 主端口 + 代理转发端口)"""
         if self._is_running:
             return True, f"L4 Relay 已经在运行中 ({self.host}:{self.port})"
         try:
             self._thread = threading.Thread(target=self._run_event_loop, daemon=True, name="L4RelayThread")
             self._thread.start()
             import time
-            time.sleep(0.15)
+            time.sleep(0.2)
             if self._is_running:
-                return True, f"L4 Relay 启动成功 (监听 {self.host}:{self.port})"
-            return False, "L4 Relay 启动未就绪"
+                extra = f" + {len(self._servers) - 1} 个代理转发端口" if len(self._servers) > 1 else ""
+                return True, f"L4 Relay 启动成功 (监听 {self.host}:{self.port}{extra})"
+            return False, "L4 Relay 启动未就绪 (端口可能被占用)"
         except Exception as e:
             return False, f"启动 L4 Relay 异常: {e}"
 

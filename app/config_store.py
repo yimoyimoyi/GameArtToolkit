@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     "upstream_proxy": {"enabled": False, "host": "127.0.0.1", "port": 7897}
 }
 
-# 旧版粗粒度服务 ID 到现代 18 项细粒度 ID 的映射转换字典
+# 旧版粗粒度服务 ID 到细粒度 ID 的映射转换字典 (自动兼容历史配置)
 _LEGACY_SERVICE_MAPPING = {
     "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "danbooru", "yandere", "vndb"],
     "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft", "ea_app"],

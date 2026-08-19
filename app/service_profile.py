@@ -89,7 +89,7 @@ SERVICE_GROUPS = {
 
 
 # ==============================================================================
-# 18 项核心加速服务 Profile 注册表 (声明式单源定义)
+# 21 项核心加速服务 Profile 注册表 (声明式单源定义)
 # ==============================================================================
 PROFILES: List[ServiceProfile] = [
     # --------------------------------------------------------------------------
@@ -123,7 +123,10 @@ PROFILES: List[ServiceProfile] = [
         group="gaming",
         name="Steam 静态图片 CDN",
         desc="解决好友头像加载失败、创意工坊 Mod 预览图破图",
-        domains=["community.akamai.steamstatic.com", "avatars.akamai.steamstatic.com", "clan.akamai.steamstatic.com", "community.steamstatic.com"],
+        domains=["community.akamai.steamstatic.com", "avatars.akamai.steamstatic.com", "clan.akamai.steamstatic.com",
+                 "community.akamai.steamstatic.com",
+                 "steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",  # 创意工坊封面/用户上传图
+                 "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"],  # 静态资源 CDN
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_akamai",
         ssl_sni_mode="community.steamstatic.com",
@@ -245,45 +248,13 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_vndb",
         ssl_sni_mode="host",
-        candidate_ips=["217.182.194.133"]
-    ),
-    ServiceProfile(
-        id="fandom",
-        group="acg",
-        name="Fandom 游戏动漫社区 Wiki",
-        desc="解决各类游戏/动漫/影视 Wiki 资料库与图片 CDN 加速",
-        domains=[
-            "fandom.com", "www.fandom.com", "wikia.com", "static.wikia.nocookie.net",
-            "vignette.wikia.nocookie.net", "images.wikia.com", "services.fandom.com",
-            "auth.fandom.com", "genshin-impact.fandom.com", "minecraft.fandom.com",
-            "starwars.fandom.com", "zelda.fandom.com", "honkai-star-rail.fandom.com", "terraria.fandom.com"
-        ],
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_fandom",
-        ssl_sni_mode="host",
-        candidate_ips=["151.101.0.194", "151.101.64.194", "151.101.128.194", "151.101.192.194"]
+        candidate_ips=["217.182.194.133",
+                       "2001:1af8:5301:117:1c00:d7ff:fe00:ffd"]  # IPv6 实测可用
     ),
 
     # --------------------------------------------------------------------------
     # 💻 开发者 & AI
     # --------------------------------------------------------------------------
-    ServiceProfile(
-        id="wikipedia",
-        group="dev",
-        name="Wikipedia 维基百科",
-        desc="解决全球自由百科全书中文/英文版及图库媒体加载",
-        domains=[
-            "wikipedia.org", "www.wikipedia.org",
-            "zh.wikipedia.org", "en.wikipedia.org", "ja.wikipedia.org", "zh-tw.wikipedia.org", "zh-cn.wikipedia.org",
-            "zh.m.wikipedia.org", "en.m.wikipedia.org",
-            "upload.wikimedia.org", "commons.wikimedia.org", "meta.wikimedia.org",
-            "wikidata.org", "www.wikidata.org", "wikimedia.org"
-        ],
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_wikipedia",
-        ssl_sni_mode="host",
-        candidate_ips=["185.15.59.224", "185.15.58.224", "198.35.26.96", "208.80.154.224"]
-    ),
     ServiceProfile(
         id="github_web",
         group="dev",
@@ -314,7 +285,9 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_raw",
         ssl_sni_mode="host",
-        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"]
+        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133",
+                       "2606:50c0:8000::154", "2606:50c0:8001::154",  # GitHub 原生 IPv6, 实测直连可用
+                       "2606:50c0:8002::154", "2606:50c0:8003::154"]
     ),
     ServiceProfile(
         id="github_release",
@@ -336,7 +309,9 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_assets",
         ssl_sni_mode="host",
-        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133", "185.199.108.154"]
+        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133", "185.199.108.154",
+                       "2606:50c0:8000::215", "2606:50c0:8001::215",  # GitHub 原生 IPv6, 实测直连可用
+                       "2606:50c0:8002::215", "2606:50c0:8003::215"]
     ),
     ServiceProfile(
         id="gitlab",
@@ -347,7 +322,8 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_gitlab",
         ssl_sni_mode="host",
-        candidate_ips=["104.18.37.180", "172.64.150.76", "172.65.251.78"]
+        candidate_ips=["104.18.37.180", "172.64.150.76", "172.65.251.78",
+                       "2606:4700:90:0:f22e:fbec:5bed:a9b9"]  # Cloudflare IPv6, 实测可用
     ),
     ServiceProfile(
         id="huggingface",
@@ -362,20 +338,6 @@ PROFILES: List[ServiceProfile] = [
             "18.155.68.86", "18.155.68.106", "18.155.68.125",
             "18.64.8.43", "18.64.8.84", "108.138.246.7",
             "54.230.71.56", "3.175.207.30", "3.175.207.31"
-        ]
-    ),
-    ServiceProfile(
-        id="google_translate",
-        group="dev",
-        name="Google 谷歌翻译",
-        desc="解决 Chrome 内置网页翻译与划词翻译连接超时 (亚太 Anycast 官方直连)",
-        domains=["translate.googleapis.com", "translate.google.com"],
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_google_translate",
-        ssl_sni_mode="host",
-        candidate_ips=[
-            "142.250.107.90", "142.250.72.234", "172.217.160.106", "172.217.163.42",
-            "142.250.66.42", "142.250.198.10", "142.250.204.42"
         ]
     )
 ]
@@ -405,3 +367,5 @@ def get_profile_by_domain(domain: str) -> Optional[ServiceProfile]:
         elif d_lower.endswith("." + registered_domain):
             return profile
     return None
+
+TOTAL_SERVICES_COUNT: int = len(PROFILES)

@@ -12,7 +12,7 @@ from typing import Tuple, Dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
-from win_utils import is_process_running, is_port_in_use, get_silent_startup_kwargs
+from win_utils import is_process_running, is_port_in_use, get_pids_by_name, get_silent_startup_kwargs
 from nginx_generator import NginxConfGenerator
 
 NGINX_EXE = NGINX_DIR / "nginx.exe"
@@ -41,6 +41,44 @@ class NginxManager:
             except Exception:
                 pass
         return 0
+
+    def _repair_pid_file(self) -> int:
+        """校验 PID 文件与实际 nginx 进程一致性, 不一致时自动修复
+
+        nginx 进程异常重启后 PID 文件会过期, 导致 -s reload/-s stop 信号失效
+        (OpenEvent ngx_reload_<过期PID> failed)。此方法在 reload/stop 前调用,
+        用实际进程 PID 覆盖过期文件, 恢复信号通道。
+        """
+        real_pids = get_pids_by_name("nginx.exe")
+        if not real_pids:
+            return 0
+        pid = self.get_pid()
+        if pid in real_pids:
+            return pid  # 一致, 无需修复
+        # PID 文件过期: 优先取监听 80/443 的 nginx 实例 (数据平面), 否则取第一个
+        actual = 0
+        try:
+            proc = subprocess.run(
+                'netstat -ano | findstr "LISTENING"',
+                shell=True, capture_output=True, text=True, timeout=2
+            )
+            for line in (proc.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[4].isdigit():
+                    cand = int(parts[4])
+                    if cand in real_pids and (":80 " in line or ":443 " in line):
+                        actual = cand
+                        break
+        except Exception:
+            pass
+        if not actual:
+            actual = real_pids[0]
+        try:
+            with open(self.pid_file, "w", encoding="utf-8") as f:
+                f.write(str(actual))
+        except Exception:
+            pass
+        return actual
 
     def test_config(self) -> Tuple[bool, str]:
         """执行 nginx -t 进行语法与 upstream 预检 (包含前置模板渲染)"""
@@ -124,6 +162,9 @@ class NginxManager:
         if not self.is_running():
             return True, "Nginx 未在运行"
 
+        # PID 文件一致性校验: 防止 nginx 重启后信号失效导致无法停止
+        self._repair_pid_file()
+
         pid = self.get_pid()
 
         # 1. 优先优雅停止
@@ -174,6 +215,9 @@ class NginxManager:
         """热重载 Nginx 配置（零中断，前置语法预检，全静默无窗）"""
         if not self.is_running():
             return self.start()
+
+        # PID 文件一致性校验: 防止 nginx 重启后信号失效
+        self._repair_pid_file()
 
         # 前置语法自检，防止破损配置打崩服务
         ok, test_msg = self.test_config()

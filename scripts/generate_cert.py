@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 PixivToolkit - 18 项加速服务通用 SAN 证书生成器 (X.509 v3 + SHA256)
 自动生成覆盖 18 项服务的根证书 (Root CA) 与多域名通用通配符服务端证书
@@ -18,57 +18,28 @@ CA_DIR = NGINX_DIR / "ca"
 CONF_DIR = NGINX_DIR / "conf"
 CONF_CA_DIR = CONF_DIR / "ca"
 
-# 18 项加速服务全域名 & 通配符 SAN 列表
-ALL_SAN_DOMAINS = [
-    # 🎨 Pixiv 二次元 & 创作生态
-    "*.pixiv.net", "pixiv.net", "www.pixiv.net", "touch.pixiv.net", "app-api.pixiv.net",
-    "oauth.secure.pixiv.net", "accounts.pixiv.net", "comic.pixiv.net", "novel.pixiv.net",
-    "dic.pixiv.net", "sketch.pixiv.net", "public-api.secure.pixiv.net",
-    "*.secure.pixiv.net", "pixivision.net", "*.pixivision.net", "pixiv.me", "*.pixiv.me",
-    "*.pximg.net", "pximg.net", "i.pximg.net", "s.pximg.net", "source.pixiv.net", "imgaz.pixiv.net",
-    "*.fanbox.cc", "fanbox.cc", "api.fanbox.cc", "downloads.fanbox.cc",
-    "*.booth.pm", "booth.pm", "api.booth.pm", "assets.booth.pm",
-    "*.donmai.us", "donmai.us", "danbooru.donmai.us", "cdn.donmai.us",
-    "*.yande.re", "yande.re", "files.yande.re",
-    "*.artstation.com", "artstation.com", "www.artstation.com", "cdna.artstation.com", "cdnb.artstation.com",
-    "*.vndb.org", "vndb.org", "t.vndb.org",
-    "*.kemono.su", "kemono.su", "c.kemono.su",
+sys.path.insert(0, str(BASE_DIR / "app"))
+from service_profile import PROFILES, TOTAL_SERVICES_COUNT
 
-    # 🎮 游戏生态 (Steam / Epic / Ubisoft / EA / GOG / 战网)
-    "*.steampowered.com", "steampowered.com", "store.steampowered.com", "checkout.steampowered.com",
-    "help.steampowered.com", "login.steampowered.com", "api.steampowered.com",
-    "*.steamcommunity.com", "steamcommunity.com",
-    "*.steamstatic.com", "steamstatic.com", "community.akamai.steamstatic.com",
-    "avatars.akamai.steamstatic.com", "clan.akamai.steamstatic.com", "community.steamstatic.com",
-    "*.steam-chat.com", "steam-chat.com", "*.steamserver.net", "steamserver.net",
-    "*.akamaized.net", "akamaized.net", "*.akamaiedge.net", "akamaiedge.net", "*.akamaihd.net", "akamaihd.net",
-    "*.epicgames.com", "epicgames.com", "store.epicgames.com", "launcher-website-prod07.ol.epicgames.com", "static-assets-prod.epicgames.com",
-    "*.ubi.com", "ubi.com", "store.ubi.com", "*.ubisoftconnect.com", "ubisoftconnect.com", "api-ubiservices.ubi.com",
-    "*.origin.com", "origin.com", "api.origin.com", "api1.origin.com", "signin.ea.com", "*.ea.com", "ea.com",
-    "*.gog.com", "gog.com", "api.gog.com", "*.gog-statics.com", "images.gog-statics.com",
-    "*.battle.net", "battle.net", "shop.battle.net", "account.battle.net", "oauth.battle.net",
-
-    # 💻 开发者与 AI
-    "*.github.com", "github.com", "www.github.com", "api.github.com", "gist.github.com", "codeload.github.com",
-    "*.githubusercontent.com", "githubusercontent.com", "raw.githubusercontent.com",
-    "objects.githubusercontent.com", "github-releases.githubusercontent.com", "user-images.githubusercontent.com",
-    "*.githubassets.com", "githubassets.com", "*.github.dev", "github.dev",
-    "*.civitai.com", "civitai.com", "image.civitai.com", "image-b2.civitai.com", "model-delivery.civitai.com", "orchestration.civitai.com", "ws.civitai.com", "*.civitai.red", "civitai.red", "image.civitai.red",
-    "*.docker.com", "docker.com", "hub.docker.com", "*.docker.io", "registry-1.docker.io",
-    "*.stackoverflow.com", "stackoverflow.com", "*.sstatic.net", "cdn.sstatic.net",
-    "*.gitlab.com", "gitlab.com", "*.gitlab-static.net", "assets.gitlab-static.net",
-    "*.huggingface.co", "huggingface.co", "*.hf.co", "hf.co", "*.hf.space", "hf.space",
-
-    # 🌐 海外日常工具
-    "*.discord.com", "discord.com", "*.discordapp.com", "cdn.discordapp.com", "*.discordapp.net", "media.discordapp.net", "*.discord.gg", "discord.gg",
-    "*.reddit.com", "reddit.com", "www.reddit.com", "*.redd.it", "i.redd.it", "v.redd.it",
-    "*.wikipedia.org", "wikipedia.org", "en.wikipedia.org", "zh.wikipedia.org", "*.wikimedia.org", "upload.wikimedia.org",
-    "*.live.com", "onedrive.live.com", "*.onedrive.com", "api.onedrive.com",
-]
+def get_all_san_domains() -> list:
+    """从 ServiceProfile 单源动态提取全量 SAN 域名列表并自动拓展通配符"""
+    domains_set = set()
+    for p in PROFILES:
+        for d in p.domains:
+            d_clean = d.lower().strip()
+            if not d_clean:
+                continue
+            domains_set.add(d_clean)
+            if d_clean.startswith("*."):
+                domains_set.add(d_clean[2:])
+            else:
+                domains_set.add(f"*.{d_clean}")
+    return sorted(list(domains_set))
 
 def generate_certificates():
+    all_san_domains = get_all_san_domains()
     print("========================================================")
-    print("   PixivToolkit - 生成 18 项加速服务通用 SSL 根证书与服务端证书")
+    print(f"   PixivToolkit - 生成 {TOTAL_SERVICES_COUNT} 项加速服务通用 SSL 根证书与服务端证书")
     print("========================================================")
 
     # 1. 创建 Root CA 私钥
@@ -119,8 +90,9 @@ def generate_certificates():
     print("[3/4] 生成服务端私钥 (RSA 2048)...")
     server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-    # 4. 签发覆盖 18 项服务的多域名 SAN 服务端证书
-    print(f"[4/4] 签发全量多域名通用证书 (包含 {len(ALL_SAN_DOMAINS)} 个通配符与独立域名)...")
+    # 4. 签发覆盖全量服务的多域名 SAN 服务端证书
+    unique_sans = sorted(list(set(all_san_domains)))
+    print(f"[4/4] 签发全量多域名通用证书 (包含 {len(unique_sans)} 个通配符与独立域名)...")
     server_subject = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
         x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Shanghai"),
@@ -128,8 +100,6 @@ def generate_certificates():
         x509.NameAttribute(NameOID.COMMON_NAME, "*.pixiv.net"),
     ])
 
-    # 去重 SAN 列表
-    unique_sans = sorted(list(set(ALL_SAN_DOMAINS)))
     san_list = [x509.DNSName(d) for d in unique_sans]
 
     server_cert = (

@@ -96,9 +96,11 @@ def build_exe():
     ignore_patterns = shutil.ignore_patterns("*.log", "*.pid", "cache", "temp")
     shutil.copytree(BASE_DIR / "nginx", target_nginx_root, dirs_exist_ok=True, ignore=ignore_patterns)
 
-    # 确保生成纯净的 cache 与 logs 目录
+    # 确保生成纯净的 cache, logs 与 temp 缓冲子目录，防止大文件/大图反代报 500
     (target_nginx_root / "cache").mkdir(parents=True, exist_ok=True)
     (target_nginx_root / "logs").mkdir(parents=True, exist_ok=True)
+    for temp_sub in ["client_body_temp", "proxy_temp", "fastcgi_temp", "scgi_temp", "uwsgi_temp"]:
+        (target_nginx_root / "temp" / temp_sub).mkdir(parents=True, exist_ok=True)
 
     # 复制根目录 ca.cer 到发布根目录以供快捷手动导入
     if (BASE_DIR / "nginx" / "ca.cer").exists():

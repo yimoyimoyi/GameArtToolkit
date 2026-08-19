@@ -249,8 +249,15 @@ class NativeFramelessHelper:
             bw = max(4, min(self.border_width, 8))
             is_max = self.is_maximized()
 
-            # 优先级 1: 优先检查标题栏控制按钮与交互式控件，保证全部作为客户区派发给 Qt
-            control_buttons = [self.theme_btn, self.min_btn, self.max_btn, self.close_btn]
+            # 优先级 1: 检查最大化按钮，返回 HTMAXBUTTON 触发 Windows 11 Snap Layouts 贴靠菜单
+            if self.max_btn and self.max_btn.isVisible():
+                btn_top_left = self.max_btn.mapToGlobal(QPoint(0, 0))
+                btn_rect = QRect(btn_top_left, self.max_btn.size())
+                if btn_rect.contains(global_pos):
+                    return True, HTMAXBUTTON
+
+            # 其他标题栏控制按钮（主题、最小化、关闭）与交互式控件返回 HTCLIENT 派发给 Qt
+            control_buttons = [self.theme_btn, self.min_btn, self.close_btn]
             for btn in control_buttons:
                 if btn and btn.isVisible():
                     btn_top_left = btn.mapToGlobal(QPoint(0, 0))
@@ -267,10 +274,10 @@ class NativeFramelessHelper:
 
             # 优先级 2: 非最大化状态下，仅在真实窗口边缘 bw 像素内触发 8 方向边缘拉伸
             if not is_max:
-                on_left = 0 <= local_pos.x() <= bw
-                on_right = w - bw <= local_pos.x() <= w
-                on_top = 0 <= local_pos.y() <= bw
-                on_bottom = h - bw <= local_pos.y() <= h
+                on_left = -2 <= local_pos.x() <= bw
+                on_right = w - bw <= local_pos.x() <= w + 2
+                on_top = -2 <= local_pos.y() <= bw
+                on_bottom = h - bw <= local_pos.y() <= h + 2
 
                 if on_top and on_left:
                     return True, HTTOPLEFT
@@ -305,7 +312,18 @@ class NativeFramelessHelper:
 
             return True, HTCLIENT
 
-        # 3. 最小追踪尺寸限制
+        # 3. 非客户区鼠标点击联动 (响应 HTMAXBUTTON 触发的最大化切换)
+        elif msg.message == 0x00A1:  # WM_NCLBUTTONDOWN
+            if msg.wParam == HTMAXBUTTON:
+                return True, 0
+        elif msg.message == 0x00A2:  # WM_NCLBUTTONUP
+            if msg.wParam == HTMAXBUTTON:
+                if hasattr(self.window, "title_bar") and self.window.title_bar:
+                    if hasattr(self.window.title_bar, "_on_toggle_maximize"):
+                        self.window.title_bar._on_toggle_maximize()
+                return True, 0
+
+        # 4. 最小追踪尺寸限制
         elif msg.message == WM_GETMINMAXINFO:
             min_size = self.window.minimumSize()
             if min_size.isValid():
@@ -314,22 +332,9 @@ class NativeFramelessHelper:
                 mmi.ptMinTrackSize.y = min_size.height()
                 return True, 0
 
-        # 4. 响应 DPI 变化
+        # 5. DPI 变化处理 (交由 Qt 原生处理以保持设备像素比与自适应排版一致)
         elif msg.message == WM_DPICHANGED:
-            try:
-                rect = ctypes.cast(msg.lParam, ctypes.POINTER(RECT)).contents
-                user32 = ctypes.windll.user32
-                hwnd = int(self.window.winId())
-                user32.SetWindowPos(
-                    hwnd, 0,
-                    rect.left, rect.top,
-                    rect.right - rect.left, rect.bottom - rect.top,
-                    0x0004 | 0x0020  # SWP_NOZORDER | SWP_FRAMECHANGED
-                )
-                self.window.update()
-                return True, 0
-            except Exception:
-                pass
+            return False, 0
 
         return False, 0
 
