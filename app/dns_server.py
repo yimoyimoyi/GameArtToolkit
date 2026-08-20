@@ -59,7 +59,7 @@ def parse_dns_query(data: bytes) -> Tuple[int, str, int, int]:
 
 
 def _extract_a_ips(resp: bytes) -> List[str]:
-    """从 DNS 响应报文中提取全部 A 记录 (IPv4) IP 列表 (供污染检测)"""
+    """从 DNS 响应报文中提取全部 A 记录 (IPv4) IP 列表 (供污染与 Fake-IP 检测)"""
     if len(resp) < 12:
         return []
     ancount = struct.unpack("!H", resp[6:8])[0]
@@ -92,7 +92,8 @@ def _extract_a_ips(resp: bytes) -> List[str]:
         rtype, _, _, rdlen = struct.unpack("!HHIH", resp[off:off + 10])
         off += 10
         if rtype == 1 and rdlen == 4 and off + 4 <= len(resp):
-            ips.append(socket.inet_ntoa(resp[off:off + 4]))
+            raw_ip = socket.inet_ntoa(resp[off:off + 4])
+            ips.append(raw_ip)
         off += rdlen
     return ips
 
@@ -190,11 +191,10 @@ class LocalDnsServer:
     def _forward_upstream(self, raw_query: bytes) -> Optional[bytes]:
         """将非目标 DNS 查询透明递归转发给上游公共 DNS (UDP + DoH 双通道容灾)
 
-        UDP 响应命中已知污染 IP 段时 (GFW 对封禁域名注入伪造解析),
+        UDP 响应命中已知污染 IP 段或 Fake-IP (198.18.x.x) 时,
         改用 DoH 干净解析重建 A 记录响应 (DoH 加密查询无法被注入)。
         """
-        # 延迟导入避免模块循环依赖 (cdn_optimizer 仅延迟引用 l4_relay, 无循环)
-        from cdn_optimizer import doh_resolve, POLLUTED_IP_PREFIXES
+        from cdn_optimizer import doh_resolve, is_valid_public_cdn_ip
         tx_id, q_domain, qtype, _ = parse_dns_query(raw_query)
         for dns_ip in self.upstream_dns_list:
             try:
@@ -203,10 +203,10 @@ class LocalDnsServer:
                     up_sock.sendto(raw_query, (dns_ip, self.upstream_port))
                     resp, _ = up_sock.recvfrom(4096)
                     if resp:
-                        # DoH 双通道兜底: 仅 A 记录查询且 UDP 结果命中污染段时重建
+                        # 检查 A 记录是否合法: 若为 Fake-IP 或污染 IP，改用 DoH 重建纯净响应
                         if q_domain and qtype == 1:
                             udp_ips = _extract_a_ips(resp)
-                            if udp_ips and any(ip.startswith(POLLUTED_IP_PREFIXES) for ip in udp_ips):
+                            if udp_ips and not all(is_valid_public_cdn_ip(ip) for ip in udp_ips):
                                 doh_ips = doh_resolve(q_domain)
                                 if doh_ips:
                                     return build_dns_a_response(raw_query, tx_id, doh_ips[0])

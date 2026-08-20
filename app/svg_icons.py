@@ -4,7 +4,7 @@ GameArt Toolkit - Material Design 3 SVG 矢量图标引擎
 内置矢量 SVG 路径，支持动态着色与 High-DPI 缩放
 """
 
-from PySide6.QtCore import Qt, QSize, QByteArray
+from PySide6.QtCore import Qt, QSize, QByteArray, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PySide6.QtSvg import QSvgRenderer
 
@@ -234,39 +234,48 @@ SVG_TEMPLATES = {
 
 class SvgIconFactory:
     """
-    SVG 图标生成与缓存工厂
+    SVG 图标生成与缓存工厂 (支持 High-DPI 超采样与多主题色彩)
     """
     _cache = {}
 
     @classmethod
-    def get_pixmap(cls, name: str, color: str = "#FFFFFF", size: int = 18) -> QPixmap:
-        """根据名称、颜色和尺寸渲染高品质抗锯齿 QPixmap"""
-        cache_key = f"{name}_{color}_{size}"
+    def get_pixmap(cls, name: str, color: str = "#FFFFFF", size: int = 18, dpr: float = None) -> QPixmap:
+        """根据名称、颜色和尺寸渲染高品质抗锯齿 QPixmap (支持 High-DPI 超采样)"""
+        from PySide6.QtWidgets import QApplication
+        if dpr is None:
+            app = QApplication.instance()
+            dpr = float(app.devicePixelRatio()) if app else 1.0
+
+        cache_key = f"{name}_{color}_{size}_{dpr}"
         if cache_key in cls._cache:
             return cls._cache[cache_key]
 
         template = SVG_TEMPLATES.get(name)
         if not template:
             pix = QPixmap(size, size)
+            pix.setDevicePixelRatio(dpr)
             pix.fill(Qt.transparent)
             return pix
 
         svg_data = template.replace("{color}", color).encode("utf-8")
         renderer = QSvgRenderer(QByteArray(svg_data))
 
-        pixmap = QPixmap(size, size)
+        physical_size = max(1, int(round(size * dpr)))
+        pixmap = QPixmap(physical_size, physical_size)
+        pixmap.setDevicePixelRatio(dpr)
         pixmap.fill(Qt.transparent)
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        renderer.render(painter)
+        renderer.render(painter, QRectF(0.0, 0.0, float(size), float(size)))
         painter.end()
 
         cls._cache[cache_key] = pixmap
         return pixmap
 
     @classmethod
-    def get_icon(cls, name: str, color: str = "#FFFFFF", size: int = 18) -> QIcon:
+    def get_icon(cls, name: str, color: str = "#FFFFFF", size: int = 18, dpr: float = None) -> QIcon:
         """根据名称、颜色和尺寸返回 QIcon"""
-        return QIcon(cls.get_pixmap(name, color, size))
+        return QIcon(cls.get_pixmap(name, color, size, dpr))
+

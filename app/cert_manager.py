@@ -501,3 +501,44 @@ class CertManager:
             return True, "已从系统卸载根证书"
         except Exception as e:
             return False, f"卸载证书异常: {e}"
+
+    def inject_dev_environments(self) -> bool:
+        """为 Git / Node.js 等开发工具挂载作用域证书 (仅针对 GitHub / GitLab 域名生效)"""
+        try:
+            cer_str = str(self.cer_path.resolve()).replace("\\", "/")
+            # 1. 配置 Git 优先使用 SChannel (原生读取 Windows 根证书库)
+            subprocess.run(
+                ["git", "config", "--global", "http.sslBackend", "schannel"],
+                capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
+            )
+            # 2. 针对 github.com / gitlab.com 配置单独的 sslCAInfo 兜底
+            subprocess.run(
+                ["git", "config", "--global", "http.https://github.com.sslCAInfo", cer_str],
+                capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
+            )
+            subprocess.run(
+                ["git", "config", "--global", "http.https://gitlab.com.sslCAInfo", cer_str],
+                capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
+            )
+            # 3. 注入 Node.js 扩展 CA 环境变量
+            os.environ["NODE_EXTRA_CA_CERTS"] = str(self.cer_path.resolve())
+            return True
+        except Exception:
+            return False
+
+    def restore_dev_environments(self) -> bool:
+        """清理开发工具的证书注入 (退出时调用)"""
+        try:
+            subprocess.run(
+                ["git", "config", "--global", "--unset-all", "http.https://github.com.sslCAInfo"],
+                capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
+            )
+            subprocess.run(
+                ["git", "config", "--global", "--unset-all", "http.https://gitlab.com.sslCAInfo"],
+                capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
+            )
+            os.environ.pop("NODE_EXTRA_CA_CERTS", None)
+            return True
+        except Exception:
+            return False
+

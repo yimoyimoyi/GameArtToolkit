@@ -54,9 +54,10 @@ from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABL
 from frameless_helper import NativeFramelessHelper
 from md_widgets import (
     MDSwitch, TrafficMonitorChart, LatencyBadge, TitleBar,
-    show_toast, InlineEditableLabel, SkeletonCard, AnimatedStackedWidget, FlowLayout
+    show_toast, InlineEditableLabel, SkeletonCard, AnimatedStackedWidget, FlowLayout,
+    NoWheelComboBox
 )
-from material_theme import MATERIAL_DARK_QSS, MATERIAL_LIGHT_QSS, ThemeManager
+from material_theme import MATERIAL_DARK_QSS, MATERIAL_LIGHT_QSS, MATERIAL_PINK_QSS, ThemeManager
 from svg_icons import SvgIconFactory
 
 # 单例实例
@@ -83,6 +84,7 @@ def emergency_fast_cleanup():
         cfg = load_config()
         if cfg.get("auto_clean_hosts_on_exit", True):
             hosts_mgr.fast_remove_rules()
+        cert_mgr.restore_dev_environments()
     except Exception:
         pass
 
@@ -385,7 +387,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1200, 800)
-        self.setMinimumSize(1060, 680)
+        self.setMinimumSize(1020, 660)
         self.setWindowIcon(get_app_icon())
 
         self.frameless_helper = None
@@ -465,34 +467,48 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2500, self.trigger_startup_auto_cdn)
 
     def _update_service_icon(self, sid: str, is_checked: bool):
-        """根据开关状态与当前主题动态调整服务卡片图标色彩 (开启高亮/关闭待命灰)"""
+        """根据开关状态与当前主题动态调整服务卡片图标色彩"""
         if sid not in self.service_icon_labels or not SvgIconFactory:
             return
         lbl, icon_name = self.service_icon_labels[sid]
-        is_dark = ThemeManager.get_instance().is_dark
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
         if is_checked:
-            color = "#7EB9F5" if is_dark else "#0284C7"
+            color = palette.get("primary", "#7EB9F5")
         else:
-            color = "#475569" if is_dark else "#94A3B8"
+            color = palette.get("text_muted", "#94A3B8")
         lbl.setPixmap(SvgIconFactory.get_pixmap(icon_name, color, 20))
 
     def on_theme_changed(self, new_theme: str):
-        """响应全局主题变更广播"""
+        """响应全局主题变更广播 (支持标题栏与设置页双向同步)"""
         is_dark = (new_theme == "dark")
         if self.frameless_helper:
             self.frameless_helper.set_immersive_dark_mode(is_dark)
         
         cfg = load_config()
         cfg["theme"] = new_theme
+        if cfg.get("theme_mode") != "system":
+            cfg["theme_mode"] = new_theme
         save_config(cfg)
         
+        # 同步更新设置页面下拉框选中项
+        if hasattr(self, "cmb_theme_mode") and self.cmb_theme_mode:
+            self.cmb_theme_mode.blockSignals(True)
+            if new_theme == "light":
+                self.cmb_theme_mode.setCurrentIndex(1)
+            elif new_theme == "pink":
+                self.cmb_theme_mode.setCurrentIndex(2)
+            else:
+                self.cmb_theme_mode.setCurrentIndex(0)
+            self.cmb_theme_mode.blockSignals(False)
+
         # 刷新所有静态 SVG 图标与资源
         self.refresh_theme_assets(new_theme)
         # 动态刷新原位样式
         self.refresh_inline_styles()
 
     def _render_sidebar_logo(self):
-        """自绘 34x34 GameArt Toolkit 极光渐变品牌矢量微徽标 (侧边栏)"""
+        """自绘 34x34 GameArt Toolkit 极光/樱粉品牌矢量微徽标 (侧边栏)"""
         if not getattr(self, "lbl_sidebar_logo", None):
             return
         size = 34
@@ -502,8 +518,10 @@ class MainWindow(QMainWindow):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        is_dark = ThemeManager.get_instance().is_dark
-        # 圆角背景 (极光深蓝紫到天蓝渐变)
+        tm = ThemeManager.get_instance()
+        is_dark = tm.is_dark
+        is_pink = tm.is_pink
+
         painter.setPen(Qt.NoPen)
         grad = QLinearGradient(0, 0, size, size)
         if is_dark:
@@ -511,6 +529,11 @@ class MainWindow(QMainWindow):
             grad.setColorAt(0.5, QColor("#1C2541"))
             grad.setColorAt(1.0, QColor("#7EB9F5"))
             border_c = QColor(255, 255, 255, 30)
+        elif is_pink:
+            grad.setColorAt(0.0, QColor("#BE123C"))
+            grad.setColorAt(0.5, QColor("#E11D48"))
+            grad.setColorAt(1.0, QColor("#FDA4AF"))
+            border_c = QColor("#FECDD3")
         else:
             grad.setColorAt(0.0, QColor("#0369A1"))
             grad.setColorAt(0.5, QColor("#0284C7"))
@@ -539,7 +562,8 @@ class MainWindow(QMainWindow):
         painter.drawPath(rocket_path)
 
         # 尾翼发光粒子
-        painter.setBrush(QBrush(QColor("#38BDF8") if is_dark else QColor("#BAE6FD")))
+        tail_c = QColor("#38BDF8") if is_dark else (QColor("#FFE4E6") if is_pink else QColor("#BAE6FD"))
+        painter.setBrush(QBrush(tail_c))
         painter.drawEllipse(QRectF(11.0 * scale, 18.5 * scale, 2.0 * scale, 2.0 * scale))
 
         painter.end()
@@ -547,9 +571,10 @@ class MainWindow(QMainWindow):
 
     def refresh_theme_assets(self, theme_name: str):
         """批量刷新侧栏、分组卡片及设置诊断页面的矢量图标"""
-        is_dark = (theme_name == "dark")
-        nav_icon_color = "#CFE5FF" if is_dark else "#0F172A"
-        primary_icon_color = "#7EB9F5" if is_dark else "#0284C7"
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
+        nav_icon_color = palette.get("nav_icon", "#CFE5FF")
+        primary_icon_color = palette.get("primary", "#7EB9F5")
 
         # 刷新侧边栏品牌 Logo 渐变
         self._render_sidebar_logo()
@@ -565,7 +590,8 @@ class MainWindow(QMainWindow):
                 lbl.setPixmap(SvgIconFactory.get_pixmap(icon_name, primary_icon_color, 18))
 
             if getattr(self, "cdn_intro_icon", None):
-                self.cdn_intro_icon.setPixmap(SvgIconFactory.get_pixmap("zap", "#7EB9F5" if is_dark else "#0284C7", 36))
+                self.cdn_intro_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_color, 36))
+
         
     def refresh_inline_styles(self):
         # 让下次 probe 自动使用新颜色
@@ -758,6 +784,8 @@ class MainWindow(QMainWindow):
         # 2. 顶部四合一状态指示卡片
         stat_grid = QGridLayout()
         stat_grid.setSpacing(12)
+        for c_idx in range(4):
+            stat_grid.setColumnStretch(c_idx, 1)
 
         self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存", "server")
         self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库", "lock")
@@ -815,13 +843,15 @@ class MainWindow(QMainWindow):
         search_box.setSpacing(10)
         self.txt_service_search = QLineEdit()
         self.txt_service_search.setProperty("class", "ServiceSearchInput")
-        self.txt_service_search.setPlaceholderText("🔍 快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
+        self.txt_service_search.setPlaceholderText("快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
+        if SvgIconFactory:
+            self.txt_service_search.addAction(SvgIconFactory.get_icon("search", "#75879E" if is_dark else "#94A3B8", 16), QLineEdit.LeadingPosition)
         self.txt_service_search.setClearButtonEnabled(True)
         self.txt_service_search.textChanged.connect(self.on_service_search_changed)
         search_box.addWidget(self.txt_service_search)
         layout.addLayout(search_box)
 
-        # 4. 18 项加速服务 (3 大分类分组卡片)
+        # 4. 18 项加速服务 (3 大分类分组卡片, FlowLayout 流式自适应排布)
         cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
         for grp_id, grp_info in SERVICE_GROUPS.items():
@@ -863,17 +893,19 @@ class MainWindow(QMainWindow):
             grp_header.addWidget(btn_disable_all)
             grp_card_layout.addLayout(grp_header)
 
-            items_grid = QGridLayout()
-            items_grid.setSpacing(10)
+            items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10)
 
             grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
             for idx, srv in enumerate(grp_services):
                 sid = srv["id"]
                 s_item = QFrame()
                 s_item.setProperty("class", "ServiceItem")
+                s_item.setMinimumWidth(280)
+                s_item.setMaximumWidth(460)
+                s_item.setMinimumHeight(56)
                 self.service_cards[sid] = s_item
                 si_layout = QHBoxLayout(s_item)
-                si_layout.setContentsMargins(12, 10, 12, 10)
+                si_layout.setContentsMargins(14, 10, 14, 10)
                 si_layout.setSpacing(10)
 
                 # 服务专属矢量图标
@@ -917,9 +949,9 @@ class MainWindow(QMainWindow):
                 self.service_switches[sid] = sw
                 si_layout.addWidget(sw)
 
-                items_grid.addWidget(s_item, idx // 2, idx % 2)
+                items_flow.addWidget(s_item)
 
-            grp_card_layout.addLayout(items_grid)
+            grp_card_layout.addLayout(items_flow)
             layout.addWidget(grp_card)
 
         layout.addStretch()
@@ -1321,7 +1353,8 @@ class MainWindow(QMainWindow):
             card_top.addWidget(lbl_title)
             card_top.addStretch()
 
-            btn_single = QPushButton("⚡ 独立测速")
+            btn_single = QPushButton("独立测速")
+            btn_single.setIcon(SvgIconFactory.get_icon("zap", primary_c, 12) if SvgIconFactory else QIcon())
             btn_single.setProperty("class", "MDBtnTiny")
             btn_single.setCursor(Qt.PointingHandCursor)
             btn_single.setToolTip(f"仅探测 {name} 的候选 IP 延迟并热重载生效")
@@ -1330,15 +1363,16 @@ class MainWindow(QMainWindow):
             card_top.addWidget(btn_single)
             card_l.addLayout(card_top)
 
-            grid = QGridLayout()
-            grid.setSpacing(8)
+            grid = FlowLayout(margin=0, h_spacing=8, v_spacing=8)
             for idx, item in enumerate(ip_list):
                 ip_item = QFrame()
                 is_best = idx == 0 and item["available"]
                 ip_item.setProperty("class", "CdnIpCardBest" if is_best else "CdnIpCard")
+                ip_item.setMinimumWidth(180)
+                ip_item.setMaximumWidth(260)
 
                 il = QHBoxLayout(ip_item)
-                il.setContentsMargins(8, 6, 8, 6)
+                il.setContentsMargins(10, 6, 10, 6)
                 il.setSpacing(6)
 
                 if is_best:
@@ -1369,7 +1403,7 @@ class MainWindow(QMainWindow):
                 ip_item.style().unpolish(ip_item)
                 ip_item.style().polish(ip_item)
 
-                grid.addWidget(ip_item, idx // 3, idx % 3)
+                grid.addWidget(ip_item)
 
             card_l.addLayout(grid)
             self.cdn_results_layout.addWidget(card)
@@ -1404,7 +1438,7 @@ class MainWindow(QMainWindow):
 
         if sid in self.cdn_single_buttons:
             self.cdn_single_buttons[sid].setEnabled(True)
-            self.cdn_single_buttons[sid].setText("⚡ 独立测速")
+            self.cdn_single_buttons[sid].setText("独立测速")
 
         if not self.cached_cdn_results:
             self.cached_cdn_results = {}
@@ -1625,13 +1659,15 @@ class MainWindow(QMainWindow):
         row_theme.addLayout(r_th_text)
         row_theme.addStretch()
 
-        self.cmb_theme_mode = QComboBox()
-        self.cmb_theme_mode.addItems(["深色模式 (Dark)", "浅色模式 (Light)", "跟随 Windows 系统 (Auto)"])
+        self.cmb_theme_mode = NoWheelComboBox()
+        self.cmb_theme_mode.addItems(["深色模式 (Dark)", "浅色模式 (Light)", "粉色模式 (Pink)", "跟随 Windows 系统 (Auto)"])
         th_mode = cfg.get("theme_mode", "dark")
         if th_mode == "light":
             self.cmb_theme_mode.setCurrentIndex(1)
-        elif th_mode == "system":
+        elif th_mode == "pink":
             self.cmb_theme_mode.setCurrentIndex(2)
+        elif th_mode == "system":
+            self.cmb_theme_mode.setCurrentIndex(3)
         else:
             self.cmb_theme_mode.setCurrentIndex(0)
         self.cmb_theme_mode.currentIndexChanged.connect(self.on_theme_mode_changed)
@@ -1805,7 +1841,7 @@ class MainWindow(QMainWindow):
         row_ip_mode.addLayout(r_im_text)
         row_ip_mode.addStretch()
 
-        self.cmb_ip_mode = QComboBox()
+        self.cmb_ip_mode = NoWheelComboBox()
         self.cmb_ip_mode.addItem("优先 IPv4 节点 (推荐稳定)", "prefer_ipv4")
         self.cmb_ip_mode.addItem("双栈延迟优先 (谁快选谁)", "dual_stack")
         self.cmb_ip_mode.addItem("仅探测 IPv4 (彻底禁用 v6)", "ipv4_only")
@@ -1826,7 +1862,7 @@ class MainWindow(QMainWindow):
 
         lbl_to = QLabel("单节点超时门限:")
         lbl_to.setProperty("class", "ItemTitle")
-        self.cmb_timeout = QComboBox()
+        self.cmb_timeout = NoWheelComboBox()
         self.cmb_timeout.addItem("0.8 秒 (极速探测)", 0.8)
         self.cmb_timeout.addItem("1.5 秒 (推荐标准)", 1.5)
         self.cmb_timeout.addItem("2.5 秒 (弱网宽容)", 2.5)
@@ -1840,7 +1876,7 @@ class MainWindow(QMainWindow):
 
         lbl_wk = QLabel("最大并发线程:")
         lbl_wk.setProperty("class", "ItemTitle")
-        self.cmb_workers = QComboBox()
+        self.cmb_workers = NoWheelComboBox()
         self.cmb_workers.addItem("8 线程 (低占用)", 8)
         self.cmb_workers.addItem("16 线程 (推荐标准)", 16)
         self.cmb_workers.addItem("24 线程", 24)
@@ -1902,7 +1938,7 @@ class MainWindow(QMainWindow):
 
         lbl_db = QLabel("启动测速防抖间隔:")
         lbl_db.setProperty("class", "ItemTitle")
-        self.cmb_debounce = QComboBox()
+        self.cmb_debounce = NoWheelComboBox()
         self.cmb_debounce.addItem("15 分钟", 15)
         self.cmb_debounce.addItem("30 分钟 (推荐)", 30)
         self.cmb_debounce.addItem("60 分钟 (1小时)", 60)
@@ -1916,7 +1952,7 @@ class MainWindow(QMainWindow):
 
         lbl_hl = QLabel("健康巡检周期:")
         lbl_hl.setProperty("class", "ItemTitle")
-        self.cmb_health_freq = QComboBox()
+        self.cmb_health_freq = NoWheelComboBox()
         self.cmb_health_freq.addItem("15 秒 (高灵敏)", 15)
         self.cmb_health_freq.addItem("30 秒 (推荐)", 30)
         self.cmb_health_freq.addItem("60 秒 (1分钟)", 60)
@@ -2289,7 +2325,7 @@ class MainWindow(QMainWindow):
 
     # ==================== 设置页事件响应方法 ====================
     def on_theme_mode_changed(self, index: int):
-        modes = ["dark", "light", "system"]
+        modes = ["dark", "light", "pink", "system"]
         mode = modes[index] if 0 <= index < len(modes) else "dark"
         update_config_key("theme_mode", mode)
         target_theme = mode
@@ -2633,7 +2669,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'title_bar') and self.title_bar:
             self.title_bar.update_status(is_acc)
 
-        is_dark = ThemeManager.get_instance().is_dark
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
+        is_dark = tm.is_dark
+
+        success_val_c = palette.get("success", "#34D399")
+        warning_val_c = palette.get("warning", "#FBBF24")
+        error_val_c = palette.get("error", "#F87171")
+        muted_val_c = palette.get("text_muted", "#75879E")
+        primary_val_c = palette.get("primary", "#7EB9F5")
 
         if self._last_acc_state != is_acc:
             self._last_acc_state = is_acc
@@ -2641,10 +2685,7 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip(f"GameArt Toolkit - 加速服务{'运行中' if is_acc else '已停止'}")
 
             if is_acc:
-                if is_dark:
-                    self.lbl_main_status.setStyleSheet("font-size: 17px; font-weight: bold; color: #34D399;")
-                else:
-                    self.lbl_main_status.setStyleSheet("font-size: 17px; font-weight: bold; color: #059669;")
+                self.lbl_main_status.setStyleSheet(f"font-size: 17px; font-weight: bold; color: {success_val_c};")
                 self.lbl_main_status.setText("加速服务运行中")
                 self.btn_toggle_acc.setText("停止加速服务")
                 self.btn_toggle_acc.setProperty("class", "MDBtnStop")
@@ -2664,24 +2705,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'btn_sidebar_admin'):
             if has_admin:
                 self.btn_sidebar_admin.setText("管理员已授权")
-                self.btn_sidebar_admin.setIcon(SvgIconFactory.get_icon("shield_check", "#34D399" if is_dark else "#059669", 14))
+                self.btn_sidebar_admin.setIcon(SvgIconFactory.get_icon("shield_check", success_val_c, 14))
                 self.btn_sidebar_admin.setEnabled(False)
                 if is_dark:
-                    self.btn_sidebar_admin.setStyleSheet("color: #34D399; font-size: 11px; padding: 6px 10px; background: rgba(52, 211, 153, 0.12); border: none; border-radius: 8px;")
+                    self.btn_sidebar_admin.setStyleSheet(f"color: {success_val_c}; font-size: 11px; padding: 6px 10px; background: rgba(52, 211, 153, 0.12); border: none; border-radius: 8px;")
                 else:
-                    self.btn_sidebar_admin.setStyleSheet("color: #059669; font-size: 11px; padding: 6px 10px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px;")
+                    self.btn_sidebar_admin.setStyleSheet(f"color: {success_val_c}; font-size: 11px; padding: 6px 10px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px;")
             else:
                 self.btn_sidebar_admin.setText("标准用户 [点击提权]")
-                self.btn_sidebar_admin.setIcon(SvgIconFactory.get_icon("shield", "#FBBF24" if is_dark else "#D97706", 14))
+                self.btn_sidebar_admin.setIcon(SvgIconFactory.get_icon("shield", warning_val_c, 14))
                 self.btn_sidebar_admin.setEnabled(True)
-                self.btn_sidebar_admin.setStyleSheet("color: #FBBF24; font-size: 11px; padding: 6px 10px; background: rgba(245, 158, 11, 0.15); border: 1px solid #D97706; border-radius: 8px;" if is_dark else "color: #D97706; font-size: 11px; padding: 6px 10px; background: rgba(245, 158, 11, 0.10); border: 1px solid #F59E0B; border-radius: 8px;")
+                self.btn_sidebar_admin.setStyleSheet(f"color: {warning_val_c}; font-size: 11px; padding: 6px 10px; background: rgba(245, 158, 11, 0.12); border: 1px solid {warning_val_c}; border-radius: 8px;")
 
-        success_val_c = "#34D399" if is_dark else "#059669"
-        warning_val_c = "#FBBF24" if is_dark else "#D97706"
-        muted_val_c = "#75879E" if is_dark else "#64748B"
-        primary_val_c = "#7EB9F5" if is_dark else "#0284C7"
-
-        # 主控卡片大图标联动变色 (运行中翠绿 / 停止待命蓝)
+        # 主控卡片大图标联动变色 (运行中翠绿 / 停止待命主色)
         if getattr(self, 'lbl_main_icon', None) and SvgIconFactory:
             self.lbl_main_icon.setPixmap(SvgIconFactory.get_pixmap("rocket", success_val_c if is_acc else primary_val_c, 36))
 
@@ -2711,7 +2747,7 @@ class MainWindow(QMainWindow):
             self.lbl_steam_banner_path.setText(f"安装路径: {steam_path}")
             if status.get('is_steam_running', False):
                 self.lbl_steam_banner_status.setText(f"Steam 运行中 (当前用户: {curr_steam_user})")
-                self.lbl_steam_banner_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #34D399;")
+                self.lbl_steam_banner_status.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {success_val_c};")
             else:
                 self.lbl_steam_banner_status.setText("Steam 客户端已就绪 (未运行)")
                 self.lbl_steam_banner_status.setProperty("class", "ItemTitle")
@@ -2723,10 +2759,10 @@ class MainWindow(QMainWindow):
         p443_busy = status.get('p443_busy', False)
         if p443_busy and not is_nginx:
             self.lbl_port_detail.setText("警告: 443 端口被其他程序占用！")
-            self.lbl_port_detail.setStyleSheet("font-size: 12px; color: #F87171; font-weight: bold;")
+            self.lbl_port_detail.setStyleSheet(f"font-size: 12px; color: {error_val_c}; font-weight: bold;")
         else:
             self.lbl_port_detail.setText("端口状态: 80 (HTTP) 与 443 (HTTPS) 正常就绪")
-            self.lbl_port_detail.setStyleSheet("font-size: 12px; color: #34D399;")
+            self.lbl_port_detail.setStyleSheet(f"font-size: 12px; color: {success_val_c};")
 
     def watchdog_auto_heal(self):
         cfg = load_config()
@@ -2795,6 +2831,12 @@ class MainWindow(QMainWindow):
         relay_ok, relay_msg = self._start_relay()
         health_monitor.start(services)
 
+        # 为 Git / 开发生态注入作用域证书
+        try:
+            cert_mgr.inject_dev_environments()
+        except Exception:
+            pass
+
         if show_toast_on_fail:
             extra = f" | {relay_msg}" if relay_ok else f" | ⚠ {relay_msg}"
             show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}", toast_type="success", duration=2500)
@@ -2829,6 +2871,10 @@ class MainWindow(QMainWindow):
         relay_server.stop()
         relay_server.clear_proxy_routes()
         hosts_mgr.remove_rules()
+        try:
+            cert_mgr.restore_dev_environments()
+        except Exception:
+            pass
         nginx_mgr.stop()
         show_toast(self, "加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
         self._start_status_probe()
@@ -2928,8 +2974,18 @@ def main():
     app.setWindowIcon(get_app_icon())
 
     cfg = load_config()
-    theme = cfg.get("theme", "dark")
-    qss = MATERIAL_DARK_QSS if theme == "dark" else MATERIAL_LIGHT_QSS
+    theme_mode = cfg.get("theme_mode", "dark")
+    if theme_mode == "system":
+        theme = "dark" if is_windows_dark_mode() else "light"
+    else:
+        theme = cfg.get("theme", "dark")
+
+    if theme == "dark":
+        qss = MATERIAL_DARK_QSS
+    elif theme == "pink":
+        qss = MATERIAL_PINK_QSS
+    else:
+        qss = MATERIAL_LIGHT_QSS
     app.setStyleSheet(qss)
     app.setApplicationName("GameArtToolkit")
     app.setApplicationDisplayName("GameArt Toolkit")

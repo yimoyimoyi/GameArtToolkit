@@ -257,6 +257,11 @@ class HostsManager:
             if not domain_ip_map:
                 self._safe_write_hosts(base_content)
                 self.flush_dns()
+                try:
+                    from win_utils import ProxyBypassManager
+                    ProxyBypassManager.restore_bypass()
+                except Exception:
+                    pass
                 return True, "已清空所有加速 Hosts 规则"
 
             # 构造全新的注入规则块 (按域名排序输出)
@@ -269,6 +274,13 @@ class HostsManager:
 
             new_hosts_content = base_content.rstrip() + "\r\n\r\n" + rule_block
             self._safe_write_hosts(new_hosts_content)
+
+            # 联动注入 WinINet ProxyOverride 代理例外列表
+            try:
+                from win_utils import ProxyBypassManager
+                ProxyBypassManager.apply_bypass(list(domain_ip_map.keys()))
+            except Exception:
+                pass
 
             self.flush_dns()
             return True, f"已成功注入 {len(domain_ip_map)} 条加速域名规则！"
@@ -283,6 +295,12 @@ class HostsManager:
 
     def remove_rules(self) -> Tuple[bool, str]:
         """安全移除 GameArt Toolkit 注入的全部规则"""
+        try:
+            from win_utils import ProxyBypassManager
+            ProxyBypassManager.restore_bypass()
+        except Exception:
+            pass
+
         if not self.hosts_file.exists():
             return True, "Hosts 文件不存在"
 
@@ -309,6 +327,12 @@ class HostsManager:
 
     def fast_remove_rules(self) -> bool:
         """为 Windows 关机与退出设计的无阻塞 Hosts 清理 (不启动子进程、不重试)"""
+        try:
+            from win_utils import ProxyBypassManager
+            ProxyBypassManager.restore_bypass()
+        except Exception:
+            pass
+
         if not self.hosts_file.exists():
             return True
         try:
@@ -343,6 +367,13 @@ class HostsManager:
         """检查 Hosts 状态（属性、编码、不对称标签、历史残留）并自动修复"""
         issues = []
         fixes = []
+
+        if auto_fix:
+            try:
+                from win_utils import ProxyBypassManager
+                ProxyBypassManager.restore_bypass()
+            except Exception:
+                pass
 
         # 1. 检查文件是否存在
         if not self.hosts_file.exists():

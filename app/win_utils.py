@@ -6,7 +6,7 @@ GameArt Toolkit - Windows 原生 API 工具集 (进程与端口探测)
 import socket
 import ctypes
 from ctypes import wintypes
-from typing import List
+from typing import List, Optional, Tuple
 
 TH32CS_SNAPPROCESS = 0x00000002
 
@@ -285,4 +285,167 @@ def check_proxy_alive(host: str = "127.0.0.1", port: int = 7897, timeout: float 
             return " 200 " in line
     except Exception:
         return False
+
+
+# ==================== WinINet 系统代理例外列表 (ProxyOverride) 管理 ====================
+INTERNET_OPTION_SETTINGS_CHANGED = 39
+INTERNET_OPTION_REFRESH = 37
+REG_PROXY_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+class ProxyBypassManager:
+    """WinINet 系统代理例外列表 (ProxyOverride) 动态接管与还原管理器
+    
+    让浏览器在 Clash 等开启系统代理时，针对指定加速域名自动绕过代理，
+    直连 127.0.0.1 享受本地 Nginx 0ms 磁盘缓存与协议加速。
+    """
+    TAG_START = "<-GameArtStart->"
+    TAG_END = "<-GameArtEnd->"
+    LEGACY_TAG_START = "<-PixivToolkitStart->"
+    LEGACY_TAG_END = "<-PixivToolkitEnd->"
+
+    @classmethod
+    def apply_bypass(cls, domains: List[str]) -> bool:
+        """将加速域名追加至 ProxyOverride 例外列表并通知 WinINet 立即生效"""
+        if not domains:
+            return False
+        import winreg
+        import re
+        try:
+            current_override = ""
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PROXY_SETTINGS, 0, winreg.KEY_READ) as key:
+                    current_override, _ = winreg.QueryValueEx(key, "ProxyOverride")
+            except FileNotFoundError:
+                current_override = "<local>"
+
+            clean_override = cls._strip_tags(current_override)
+            
+            # 为每个域名生成通配符规则 (*.domain 与 domain)
+            rules = []
+            for d in domains:
+                d_clean = d.strip()
+                if not d_clean:
+                    continue
+                if d_clean.startswith("*."):
+                    rules.append(d_clean)
+                else:
+                    rules.append(f"*.{d_clean}")
+                    rules.append(d_clean)
+            
+            rules_str = ";".join(dict.fromkeys(rules))
+            tagged_block = f"{cls.TAG_START}{rules_str}{cls.TAG_END}"
+            
+            # 合并并确保 <local> 存在
+            parts = [p for p in clean_override.split(";") if p and p != "<local>"]
+            parts.append(tagged_block)
+            parts.append("<local>")
+            new_override = ";".join(parts)
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PROXY_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, new_override)
+
+            cls._notify_wininet()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def restore_bypass(cls) -> bool:
+        """从 ProxyOverride 中安全剥离本项目的标签块并通知 WinINet 立即还原"""
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PROXY_SETTINGS, 0, winreg.KEY_READ) as key:
+                current_override, _ = winreg.QueryValueEx(key, "ProxyOverride")
+        except Exception:
+            return False
+
+        clean_override = cls._strip_tags(current_override)
+        if clean_override == current_override:
+            return True  # 无需更改
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PROXY_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, clean_override)
+            cls._notify_wininet()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _strip_tags(cls, text: str) -> str:
+        """剥离当前版本与历史版本的标签块"""
+        import re
+        if not text:
+            return "<local>"
+        pattern = re.compile(rf"{re.escape(cls.TAG_START)}.*?{re.escape(cls.TAG_END)};?", re.DOTALL)
+        text = pattern.sub("", text)
+        legacy_pattern = re.compile(rf"{re.escape(cls.LEGACY_TAG_START)}.*?{re.escape(cls.LEGACY_TAG_END)};?", re.DOTALL)
+        text = legacy_pattern.sub("", text)
+        # 清理多余的分号
+        clean_parts = [p.strip() for p in text.split(";") if p.strip()]
+        return ";".join(clean_parts) if clean_parts else "<local>"
+
+    @classmethod
+    def _notify_wininet(cls):
+        """通知 Windows WinINet 系统代理配置已更新 (即时生效)"""
+        try:
+            ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+            ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
+        except Exception:
+            pass
+
+
+# ==================== 物理网卡与本地代理自适应探测 ====================
+
+COMMON_PROXY_PORTS = [
+    ("127.0.0.1", 7897),   # Clash Verge / Mihomo Mixed Port
+    ("127.0.0.1", 7890),   # Clash for Windows / Classical Clash
+    ("127.0.0.1", 10809),  # v2rayN / Xray HTTP
+    ("127.0.0.1", 2080),   # Sing-box HTTP / Mixed
+    ("127.0.0.1", 10808),  # SOCKS5 fallback
+]
+
+
+def get_physical_adapter_ip() -> Optional[str]:
+    """获取本机默认物理网卡 (Ethernet/Wi-Fi) 的局域网 IPv4 地址，避开 TUN 虚拟网卡 (如 198.18.x.x)"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("223.5.5.5", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        # 排除 TUN 虚拟网卡常见的 198.18.x.x, 198.19.x.x, 127.x.x.x
+        if not local_ip.startswith(("198.18.", "198.19.", "127.")):
+            return local_ip
+    except Exception:
+        pass
+    return None
+
+
+def auto_detect_active_proxy(timeout: float = 0.2) -> Optional[Tuple[str, int]]:
+    """后台自适应嗅探当前活跃的本地代理端口 (优先读取注册表 ProxyServer，次选常见客户端端口)"""
+    # 1. 优先读取系统注册表中的 ProxyServer 配置
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PROXY_SETTINGS, 0, winreg.KEY_READ) as key:
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            if server:
+                # 兼容 "127.0.0.1:7890" 或 "http=127.0.0.1:7890;https=..."
+                for part in server.split(";"):
+                    hp = part.split("=")[-1].strip()
+                    if ":" in hp:
+                        host, port_str = hp.split(":", 1)
+                        if port_str.isdigit():
+                            port = int(port_str)
+                            if is_port_in_use(port, host):
+                                return (host, port)
+    except Exception:
+        pass
+
+    # 2. 依次探测常用客户端端口
+    for host, port in COMMON_PROXY_PORTS:
+        if is_port_in_use(port, host):
+            return (host, port)
+    return None
+
 

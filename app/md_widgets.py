@@ -25,7 +25,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QLayout, QStackedWidget, QLayoutItem,
     QWidget, QAbstractButton, QHBoxLayout, QVBoxLayout, QLabel, QFrame,
-    QPushButton, QLineEdit, QGraphicsOpacityEffect, QSizePolicy
+    QPushButton, QLineEdit, QComboBox, QGraphicsOpacityEffect, QSizePolicy
 )
 
 try:
@@ -215,21 +215,20 @@ class TitleBar(QFrame):
         self.title_label.setObjectName("TitleBrand")
         layout.addWidget(self.title_label)
 
-        # 运行状态胶囊指示器
+        # 隐藏的状态占位对象 (保持向后兼容, UI 上不添加到布局以保证界面清爽)
         self.status_pill = QLabel("● 加速待命")
-        self.status_pill.setObjectName("TitleStatusPill")
-        layout.addWidget(self.status_pill)
+        self.status_pill.setVisible(False)
 
         # 中间可拖拽空白扩展区
         layout.addStretch()
 
-        # 窗口操作按钮组 (主题切换胶囊 + 最小化、最大化、关闭三联)
+        # 窗口操作按钮组 (黑白主题切换按钮 + 最小化、最大化、关闭三联)
         self.btn_theme = QPushButton()
         self.btn_theme.setObjectName("BtnTitleTheme")
         self.btn_theme.setProperty("class", "ThemeToggleBtn")
         self.btn_theme.setFixedSize(36, 32)
         self.btn_theme.setCursor(Qt.PointingHandCursor)
-        self.btn_theme.setToolTip("切换明暗主题 (Alt+T)")
+        self.btn_theme.setToolTip("切换黑白主题 (Alt+T)")
         self.btn_theme.clicked.connect(self._on_theme_toggle)
         
         ThemeManager.get_instance().theme_changed.connect(self._on_theme_changed)
@@ -264,7 +263,7 @@ class TitleBar(QFrame):
         layout.addWidget(self.btn_close)
 
     def _render_brand_icon(self):
-        """自绘 20x20 GameArt Toolkit 极光渐变品牌矢量微徽标"""
+        """自绘 20x20 GameArt Toolkit 极光/樱粉渐变品牌矢量微徽标"""
         from PySide6.QtGui import QPixmap
         pixmap = QPixmap(20, 20)
         pixmap.fill(Qt.transparent)
@@ -272,8 +271,10 @@ class TitleBar(QFrame):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        is_dark = ThemeManager.get_instance().is_dark
-        # 圆角背景 (极光深蓝紫到天蓝渐变)
+        tm = ThemeManager.get_instance()
+        is_dark = tm.is_dark
+        is_pink = tm.is_pink
+
         painter.setPen(Qt.NoPen)
         grad = QLinearGradient(0, 0, 20, 20)
         if is_dark:
@@ -281,6 +282,11 @@ class TitleBar(QFrame):
             grad.setColorAt(0.5, QColor("#1C2541"))
             grad.setColorAt(1.0, QColor("#7EB9F5"))
             border_c = QColor(255, 255, 255, 30)
+        elif is_pink:
+            grad.setColorAt(0.0, QColor("#BE123C"))
+            grad.setColorAt(0.5, QColor("#E11D48"))
+            grad.setColorAt(1.0, QColor("#FDA4AF"))
+            border_c = QColor("#FECDD3")
         else:
             grad.setColorAt(0.0, QColor("#0369A1"))
             grad.setColorAt(0.5, QColor("#0284C7"))
@@ -309,68 +315,42 @@ class TitleBar(QFrame):
         painter.drawPath(rocket_path)
 
         # 尾翼发光粒子
-        painter.setBrush(QBrush(QColor("#38BDF8") if is_dark else QColor("#BAE6FD")))
+        tail_c = QColor("#38BDF8") if is_dark else (QColor("#FFE4E6") if is_pink else QColor("#BAE6FD"))
+        painter.setBrush(QBrush(tail_c))
         painter.drawEllipse(QRectF(11.0 * scale, 18.5 * scale, 2.0 * scale, 2.0 * scale))
 
         painter.end()
         self.icon_label.setPixmap(pixmap)
 
-    def update_status(self, is_running: bool, text: str = None):
-        """更新标题栏状态胶囊"""
-        is_dark = ThemeManager.get_instance().is_dark
-        if is_running:
-            msg = text if text else "● 加速运行中"
+    def update_status(self, is_running: bool, text: str = ""):
+        """更新标题栏状态指示 (兼容桩函数)"""
+        msg = text if text else ("● 加速运行中" if is_running else "● 加速待命")
+        if hasattr(self, 'status_pill') and self.status_pill:
             self.status_pill.setText(msg)
-            if is_dark:
-                self.status_pill.setStyleSheet("""
-                    background-color: rgba(52, 211, 153, 0.12);
-                    color: #34D399;
-                    border: none;
-                    border-radius: 11px;
-                    padding: 2px 10px;
-                """)
-            else:
-                self.status_pill.setStyleSheet("""
-                    background-color: rgba(16, 185, 129, 0.12);
-                    color: #059669;
-                    border: 1px solid rgba(16, 185, 129, 0.3);
-                    border-radius: 11px;
-                    padding: 2px 10px;
-                """)
-        else:
-            msg = text if text else "● 加速待命"
-            self.status_pill.setText(msg)
-            if is_dark:
-                self.status_pill.setStyleSheet("""
-                    background-color: rgba(117, 135, 158, 0.12);
-                    color: #75879E;
-                    border: none;
-                    border-radius: 11px;
-                    padding: 2px 10px;
-                """)
-            else:
-                self.status_pill.setStyleSheet("""
-                    background-color: rgba(100, 116, 139, 0.10);
-                    color: #64748B;
-                    border: 1px solid rgba(100, 116, 139, 0.2);
-                    border-radius: 11px;
-                    padding: 2px 10px;
-                """)
 
     def _refresh_window_control_icons(self):
-        """批量渲染并设置标题栏控制按钮的 Fluent 矢量图标"""
-        is_dark = ThemeManager.get_instance().is_dark
-        ctrl_icon_color = "#CBD5E1" if is_dark else "#475569"
+        """批量渲染并设置标题栏控制按钮的 Fluent 矢量图标 (无 emoji)"""
+        tm = ThemeManager.get_instance()
+        curr = tm.get_current_theme()
+        ctrl_icon_color = "#CBD5E1" if tm.is_dark else ("#475569" if tm.is_light else "#881337")
         
-        # 1. 主题切换按钮
-        theme_icon_name = "sun" if is_dark else "moon"
-        theme_icon_color = "#CFE5FF" if is_dark else "#0284C7"
+        # 1. 主题快速切换按钮 (仅支持黑白二元切换，粉色保留在设置页)
+        if curr == "dark":
+            theme_icon_name = "moon"
+            theme_icon_color = "#CFE5FF"
+            tip = "当前: 黑色主题 (点击切换白色)"
+        else:
+            theme_icon_name = "sun"
+            theme_icon_color = "#0284C7"
+            tip = "当前: 白色主题 (点击切换黑色)"
+
         if SvgIconFactory:
             self.btn_theme.setIcon(SvgIconFactory.get_icon(theme_icon_name, theme_icon_color, 16))
             self.btn_theme.setIconSize(QSize(16, 16))
             self.btn_theme.setText("")
         else:
-            self.btn_theme.setText("☀️" if is_dark else "🌙")
+            self.btn_theme.setText("")
+        self.btn_theme.setToolTip(tip)
 
         # 2. 最小化按钮
         if SvgIconFactory:
@@ -390,8 +370,8 @@ class TitleBar(QFrame):
 
     def update_max_icon(self, is_maximized: bool):
         """根据最大化状态切换 Fluent SVG 矢量图标"""
-        is_dark = ThemeManager.get_instance().is_dark
-        ctrl_icon_color = "#CBD5E1" if is_dark else "#475569"
+        tm = ThemeManager.get_instance()
+        ctrl_icon_color = "#CBD5E1" if tm.is_dark else ("#475569" if tm.is_light else "#881337")
         icon_name = "window_restore" if is_maximized else "window_max"
         
         if SvgIconFactory:
@@ -399,7 +379,7 @@ class TitleBar(QFrame):
             self.btn_max.setIconSize(QSize(12, 12))
             self.btn_max.setText("")
         else:
-            self.btn_max.setText("❐" if is_maximized else "▢")
+            self.btn_max.setText("")
         self.btn_max.setToolTip("还原" if is_maximized else "最大化")
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -410,16 +390,19 @@ class TitleBar(QFrame):
             super().mouseDoubleClickEvent(event)
 
     def _on_theme_toggle(self):
+        """标题栏按钮快速在黑色与白色主题之间二元切换"""
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
-        new_theme = ThemeManager.get_instance().toggle_theme(app)
+        curr = ThemeManager.get_instance().get_current_theme()
+        new_theme = "light" if curr == "dark" else "dark"
+        ThemeManager.get_instance().set_theme(new_theme, app)
         if self.window and hasattr(self.window, "frameless_helper") and self.window.frameless_helper:
             self.window.frameless_helper.set_immersive_dark_mode(new_theme == "dark")
 
     def _on_theme_changed(self, theme_name: str = ""):
         self._refresh_window_control_icons()
         self._render_brand_icon()
-        self.update_status(self.status_pill.text().startswith("●"), self.status_pill.text())
+
 
     def _on_minimize(self):
         if self.window:
@@ -494,7 +477,7 @@ class ToastNotification(QFrame):
             layout.addWidget(self.action_btn)
 
         # 关闭按钮
-        self.close_btn = QPushButton("✕")
+        self.close_btn = QPushButton("x")
         self.close_btn.setProperty("class", "ToastCloseBtn")
         self.close_btn.setCursor(Qt.PointingHandCursor)
         self.close_btn.clicked.connect(self.dismiss)
@@ -614,7 +597,7 @@ class ToastManager(QObject):
         :param message: 通知文本内容
         :param toast_type: 'success' | 'info' | 'warning' | 'error'
         :param duration: 自动消失毫秒数 (默认 3000ms)
-        :param action_text: 内联动作按钮文字 (如 '[🛡️ 提权]')
+        :param action_text: 内联动作按钮文字 (如 '[提权]')
         :param on_action: 动作回调函数
         """
         if not parent:
@@ -686,7 +669,7 @@ def show_toast(parent: QWidget, message: str, toast_type: str = "info",
 class InlineEditableLabel(QWidget):
     """
     原位内联编辑组件
-    常规态：显示当前别名徽章或 '+ 备注' (带微铅笔 ✏️)
+    常规态：显示当前别名徽章或 '+ 备注'
     激活态：单击/双击原地切换为 QLineEdit，回车保存，Esc取消，失去焦点自动保存
     """
     text_changed = Signal(str)
@@ -732,14 +715,25 @@ class InlineEditableLabel(QWidget):
         try:
             if not hasattr(self, 'badge_label') or not self.badge_label:
                 return
-            is_dark = ThemeManager.get_instance().is_dark
+            tm = ThemeManager.get_instance()
+            curr = tm.get_current_theme()
             if self.current_text:
                 self.badge_label.setText(f"备注: {self.current_text}")
-                if is_dark:
+                if curr == "dark":
                     self.badge_label.setStyleSheet("""
                         background-color: #182032;
                         color: #7EB9F5;
                         border: 1px solid #273752;
+                        border-radius: 6px;
+                        padding: 2px 8px;
+                        font-size: 11px;
+                        font-weight: bold;
+                    """)
+                elif curr == "pink":
+                    self.badge_label.setStyleSheet("""
+                        background-color: #FFE4E6;
+                        color: #E11D48;
+                        border: 1px solid #FECDD3;
                         border-radius: 6px;
                         padding: 2px 8px;
                         font-size: 11px;
@@ -757,11 +751,20 @@ class InlineEditableLabel(QWidget):
                     """)
             else:
                 self.badge_label.setText(f"{self.placeholder}")
-                if is_dark:
+                if curr == "dark":
                     self.badge_label.setStyleSheet("""
                         background-color: transparent;
                         color: #75879E;
                         border: 1px dashed #273752;
+                        border-radius: 6px;
+                        padding: 2px 8px;
+                        font-size: 11px;
+                    """)
+                elif curr == "pink":
+                    self.badge_label.setStyleSheet("""
+                        background-color: transparent;
+                        color: #94A3B8;
+                        border: 1px dashed #FECDD3;
                         border-radius: 6px;
                         padding: 2px 8px;
                         font-size: 11px;
@@ -923,18 +926,20 @@ class MDSwitch(QAbstractButton):
         radius = h / 2.0
         pos = self._thumb_position
 
-        # 1. 轨道色彩插值
+        palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
-        track_off = QColor("#1E283E") if is_dark else QColor("#E2E8F0")
-        track_on = QColor("#7EB9F5") if is_dark else QColor("#0284C7")
+
+        # 1. 轨道色彩插值
+        track_off = QColor(palette.get("container_high", "#1E283E"))
+        track_on = QColor(palette.get("primary", "#7EB9F5"))
         track_color = QColor(
             int(track_off.red() + (track_on.red() - track_off.red()) * pos),
             int(track_off.green() + (track_on.green() - track_off.green()) * pos),
             int(track_off.blue() + (track_on.blue() - track_off.blue()) * pos)
         )
 
-        border_off = QColor("#273752") if is_dark else QColor("#CBD5E1")
-        border_on = QColor("#A6D1FF") if is_dark else QColor("#0369A1")
+        border_off = QColor(palette.get("outline", "#273752"))
+        border_on = QColor(palette.get("primary", "#A6D1FF"))
         border_color = QColor(
             int(border_off.red() + (border_on.red() - border_off.red()) * pos),
             int(border_off.green() + (border_on.green() - border_off.green()) * pos),
@@ -948,7 +953,6 @@ class MDSwitch(QAbstractButton):
         painter.drawRoundedRect(track_rect, radius, radius)
 
         # 2. 滑块尺寸与位置计算
-        # 未开启 14px，开启 20px，按下额外扩充 2px
         base_diameter = 14.0 + 6.0 * pos
         extra = 2.0 if self._press_scale > 0 else 0.0
         thumb_diameter = base_diameter + extra
@@ -961,14 +965,14 @@ class MDSwitch(QAbstractButton):
 
         # 3. 悬浮光晕绘制
         if self._hover_glow > 0:
-            glow_color = QColor("rgba(126, 185, 245, 0.20)") if is_dark else QColor("rgba(2, 132, 199, 0.15)")
+            glow_color = QColor(track_on.red(), track_on.green(), track_on.blue(), 45)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(glow_color))
             painter.drawEllipse(QRectF(thumb_x - 4, thumb_y - 4, thumb_diameter + 8, thumb_diameter + 8))
 
         # 4. 绘制滑块
-        thumb_off = QColor("#94A3B8") if is_dark else QColor("#64748B")
-        thumb_on = QColor("#FFFFFF") if is_dark else QColor("#FFFFFF")
+        thumb_off = QColor(palette.get("text_muted", "#94A3B8"))
+        thumb_on = QColor("#FFFFFF")
         thumb_color = QColor(
             int(thumb_off.red() + (thumb_on.red() - thumb_off.red()) * pos),
             int(thumb_off.green() + (thumb_on.green() - thumb_off.green()) * pos),
@@ -981,7 +985,7 @@ class MDSwitch(QAbstractButton):
 
         # 5. 开启时在滑块中心绘制精致钩标志
         if pos > 0.55:
-            check_color = QColor("#002E5C") if is_dark else QColor("#0284C7")
+            check_color = QColor(palette.get("on_primary", "#002E5C") if is_dark else palette.get("primary", "#0284C7"))
             painter.setPen(QPen(check_color, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             opacity = min(1.0, (pos - 0.55) / 0.45)
             painter.setOpacity(opacity)
@@ -1042,7 +1046,6 @@ class TrafficMonitorChart(QWidget):
         for i in range(n - 1):
             p0 = points[i]
             p1 = points[i + 1]
-            # 计算平滑切线控制点
             p_prev = points[i - 1] if i > 0 else p0
             p_next = points[i + 2] if i < n - 2 else p1
 
@@ -1064,18 +1067,15 @@ class TrafficMonitorChart(QWidget):
         w = float(self.width())
         h = float(self.height())
 
-        # 1. 容器底色与圆角边框 (通透 Material 3 调色板，告别死黑)
+        palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
+
+        # 1. 容器底色与圆角边框
         bg_rect = QRectF(0, 0, w, h)
         bg_grad = QLinearGradient(0, 0, 0, h)
-        if is_dark:
-            bg_grad.setColorAt(0.0, QColor("#182234"))
-            bg_grad.setColorAt(1.0, QColor("#121927"))
-            painter.setPen(QPen(QColor("#223147"), 1.2))
-        else:
-            bg_grad.setColorAt(0.0, QColor("#FFFFFF"))
-            bg_grad.setColorAt(1.0, QColor("#F8FAFC"))
-            painter.setPen(QPen(QColor("#E2E8F0"), 1.2))
+        bg_grad.setColorAt(0.0, QColor(palette.get("chart_bg_start", "#182234")))
+        bg_grad.setColorAt(1.0, QColor(palette.get("chart_bg_end", "#121927")))
+        painter.setPen(QPen(QColor(palette.get("outline", "#223147")), 1.2))
         painter.setBrush(QBrush(bg_grad))
         painter.drawRoundedRect(bg_rect, 14, 14)
 
@@ -1094,14 +1094,14 @@ class TrafficMonitorChart(QWidget):
 
         # 2. 动态 Y 轴缩放
         raw_max = max(max(self.down_speeds), max(self.up_speeds), 100.0)
-        alpha = 0.15  # EMA平滑系数，越小越平滑
+        alpha = 0.15
         if raw_max > self._ema_max:
-            self._ema_max = raw_max  # 上升时立即跟随
+            self._ema_max = raw_max
         else:
-            self._ema_max = self._ema_max * (1.0 - alpha) + raw_max * alpha  # 下降时平滑衰减
+            self._ema_max = self._ema_max * (1.0 - alpha) + raw_max * alpha
         max_val = self._ema_max
 
-        # 3. 构造点序列与局部极值计算
+        # 3. 构造点序列
         n = len(self.down_speeds)
         dx = chart_w / float(n - 1) if n > 1 else chart_w
 
@@ -1123,7 +1123,8 @@ class TrafficMonitorChart(QWidget):
             min_y_down = min(min_y_down, y)
             points_down.append(QPointF(x, y))
 
-        # 4. 绘制上传曲线与渐变填充 (Pixiv 蓝)
+        # 4. 绘制上传曲线与渐变填充
+        up_color = QColor(palette.get("chart_up", "#7EB9F5"))
         if len(points_up) >= 2:
             path_up = self._build_smooth_path(points_up)
             fill_up = QPainterPath(path_up)
@@ -1132,23 +1133,19 @@ class TrafficMonitorChart(QWidget):
             fill_up.closeSubpath()
 
             grad_up = QLinearGradient(0, min_y_up - 2, 0, chart_bottom)
-            if is_dark:
-                grad_up.setColorAt(0.0, QColor(126, 185, 245, 75))
-                grad_up.setColorAt(0.4, QColor(126, 185, 245, 35))
-                grad_up.setColorAt(1.0, QColor(126, 185, 245, 8))
-            else:
-                grad_up.setColorAt(0.0, QColor(2, 132, 199, 65))
-                grad_up.setColorAt(0.4, QColor(2, 132, 199, 25))
-                grad_up.setColorAt(1.0, QColor(2, 132, 199, 5))
+            grad_up.setColorAt(0.0, QColor(up_color.red(), up_color.green(), up_color.blue(), 75 if is_dark else 65))
+            grad_up.setColorAt(0.4, QColor(up_color.red(), up_color.green(), up_color.blue(), 35 if is_dark else 25))
+            grad_up.setColorAt(1.0, QColor(up_color.red(), up_color.green(), up_color.blue(), 8 if is_dark else 5))
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(grad_up))
             painter.drawPath(fill_up)
 
-            painter.setPen(QPen(QColor("#7EB9F5") if is_dark else QColor("#0284C7"), 1.8, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setPen(QPen(up_color, 1.8, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path_up)
 
-        # 5. 绘制下载曲线与渐变填充 (绿色)
+        # 5. 绘制下载曲线与渐变填充
+        down_color = QColor(palette.get("chart_down", "#34D399"))
         if len(points_down) >= 2:
             path_down = self._build_smooth_path(points_down)
             fill_down = QPainterPath(path_down)
@@ -1157,38 +1154,32 @@ class TrafficMonitorChart(QWidget):
             fill_down.closeSubpath()
 
             grad_down = QLinearGradient(0, min_y_down - 2, 0, chart_bottom)
-            if is_dark:
-                grad_down.setColorAt(0.0, QColor(52, 211, 153, 95))
-                grad_down.setColorAt(0.3, QColor(52, 211, 153, 50))
-                grad_down.setColorAt(0.8, QColor(16, 185, 129, 20))
-                grad_down.setColorAt(1.0, QColor(16, 185, 129, 6))
-            else:
-                grad_down.setColorAt(0.0, QColor(16, 185, 129, 85))
-                grad_down.setColorAt(0.3, QColor(16, 185, 129, 40))
-                grad_down.setColorAt(0.8, QColor(16, 185, 129, 15))
-                grad_down.setColorAt(1.0, QColor(16, 185, 129, 4))
+            grad_down.setColorAt(0.0, QColor(down_color.red(), down_color.green(), down_color.blue(), 95 if is_dark else 85))
+            grad_down.setColorAt(0.3, QColor(down_color.red(), down_color.green(), down_color.blue(), 50 if is_dark else 40))
+            grad_down.setColorAt(0.8, QColor(down_color.red(), down_color.green(), down_color.blue(), 20 if is_dark else 15))
+            grad_down.setColorAt(1.0, QColor(down_color.red(), down_color.green(), down_color.blue(), 6 if is_dark else 4))
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(grad_down))
             painter.drawPath(fill_down)
 
-            painter.setPen(QPen(QColor("#34D399") if is_dark else QColor("#10B981"), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setPen(QPen(down_color, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path_down)
 
         # 6. 顶部指标排版
         curr_down = self.down_speeds[-1]
         down_txt = f"↓ 下载: {curr_down:.1f} KB/s" if curr_down < 1024 else f"↓ 下载: {curr_down/1024.0:.2f} MB/s"
-        painter.setPen(QColor("#34D399") if is_dark else QColor("#10B981"))
+        painter.setPen(down_color)
         painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
         painter.drawText(QRectF(18, 10, 160, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
 
         curr_up = self.up_speeds[-1]
         up_txt = f"↑ 上传: {curr_up:.1f} KB/s"
-        painter.setPen(QColor("#7EB9F5") if is_dark else QColor("#0284C7"))
+        painter.setPen(up_color)
         painter.drawText(QRectF(190, 10, 130, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
 
         req_txt = f"已加速请求: {self.total_requests} 次"
-        painter.setPen(QColor("#75879E") if is_dark else QColor("#64748B"))
+        painter.setPen(QColor(palette.get("text_muted", "#75879E")))
         painter.setFont(QFont("Segoe UI", 9))
         painter.drawText(QRectF(w - 240, 10, 222, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
 
@@ -1199,7 +1190,7 @@ class TrafficMonitorChart(QWidget):
 # 6. 延迟微徽章 (LatencyBadge)
 # ==============================================================================
 class LatencyBadge(QWidget):
-    """动态延迟微徽章控件 (支持双主题高对比度自适应与动态宽度)"""
+    """动态延迟微徽章控件 (支持多主题高对比度自适应与动态宽度)"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.latency_ms = -1
@@ -1207,7 +1198,6 @@ class LatencyBadge(QWidget):
         self.via_proxy = False
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
-        # 解耦带参信号槽，确保在主题广播时稳定触发重绘
         ThemeManager.get_instance().theme_changed.connect(lambda _: self.update())
 
     def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False):
@@ -1229,13 +1219,14 @@ class LatencyBadge(QWidget):
         w = float(self.width())
         h = float(self.height())
 
+        palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
         if self.latency_ms < 0:
-            bg_color = QColor("#182032") if is_dark else QColor("#F1F5F9")
-            border_color = QColor("#273752") if is_dark else QColor("#CBD5E1")
-            text_color = QColor("#75879E") if is_dark else QColor("#475569")
+            bg_color = QColor(palette.get("container", "#182032"))
+            border_color = QColor(palette.get("outline", "#273752"))
+            text_color = QColor(palette.get("text_muted", "#75879E"))
             txt = "检测中"
-            dot_color = QColor("#75879E") if is_dark else QColor("#94A3B8")
+            dot_color = QColor(palette.get("text_muted", "#75879E"))
         elif self.latency_ms >= 9999:
             bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
             border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
@@ -1266,7 +1257,7 @@ class LatencyBadge(QWidget):
             else:
                 txt = f"{int(self.latency_ms)} ms"
 
-        # 胶囊外框 (1.2px 边框)
+        # 胶囊外框
         rect = QRectF(1, 1, w - 2, h - 2)
         painter.setPen(QPen(border_color, 1.2))
         painter.setBrush(QBrush(bg_color))
@@ -1325,10 +1316,12 @@ class SkeletonCard(QFrame):
         w = float(self.width())
         h = float(self.height())
 
-        # 卡片底色
+        palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
-        painter.setPen(QPen(QColor("#1E283E") if is_dark else QColor("#E2E8F0"), 1))
-        painter.setBrush(QBrush(QColor("#141A28") if is_dark else QColor("#F8FAFC")))
+
+        # 卡片底色
+        painter.setPen(QPen(QColor(palette.get("outline", "#1E283E")), 1))
+        painter.setBrush(QBrush(QColor(palette.get("container", "#141A28"))))
         painter.drawRoundedRect(QRectF(0, 0, w, h), 12, 12)
 
         # 扫掠渐变
@@ -1337,8 +1330,8 @@ class SkeletonCard(QFrame):
         p1 = max(0.0, min(1.0, self._offset))
         p2 = max(0.0, min(1.0, self._offset + 0.4))
 
-        base_color = QColor("#141A28") if is_dark else QColor("#F1F5F9")
-        highlight_color = QColor("#27344E") if is_dark else QColor("#FFFFFF")
+        base_color = QColor(palette.get("container", "#141A28"))
+        highlight_color = QColor(palette.get("container_high", "#27344E") if is_dark else "#FFFFFF")
         grad.setColorAt(0.0, base_color)
         if 0.0 <= p0 < 1.0:
             grad.setColorAt(p0, base_color)
@@ -1356,3 +1349,21 @@ class SkeletonCard(QFrame):
         painter.drawRoundedRect(QRectF(w - 120, 22, 100, 20), 10, 10)
 
         painter.end()
+
+
+# ==============================================================================
+# 8. 防误触下拉框 (NoWheelComboBox)
+# ==============================================================================
+class NoWheelComboBox(QComboBox):
+    """
+    防滚轮误触下拉框：
+    在下拉列表未展开状态下忽略滚轮事件，将滚轮传递给父级滚动容器，
+    彻底解决页面滚动时鼠标悬停误触发配置变更的问题。
+    """
+    def wheelEvent(self, event):
+        if not self.view().isVisible():
+            event.ignore()
+        else:
+            super().wheelEvent(event)
+
+

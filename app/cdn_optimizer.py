@@ -4,9 +4,9 @@ GameArt Toolkit - 高并发 CDN 测速与动态 Upstream 优选引擎 (双通道
 
 核心改进:
 - 双通道探测: 直连 + 经本地代理(默认 127.0.0.1:7897 Clash mixed) HTTP CONNECT 隧道
-- 三态验证: TCP 握手 → TLS 握手(按服务 SNI 模式) → HTTP 状态码, 排除"TCP 通但 TLS 被阻断"的假可用节点
-- rank 分级: 0=直连可用 1=经代理验证的真节点 2=代理可疑(5xx/421) 3=不可用(不入选)
-- 代理仅作"节点筛选器", 最终写入 nginx 的仍是直连 IP
+- 三态验证: TCP 握手 -> TLS 握手(按服务 SNI 模式) -> HTTP 状态码, 排除"TCP 通但 TLS 被阻断"的假可用节点
+- 严格过滤 Fake-IP (198.18.0.0/15) 与内网地址
+- DoH 强行绕过 WinINet 系统代理获取真实国内最优 CDN IP
 """
 
 import sys
@@ -18,6 +18,7 @@ import re
 import struct
 import random
 import threading
+import ipaddress
 import urllib.request
 import concurrent.futures
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Dict, List, Tuple, Optional, Callable, Any
 from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID
 from config_store import load_config
-from win_utils import is_port_in_use
+from win_utils import is_port_in_use, get_physical_adapter_ip, auto_detect_active_proxy
 
 UPSTREAM_CONF_PATH = NGINX_DIR / "conf" / "upstream-dynamic.conf"
 
@@ -64,20 +65,49 @@ _DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
 # 国外 1.1.1.1 / 8.8.8.8 直连实测被阻断, 不作为默认端点。
 DOH_ENDPOINTS = ["https://doh.pub/dns-query", "https://dns.alidns.com/resolve"]
 
+# 严禁进入 Upstream 的保留/虚拟 IP 段 (含 Clash / Sing-box Fake-IP: 198.18.0.0/15)
+BLOCKED_IP_NETWORKS = [
+    ipaddress.ip_network("198.18.0.0/15"),  # Clash Fake-IP 虚拟池 (198.18.0.0 - 198.19.255.255)
+    ipaddress.ip_network("127.0.0.0/8"),     # Loopback 回环
+    ipaddress.ip_network("10.0.0.0/8"),      # 私有内网
+    ipaddress.ip_network("172.16.0.0/12"),   # 私有内网
+    ipaddress.ip_network("192.168.0.0/16"),  # 私有内网
+    ipaddress.ip_network("169.254.0.0/16"),  # 链路本地
+    ipaddress.ip_network("224.0.0.0/4"),     # 组播
+    ipaddress.ip_network("240.0.0.0/4"),     # 保留段
+    ipaddress.ip_network("::1/128"),         # IPv6 Loopback
+    ipaddress.ip_network("fe80::/10"),       # IPv6 Link-Local
+    ipaddress.ip_network("fc00::/7"),        # IPv6 ULA
+]
+
 # 已知 GFW DNS 污染注入段 (Facebook/Twitter/Dropbox 等大厂 IP 前缀):
-# 被全面封禁域名 (dlsite/patreon/wikipedia/fandom 等) 的解析被注入到这些段。
-# 注意: 该列表是动态变化的 (实测 wikipedia 曾在腾讯 DoH 拿到干净 IP, 后又变回污染),
-# 仅用于过滤 DoH 端点自身返回的污染结果, 不作为主判定依据。
 POLLUTED_IP_PREFIXES = ("31.13.", "69.171.", "157.240.", "69.63.",
                         "199.59.", "104.244.", "108.160.", "162.125.", "199.96.")
 
 
+def is_valid_public_cdn_ip(ip_str: str) -> bool:
+    """严格校验是否为合法的公网真实 CDN IP (彻底阻断 Fake-IP 与内网地址污染)"""
+    if not ip_str:
+        return False
+    clean = ip_str.strip("[]").strip()
+    try:
+        ip_obj = ipaddress.ip_address(clean)
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local or ip_obj.is_multicast:
+            return False
+        for net in BLOCKED_IP_NETWORKS:
+            if ip_obj in net:
+                return False
+        return True
+    except ValueError:
+        return False
+
+
 def doh_resolve(domain: str, timeout: float = 3.0,
                 endpoints: Optional[Tuple[str, ...]] = None) -> List[str]:
-    """DoH (DNS over HTTPS) JSON 模式解析, 返回干净 A 记录 IPv4 列表
-
+    """DoH (DNS over HTTPS) 纯净解析 (强行绕过 WinINet 系统代理, 获取国内真实 Anycast CDN)
+    
     - 标准库 urllib 实现 (零新依赖), 加密查询无法被 GFW 注入污染
-    - 端点自身结果也可能继承污染 (如阿里端点), 过滤已知污染 IP 段
+    - 过滤 Fake-IP 与已知污染 IP 段
     - 失败静默返回空列表 (不抛出异常, 不拖垮调用方)
     """
     if not domain:
@@ -89,11 +119,14 @@ def doh_resolve(domain: str, timeout: float = 3.0,
                 "Accept": "application/dns-json",
                 "User-Agent": "GameArtToolkit/2.0",
             })
+            # 禁用代理，确保以真实本地物理出口解析
+            req.set_proxy("", "http")
+            req.set_proxy("", "https")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8", errors="replace"))
             ips = [a.get("data", "") for a in payload.get("Answer", [])
                    if a.get("type") == 1 and ":" not in a.get("data", "")]
-            clean = [ip for ip in ips if not ip.startswith(POLLUTED_IP_PREFIXES)]
+            clean = [ip for ip in ips if not ip.startswith(POLLUTED_IP_PREFIXES) and is_valid_public_cdn_ip(ip)]
             if clean:
                 return list(dict.fromkeys(clean))
         except Exception:
@@ -102,7 +135,7 @@ def doh_resolve(domain: str, timeout: float = 3.0,
 
 
 def _udp_resolve_a(domain: str, timeout: float = 0.8) -> List[str]:
-    """UDP 直查公共 DNS 获取域名 A 记录 (绕过被注入的 hosts, 避免解析到 127.0.0.1)"""
+    """UDP 直查公共 DNS 获取域名 A 记录 (带 Fake-IP 与内网地址过滤)"""
     results: List[str] = []
     for dns in _DNS_SERVERS:
         try:
@@ -130,7 +163,9 @@ def _udp_resolve_a(domain: str, timeout: float = 0.8) -> List[str]:
                 rtype, _, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
                 off += 10
                 if rtype == 1 and rdlen == 4:
-                    results.append(socket.inet_ntoa(data[off:off + 4]))
+                    raw_ip = socket.inet_ntoa(data[off:off + 4])
+                    if is_valid_public_cdn_ip(raw_ip):
+                        results.append(raw_ip)
                 off += rdlen
             if results:
                 break
@@ -140,18 +175,7 @@ def _udp_resolve_a(domain: str, timeout: float = 0.8) -> List[str]:
 
 
 def _resolve_dns_candidates(domain: str, timeout: float = 0.8, use_doh: bool = True) -> List[str]:
-    """双通道解析: UDP 直查 + DoH (DNS over HTTPS), 规避 DNS 污染
-
-    候选池中的 IP 可能过期 (DNS 已换节点), 每次测速补充当前解析 IP;
-    GFW 对封禁域名 (如 dlsite/patreon/wikipedia) 的 UDP 解析注入伪造 IP。
-
-    判定规则 (实测验证):
-    - DoH 加密查询无法被注入, 拿到干净结果 (已过滤端点自身污染段) 即优先采用;
-      不以"UDP 命中已知污染段"为主判定——污染段列表动态变化且无法穷举
-      (实测 patreon 曾污染到 Dropbox 108.160 段, 后变 162.125 段)
-    - DoH 无干净结果 (端点不可达 / 端点同样被污染, 如 wikipedia 国内 DoH 全污染)
-      时回退 UDP 原行为 (零回归, 无 DoH 环境不受影响)
-    """
+    """双通道解析: UDP 直查 + DoH (DNS over HTTPS), 规避 DNS 污染与 Fake-IP"""
     if not domain:
         return []
     udp_box: Dict[str, List[str]] = {"ips": []}
@@ -163,21 +187,29 @@ def _resolve_dns_candidates(domain: str, timeout: float = 0.8, use_doh: bool = T
     t.start()
     doh_ips = doh_resolve(domain, timeout=max(timeout * 3, 2.5)) if use_doh else []
     t.join(timeout=timeout + 0.5)
-    udp_ips = udp_box["ips"]
+    udp_ips = [ip for ip in udp_box["ips"] if is_valid_public_cdn_ip(ip)]
     if doh_ips:
         return doh_ips
     return udp_ips
 
 
 def _load_proxy_config() -> Optional[Tuple[str, int]]:
-    """读取 config.json 的 upstream_proxy 配置, 返回 (host, port); 显式禁用或异常时返回 None"""
+    """读取 config.json 的 upstream_proxy 配置; 若未启用或不可达, 自动尝试嗅探本地活跃代理"""
     try:
         cfg = load_config().get("upstream_proxy", {})
-        if not cfg.get("enabled", True):
-            return None
-        return (str(cfg.get("host", DEFAULT_PROXY[0])), int(cfg.get("port", DEFAULT_PROXY[1])))
+        if cfg.get("enabled", False):
+            host = str(cfg.get("host", DEFAULT_PROXY[0]))
+            port = int(cfg.get("port", DEFAULT_PROXY[1]))
+            if is_proxy_available((host, port), timeout=0.2):
+                return (host, port)
     except Exception:
-        return DEFAULT_PROXY
+        pass
+    
+    # 自动探测活跃代理 (Clash Verge 7897 / Clash 7890 / v2rayN 10809 等)
+    detected = auto_detect_active_proxy(timeout=0.15)
+    if detected and is_proxy_available(detected, timeout=0.2):
+        return detected
+    return None
 
 
 def is_proxy_available(proxy: Optional[Tuple[str, int]], timeout: float = 0.3) -> bool:
@@ -215,22 +247,18 @@ def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeou
 
 
 def _suspect_status(status: Optional[int]) -> bool:
-    """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 或 Cloudflare 421 重路由)
-
-    注意: 500 豁免——部分服务(如 githubassets.com)对根路径返回 500 但节点真实可用;
-    530 为 Cloudflare "Origin unreachable" (边缘可达但回源失败, 页面实际打不开),
-    必须判定为可疑, 否则会被误判 rank0 假可用写入 upstream。
-    """
+    """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 或 Cloudflare 421 重路由)"""
     return status is not None and (status == 421 or 530 <= status <= 530 or 502 <= status <= 504)
 
 
 def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 1.5,
                          sni_mode: str = "host",
-                         proxy: Optional[Tuple[str, int]] = None) -> Dict:
+                         proxy: Optional[Tuple[str, int]] = None,
+                         physical_ip: Optional[str] = None) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式) → HTTP 状态码
-
-    proxy=None 为直连; proxy=(host,port) 先经 HTTP CONNECT 隧道再探测。
-    返回: tcp_ok/tcp_latency/tls_ok/tls_latency/http_ok/http_status/error
+    
+    - proxy=None 为直连 (绑定物理网卡 IP, 避开 TUN 网卡伪直连欺骗)
+    - proxy=(host,port) 经 HTTP CONNECT 隧道探测
     """
     out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
            "tls_latency": None, "http_ok": False, "http_status": None, "error": ""}
@@ -248,7 +276,16 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 1.5,
                 out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
             else:
                 t0 = time.perf_counter()
-                sock = socket.create_connection((ip, 443), timeout=timeout)
+                sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                # 若探测到物理网卡 IP 且当前为 IPv4 目标，绑定物理 IP 穿透 TUN
+                p_ip = physical_ip if physical_ip is not None else get_physical_adapter_ip()
+                if p_ip and ":" not in ip:
+                    try:
+                        sock.bind((p_ip, 0))
+                    except Exception:
+                        pass
+                sock.connect((ip, 443))
                 out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
             out["tcp_ok"] = True
         except Exception as e:
@@ -380,7 +417,7 @@ class CDNOptimizer:
 
         srv = SERVICES_BY_ID.get(group_name, {})
         domain = srv.get("domains", [""])[0] if srv else ""
-        # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
+        # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (带 Fake-IP 过滤)
         if domain:
             ip_list = list(dict.fromkeys(list(ip_list) + _resolve_dns_candidates(domain)))
 
@@ -455,7 +492,7 @@ class CDNOptimizer:
                 continue
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
-            # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (绕过 hosts 注入)
+            # DNS 动态补充: 候选池可能过期, 补充域名当前解析的 A 记录 (带 Fake-IP 过滤)
             if domain:
                 ips = list(dict.fromkeys(list(ips) + _resolve_dns_candidates(domain)))
             

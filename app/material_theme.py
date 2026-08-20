@@ -742,6 +742,7 @@ QFrame[class="CdnIpCardBest"] {
 # Material Design 3 浅色调色板常量定义 (Pixiv Soft Blue & Crisp White)
 # ==============================================================================
 MD3_LIGHT_SURFACE = "#F8FAFC"
+MD3_LIGHT_SURFACE_DIM = "#EDF2F7"
 MD3_LIGHT_SURFACE_CONTAINER_LOWEST = "#FFFFFF"
 MD3_LIGHT_SURFACE_CONTAINER_LOW = "#F1F5F9"
 MD3_LIGHT_SURFACE_CONTAINER = "#E2E8F0"
@@ -1451,6 +1452,485 @@ QFrame[class="CdnIpCardBest"] {
 }
 """
 
+# ==========================================================================
+# Material Design 3 樱花粉色调色板常量定义 (Sakura Rose MD3)
+# ==========================================================================
+MD3_PINK_SURFACE = "#FFF5F7"
+MD3_PINK_SURFACE_DIM = "#FFEBEF"
+MD3_PINK_SURFACE_CONTAINER_LOWEST = "#FFFFFF"
+MD3_PINK_SURFACE_CONTAINER_LOW = "#FFF0F3"
+MD3_PINK_SURFACE_CONTAINER = "#FFFFFF"
+MD3_PINK_SURFACE_CONTAINER_HIGH = "#FFE4E8"
+MD3_PINK_SURFACE_CONTAINER_HIGHEST = "#FFD1DA"
+
+MD3_PINK_PRIMARY = "#E11D48"               # 柔和清新玫瑰樱粉
+MD3_PINK_ON_PRIMARY = "#FFFFFF"
+MD3_PINK_PRIMARY_CONTAINER = "#FFE4E6"
+MD3_PINK_ON_PRIMARY_CONTAINER = "#9F1239"
+
+MD3_PINK_SECONDARY = "#64748B"
+MD3_PINK_SECONDARY_CONTAINER = "#FFF1F2"
+MD3_PINK_ON_SECONDARY_CONTAINER = "#881337"
+
+MD3_PINK_TERTIARY = "#F43F5E"
+MD3_PINK_TERTIARY_CONTAINER = "#FFE4E6"
+
+MD3_PINK_SUCCESS = "#10B981"
+MD3_PINK_SUCCESS_CONTAINER = "#059669"
+MD3_PINK_SUCCESS_BG = "rgba(16, 185, 129, 0.12)"
+
+MD3_PINK_WARNING = "#F59E0B"
+MD3_PINK_WARNING_CONTAINER = "#D97706"
+MD3_PINK_WARNING_BG = "rgba(245, 158, 11, 0.12)"
+
+MD3_PINK_ERROR = "#E11D48"
+MD3_PINK_ERROR_CONTAINER = "#BE123C"
+MD3_PINK_ERROR_BG = "rgba(225, 29, 72, 0.12)"
+
+MD3_PINK_OUTLINE = "#FECDD3"
+MD3_PINK_OUTLINE_VARIANT = "#FFE4E8"
+MD3_PINK_TEXT_PRIMARY = "#1E293B"
+MD3_PINK_TEXT_SECONDARY = "#475569"
+MD3_PINK_TEXT_MUTED = "#94A3B8"
+
+MATERIAL_PINK_QSS = """
+/* ==========================================================================
+   全局基础重置与粉色基底 (Surface - Sakura Rose 樱花粉白基调)
+   ========================================================================== */
+QWidget#CentralWidget, QWidget#ScrollContent, QWidget#AppRootWidget {
+    background-color: #FFF5F7;
+    color: #1E293B;
+    font-family: "Segoe UI", "Microsoft YaHei", -apple-system, sans-serif;
+    font-size: 13px;
+}
+
+QMainWindow {
+    background-color: #FFF5F7;
+}
+
+/* 提示气泡 ToolTip */
+QToolTip {
+    background-color: #FFF0F3;
+    color: #1E293B;
+    border: 1px solid #FECDD3;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+/* ==========================================================================
+   无边框标题栏 (TitleBar)
+   ========================================================================== */
+QFrame#TitleBar {
+    background-color: #FFF5F7;
+    border-bottom: 1px solid #FFE4E8;
+    min-height: 38px;
+    max-height: 38px;
+}
+
+QLabel#TitleBrand {
+    color: #E11D48;
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+}
+
+QLabel#TitleBadge {
+    background-color: #FFE4E6;
+    color: #9F1239;
+    font-size: 10px;
+    font-weight: bold;
+    border-radius: 6px;
+    padding: 2px 6px;
+}
+
+QLabel#TitleStatusPill {
+    background-color: rgba(16, 185, 129, 0.12);
+    color: #059669;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    border-radius: 11px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+/* 标题栏主题切换按钮 (ThemeToggleBtn) */
+QPushButton[class="ThemeToggleBtn"] {
+    background-color: transparent;
+    border: none;
+    border-radius: 8px;
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 32px;
+    max-height: 32px;
+    margin: 3px 2px;
+}
+
+QPushButton[class="ThemeToggleBtn"]:hover {
+    background-color: rgba(225, 29, 72, 0.12);
+}
+
+QPushButton[class="ThemeToggleBtn"]:pressed {
+    background-color: rgba(225, 29, 72, 0.20);
+}
+
+/* 窗口控制按钮 */
+QPushButton[class="WindowControlBtn"] {
+    background-color: transparent;
+    border: none;
+    min-width: 46px;
+    max-width: 46px;
+    min-height: 38px;
+    max-height: 38px;
+    padding: 0px;
+    margin: 0px;
+}
+
+QPushButton[class="WindowControlBtn"]:hover {
+    background-color: rgba(225, 29, 72, 0.08);
+}
+
+QPushButton[class="WindowControlBtn"]:pressed {
+    background-color: rgba(225, 29, 72, 0.16);
+}
+
+QPushButton[class="WindowCloseBtn"] {
+    background-color: transparent;
+    border: none;
+    min-width: 46px;
+    max-width: 46px;
+    min-height: 38px;
+    max-height: 38px;
+    padding: 0px;
+    margin: 0px;
+}
+
+QPushButton[class="WindowCloseBtn"]:hover {
+    background-color: #E11D48;
+}
+
+QPushButton[class="WindowCloseBtn"]:pressed {
+    background-color: #BE123C;
+}
+
+/* 滚动条 */
+QScrollArea#MainScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0px 2px 0px 0px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical {
+    background: #FBCFE8;
+    min-height: 32px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #F472B6;
+}
+
+QScrollBar::handle:vertical:pressed {
+    background: #E11D48;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 0px 0px 2px 0px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #FBCFE8;
+    min-width: 32px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #F472B6;
+}
+
+QScrollBar::handle:horizontal:pressed {
+    background: #E11D48;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+/* 侧边导航栏 (NavSidebar) */
+QFrame#NavSidebar {
+    background-color: #FFF0F3;
+    border-right: 1px solid #FFE4E8;
+    min-width: 210px;
+    max-width: 210px;
+}
+
+QLabel#BrandTitle {
+    color: #E11D48;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+QLabel#BrandSubtitle {
+    color: #94A3B8;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+QPushButton[class="NavButton"] {
+    background-color: transparent;
+    color: #475569;
+    font-size: 13px;
+    font-weight: 500;
+    text-align: left;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: none;
+}
+
+QPushButton[class="NavButton"]:hover {
+    background-color: rgba(225, 29, 72, 0.08);
+    color: #E11D48;
+}
+
+QPushButton[class="NavButton"]:checked {
+    background-color: #FFE4E6;
+    color: #E11D48;
+    font-weight: 600;
+    border-left: 3px solid #E11D48;
+}
+
+/* 页面排版 */
+QLabel#PageTitle {
+    color: #1E293B;
+    font-size: 20px;
+    font-weight: 700;
+}
+
+QLabel#PageDesc {
+    color: #64748B;
+    font-size: 12px;
+}
+
+QLabel#SectionTitle {
+    color: #334155;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QLabel#SectionDesc {
+    color: #94A3B8;
+    font-size: 11px;
+}
+
+/* 卡片容器 */
+QFrame[class="MDCard"] {
+    background-color: #FFFFFF;
+    border: 1px solid #FFE4E8;
+    border-radius: 12px;
+}
+
+QFrame[class="MDCard"]:hover {
+    border: 1px solid #FDA4AF;
+}
+
+QFrame[class="MDCardElevated"] {
+    background-color: #FFFFFF;
+    border: 1px solid #FECDD3;
+    border-radius: 12px;
+}
+
+QFrame[class="MDCardTonal"] {
+    background-color: #FFF0F3;
+    border: 1px solid #FFE4E8;
+    border-radius: 12px;
+}
+
+/* 按钮规范 */
+QPushButton[class="MDBtnPrimary"] {
+    background-color: #E11D48;
+    color: #FFFFFF;
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+    border-radius: 10px;
+    padding: 8px 18px;
+}
+
+QPushButton[class="MDBtnPrimary"]:hover {
+    background-color: #BE123C;
+}
+
+QPushButton[class="MDBtnPrimary"]:pressed {
+    background-color: #9F1239;
+}
+
+QPushButton[class="MDBtnPrimary"]:disabled {
+    background-color: #CBD5E1;
+    color: #94A3B8;
+}
+
+QPushButton[class="MDBtnTonal"] {
+    background-color: #FFE4E6;
+    color: #9F1239;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid #FECDD3;
+    border-radius: 10px;
+    padding: 8px 16px;
+}
+
+QPushButton[class="MDBtnTonal"]:hover {
+    background-color: #FFD1DA;
+    color: #881337;
+}
+
+QPushButton[class="MDBtnTonal"]:pressed {
+    background-color: #FECDD3;
+}
+
+QPushButton[class="MDBtnOutline"] {
+    background-color: #FFFFFF;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid #FECDD3;
+    border-radius: 8px;
+    padding: 6px 14px;
+}
+
+QPushButton[class="MDBtnOutline"]:hover {
+    background-color: #FFF1F2;
+    color: #E11D48;
+    border: 1px solid #FDA4AF;
+}
+
+QPushButton[class="MDBtnOutline"]:pressed {
+    background-color: #FFE4E6;
+}
+
+/* 输入框与下拉框 */
+QLineEdit {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #FECDD3;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+QLineEdit:focus {
+    border: 1.5px solid #E11D48;
+    background-color: #FFFFFF;
+}
+
+QComboBox {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #FECDD3;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 12px;
+    min-width: 140px;
+}
+
+QComboBox:hover {
+    border: 1px solid #FDA4AF;
+}
+
+QComboBox:focus {
+    border: 1.5px solid #E11D48;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    selection-background-color: #FFE4E6;
+    selection-color: #E11D48;
+    border: 1px solid #FECDD3;
+    border-radius: 8px;
+    padding: 4px;
+}
+
+/* 复选框与单选框 */
+QCheckBox {
+    color: #1E293B;
+    font-size: 12px;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid #CBD5E1;
+    border-radius: 4px;
+    background-color: #FFFFFF;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #E11D48;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #E11D48;
+    border-color: #E11D48;
+}
+
+/* 进度条 */
+QProgressBar {
+    background-color: #FFE4E8;
+    border: none;
+    border-radius: 4px;
+    text-align: center;
+    color: #1E293B;
+    font-size: 10px;
+    min-height: 6px;
+    max-height: 6px;
+}
+
+QProgressBar::chunk {
+    background-color: #E11D48;
+    border-radius: 4px;
+}
+
+/* 菜单 */
+QMenu {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #FECDD3;
+    border-radius: 8px;
+    padding: 6px;
+}
+
+QMenu::item {
+    padding: 6px 20px;
+    border-radius: 6px;
+}
+
+QMenu::item:selected {
+    background-color: #FFE4E6;
+    color: #E11D48;
+}
+"""
+
+
 class ThemeManager(QObject):
     theme_changed = Signal(str)
 
@@ -1482,8 +1962,12 @@ class ThemeManager(QObject):
     def is_light(self) -> bool:
         return self._current_theme == "light"
 
+    @property
+    def is_pink(self) -> bool:
+        return self._current_theme == "pink"
+
     def set_theme(self, theme_name: str, app=None) -> bool:
-        if theme_name not in ("dark", "light"):
+        if theme_name not in ("dark", "light", "pink"):
             return False
         
         self._current_theme = theme_name
@@ -1495,13 +1979,25 @@ class ThemeManager(QObject):
             pass
         
         if app:
-            qss = MATERIAL_DARK_QSS if theme_name == "dark" else MATERIAL_LIGHT_QSS
-            app.setStyleSheet(qss)
+            if theme_name == "dark":
+                qss = MATERIAL_DARK_QSS
+            elif theme_name == "pink":
+                qss = MATERIAL_PINK_QSS
+            else:
+                qss = MATERIAL_LIGHT_QSS
+            try:
+                app.setStyleSheet(qss)
+            except Exception:
+                pass
             
-        self.theme_changed.emit(theme_name)
+        try:
+            self.theme_changed.emit(theme_name)
+        except Exception:
+            pass
         return True
 
     def toggle_theme(self, app=None) -> str:
+        # 黑白二元快速切换: dark <-> light (粉色等扩展主题在设置页中选用)
         new_theme = "light" if self._current_theme == "dark" else "dark"
         self.set_theme(new_theme, app)
         return new_theme
@@ -1510,24 +2006,68 @@ class ThemeManager(QObject):
         if self._current_theme == "dark":
             return {
                 "surface": MD3_SURFACE,
+                "surface_dim": MD3_SURFACE_DIM,
                 "container": MD3_SURFACE_CONTAINER,
+                "container_high": MD3_SURFACE_CONTAINER_HIGH,
                 "primary": MD3_PRIMARY,
+                "primary_container": MD3_PRIMARY_CONTAINER,
                 "text": MD3_TEXT_PRIMARY,
+                "text_secondary": MD3_TEXT_SECONDARY,
                 "text_muted": MD3_TEXT_MUTED,
                 "outline": MD3_OUTLINE,
+                "outline_variant": MD3_OUTLINE_VARIANT,
                 "success": MD3_SUCCESS,
-                "error": MD3_ERROR
+                "warning": MD3_WARNING,
+                "error": MD3_ERROR,
+                "nav_icon": "#CFE5FF",
+                "chart_up": "#7EB9F5",
+                "chart_down": "#34D399",
+                "chart_bg_start": "#182234",
+                "chart_bg_end": "#121927"
+            }
+        elif self._current_theme == "pink":
+            return {
+                "surface": MD3_PINK_SURFACE,
+                "surface_dim": MD3_PINK_SURFACE_DIM,
+                "container": MD3_PINK_SURFACE_CONTAINER,
+                "container_high": MD3_PINK_SURFACE_CONTAINER_HIGH,
+                "primary": MD3_PINK_PRIMARY,
+                "primary_container": MD3_PINK_PRIMARY_CONTAINER,
+                "text": MD3_PINK_TEXT_PRIMARY,
+                "text_secondary": MD3_PINK_TEXT_SECONDARY,
+                "text_muted": MD3_PINK_TEXT_MUTED,
+                "outline": MD3_PINK_OUTLINE,
+                "outline_variant": MD3_PINK_OUTLINE_VARIANT,
+                "success": MD3_PINK_SUCCESS,
+                "warning": MD3_PINK_WARNING,
+                "error": MD3_PINK_ERROR,
+                "nav_icon": "#E11D48",
+                "chart_up": "#FB7185",
+                "chart_down": "#10B981",
+                "chart_bg_start": "#FFFFFF",
+                "chart_bg_end": "#FFF5F7"
             }
         else:
             return {
                 "surface": MD3_LIGHT_SURFACE,
+                "surface_dim": MD3_LIGHT_SURFACE_DIM,
                 "container": MD3_LIGHT_SURFACE_CONTAINER,
+                "container_high": MD3_LIGHT_SURFACE_CONTAINER_HIGH,
                 "primary": MD3_LIGHT_PRIMARY,
+                "primary_container": MD3_LIGHT_PRIMARY_CONTAINER,
                 "text": MD3_LIGHT_TEXT_PRIMARY,
+                "text_secondary": MD3_LIGHT_TEXT_SECONDARY,
                 "text_muted": MD3_LIGHT_TEXT_MUTED,
                 "outline": MD3_LIGHT_OUTLINE,
+                "outline_variant": MD3_LIGHT_OUTLINE_VARIANT,
                 "success": MD3_LIGHT_SUCCESS,
-                "error": MD3_LIGHT_ERROR
+                "warning": MD3_LIGHT_WARNING,
+                "error": MD3_LIGHT_ERROR,
+                "nav_icon": "#0F172A",
+                "chart_up": "#0284C7",
+                "chart_down": "#10B981",
+                "chart_bg_start": "#FFFFFF",
+                "chart_bg_end": "#F8FAFC"
             }
 
     def get_color(self, color_key: str):
@@ -1535,3 +2075,4 @@ class ThemeManager(QObject):
         palette = self.get_palette()
         color_str = palette.get(color_key, "#000000")
         return QColor(color_str)
+

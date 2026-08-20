@@ -157,16 +157,25 @@ class L4RelayServer:
             self._proxy_addr_override = (host, int(port))
 
     def _load_proxy_addr(self) -> Optional[Tuple[str, int]]:
-        """获取上游代理地址: 优先显式注入, 否则实时读取 config.json upstream_proxy"""
+        """获取上游代理地址: 优先显式注入, 其次读取 config.json, 最后自动嗅探活跃端口"""
         if self._proxy_addr_override is not None:
             return self._proxy_addr_override
         try:
             cfg = load_config().get("upstream_proxy", {})
-            if not cfg.get("enabled", True):
-                return None
-            return (str(cfg.get("host", "127.0.0.1")), int(cfg.get("port", 7897)))
+            if cfg.get("enabled", False):
+                h = str(cfg.get("host", "127.0.0.1"))
+                p = int(cfg.get("port", 7897))
+                return (h, p)
         except Exception:
-            return None
+            pass
+        try:
+            from win_utils import auto_detect_active_proxy
+            detected = auto_detect_active_proxy(timeout=0.15)
+            if detected:
+                return detected
+        except Exception:
+            pass
+        return None
 
     def is_running(self) -> bool:
         return self._is_running
