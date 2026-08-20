@@ -48,6 +48,18 @@ class NginxConfGenerator:
             domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
         elif profile.id == "yandere" and "*.yande.re" not in domains_list:
             domains_list.append("*.yande.re")
+        elif profile.id == "dlsite" and "*.dlsite.com" not in domains_list:
+            domains_list.append("*.dlsite.com")
+        elif profile.id == "epic_games" and "*.epicgames.com" not in domains_list:
+            domains_list.append("*.epicgames.com")
+        elif profile.id == "battle_net":
+            for _wd in ("*.battle.net", "*.blizzard.com"):
+                if _wd not in domains_list:
+                    domains_list.append(_wd)
+        elif profile.id == "patreon":
+            for _wd in ("*.patreon.com", "*.patreonusercontent.com"):
+                if _wd not in domains_list:
+                    domains_list.append(_wd)
 
         # 保序去重
         domains_list = list(dict.fromkeys(domains_list))

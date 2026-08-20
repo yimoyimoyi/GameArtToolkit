@@ -83,7 +83,7 @@ class TestRegressionSuite:
         defined_upstreams = set(re.findall(r"upstream\s+([a-zA-Z0-9_-]+)\s*\{", dynamic_upstream_conf))
         self.log_sub(f"upstream-dynamic.conf 中解析到 {len(defined_upstreams)} 个负载均衡组")
 
-        # 校验 21 项服务是否全部在 upstream-dynamic.conf 中定义
+        # 校验全部服务是否都在 upstream-dynamic.conf 中定义
         for srv in SERVICES_LIST:
             srv_id = srv["id"]
             expected_upstream = f"upstream_{srv_id}"

@@ -583,12 +583,12 @@ class TestIPv6Candidates:
 # ==============================================================================
 class TestRelayPortFor:
     def test_deterministic_and_in_range(self):
-        """同一服务两次调用结果一致, 且落在 44311-44331 区间 (21 项服务)"""
+        """同一服务两次调用结果一致, 且落在 44311 起始递增区间 (28 项服务)"""
         for srv_id in CANDIDATE_IPS:
             p1 = relay_port_for(srv_id)
             p2 = relay_port_for(srv_id)
             assert p1 == p2, f"{srv_id} 的 relay 端口两次调用不一致"
-            assert 44311 <= p1 <= 44331, f"{srv_id} -> {p1} 超出 44311-44331 区间"
+            assert 44311 <= p1 < 44311 + len(CANDIDATE_IPS), f"{srv_id} -> {p1} 超出合法区间"
 
     def test_unknown_service_falls_back_to_base(self):
         """未知服务回退基址 44311"""
@@ -833,3 +833,109 @@ class TestApplySingleOptimal:
         assert "auto_cdn_min_interval_minutes" in DEFAULT_CONFIG
         assert "auto_cdn_only_enabled" in DEFAULT_CONFIG
 
+
+
+# ==============================================================================
+# 13. DoH 双通道解析 (DNS 污染检测与规避)
+# ==============================================================================
+class _FakeUrlOpen:
+    """模拟 urllib.request.urlopen 的上下文管理器响应对象"""
+
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        import json
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class TestDohDualChannel:
+    """验证 DoH 解析与 UDP+DoH 双通道污染规避"""
+
+    def _mock_json(self, answers):
+        return _FakeUrlOpen({"Status": 0, "Answer": answers})
+
+    # ---------- doh_resolve ----------
+    def test_doh_resolve_parses_json(self):
+        """DoH JSON 模式正确提取 A 记录 (跳过 CNAME, 保留 IPv4)"""
+        from cdn_optimizer import doh_resolve
+        payload = {
+            "Status": 0,
+            "Answer": [
+                {"name": "patreon.com.", "type": 5, "data": "patreon.com.cdn.cloudflare.net."},
+                {"name": "patreon.com.", "type": 1, "data": "104.16.25.14"},
+                {"name": "patreon.com.", "type": 1, "data": "104.16.24.14"},
+                {"name": "patreon.com.", "type": 1, "data": "2606:4700::6810:180e"},
+            ],
+        }
+        with patch("cdn_optimizer.urllib.request.urlopen", return_value=self._mock_json(payload["Answer"])):
+            ips = doh_resolve("patreon.com", timeout=1.0)
+        assert ips == ["104.16.25.14", "104.16.24.14"], f"应提取 A 记录并跳过 CNAME/IPv6: {ips}"
+
+    def test_doh_resolve_filters_polluted(self):
+        """端点返回污染段 IP 时过滤 (阿里端点实测继承 GFW 注入)"""
+        from cdn_optimizer import doh_resolve
+        payload = {
+            "Status": 0,
+            "Answer": [
+                {"name": "patreon.com.", "type": 1, "data": "108.160.162.98"},   # Dropbox 段污染
+                {"name": "patreon.com.", "type": 1, "data": "104.16.25.14"},     # 真实 CF
+            ],
+        }
+        with patch("cdn_optimizer.urllib.request.urlopen", return_value=self._mock_json(payload["Answer"])):
+            ips = doh_resolve("patreon.com", timeout=1.0)
+        assert ips == ["104.16.25.14"], f"污染段应被过滤: {ips}"
+
+    def test_doh_resolve_failure_returns_empty(self):
+        """DoH 请求失败静默返回空列表 (不抛异常)"""
+        from cdn_optimizer import doh_resolve
+        with patch("cdn_optimizer.urllib.request.urlopen", side_effect=OSError("network down")):
+            assert doh_resolve("epicgames.com", timeout=1.0) == []
+        assert doh_resolve("", timeout=1.0) == []
+
+    # ---------- 双通道判定 ----------
+    def test_dual_channel_polluted_udp_uses_doh(self):
+        """UDP 命中污染段 (Facebook IP) -> 判定污染, 以 DoH 真实解析为准"""
+        from cdn_optimizer import _resolve_dns_candidates
+        with patch("cdn_optimizer._udp_resolve_a", return_value=["157.240.7.5", "157.240.17.35"]), \
+             patch("cdn_optimizer.doh_resolve", return_value=["162.159.142.170"]):
+            ips = _resolve_dns_candidates("wikipedia.org", timeout=0.2)
+        assert ips == ["162.159.142.170"], f"污染时应切换 DoH: {ips}"
+
+    def test_dual_channel_doh_clean_wins(self):
+        """DoH 拿到干净结果即优先采用 (即使 UDP 也是正常 CDN 轮换, 不做黑名单依赖)"""
+        from cdn_optimizer import _resolve_dns_candidates
+        with patch("cdn_optimizer._udp_resolve_a", return_value=["104.18.3.64"]), \
+             patch("cdn_optimizer.doh_resolve", return_value=["172.64.154.125"]):
+            ips = _resolve_dns_candidates("epicgames.com", timeout=0.2)
+        assert ips == ["172.64.154.125"], f"DoH 干净结果应优先: {ips}"
+
+    def test_dual_channel_doh_all_polluted_falls_back_udp(self):
+        """DoH 端点同样被污染 (如 wikipedia 国内 DoH 全污染) -> 回退 UDP 原行为"""
+        from cdn_optimizer import _resolve_dns_candidates
+        with patch("cdn_optimizer._udp_resolve_a", return_value=["199.59.148.96"]), \
+             patch("cdn_optimizer.doh_resolve", return_value=[]):
+            ips = _resolve_dns_candidates("wikipedia.org", timeout=0.2)
+        assert ips == ["199.59.148.96"], f"DoH 无干净结果时应回退 UDP: {ips}"
+
+    def test_dual_channel_doh_down_falls_back_udp(self):
+        """DoH 不可用 (无网络/被阻断) -> 回退 UDP 原行为 (零回归)"""
+        from cdn_optimizer import _resolve_dns_candidates
+        with patch("cdn_optimizer._udp_resolve_a", return_value=["99.83.192.184"]), \
+             patch("cdn_optimizer.doh_resolve", return_value=[]):
+            ips = _resolve_dns_candidates("battle.net", timeout=0.2)
+        assert ips == ["99.83.192.184"]
+
+    def test_dual_channel_udp_down_uses_doh(self):
+        """UDP 无结果但 DoH 可用 -> 使用 DoH 结果"""
+        from cdn_optimizer import _resolve_dns_candidates
+        with patch("cdn_optimizer._udp_resolve_a", return_value=[]), \
+             patch("cdn_optimizer.doh_resolve", return_value=["151.101.64.223"]):
+            ips = _resolve_dns_candidates("pypi.org", timeout=0.2)
+        assert ips == ["151.101.64.223"]

@@ -11,13 +11,15 @@ GameArt Toolkit - 高并发 CDN 测速与动态 Upstream 优选引擎 (双通道
 
 import sys
 import time
+import json
 import socket
 import ssl
 import re
 import struct
 import random
-import concurrent.futures
 import threading
+import urllib.request
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any
 
@@ -57,15 +59,50 @@ def relay_port_for(srv_id: str) -> int:
 # 公共 DNS 服务器 (用于绕过被注入 hosts 的动态候选解析)
 _DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
 
+# DoH (DNS over HTTPS) 端点: 腾讯 doh.pub 实测解析最干净 (返回真实 IP);
+# 阿里 dns.alidns.com 与 UDP 同源 (可能继承 GFW 注入结果), 仅作容灾。
+# 国外 1.1.1.1 / 8.8.8.8 直连实测被阻断, 不作为默认端点。
+DOH_ENDPOINTS = ["https://doh.pub/dns-query", "https://dns.alidns.com/resolve"]
 
-def _resolve_dns_candidates(domain: str, timeout: float = 0.8) -> List[str]:
-    """UDP 直查公共 DNS 获取域名 A 记录 (绕过被注入的 hosts, 避免解析到 127.0.0.1)
+# 已知 GFW DNS 污染注入段 (Facebook/Twitter/Dropbox 等大厂 IP 前缀):
+# 被全面封禁域名 (dlsite/patreon/wikipedia/fandom 等) 的解析被注入到这些段。
+# 注意: 该列表是动态变化的 (实测 wikipedia 曾在腾讯 DoH 拿到干净 IP, 后又变回污染),
+# 仅用于过滤 DoH 端点自身返回的污染结果, 不作为主判定依据。
+POLLUTED_IP_PREFIXES = ("31.13.", "69.171.", "157.240.", "69.63.",
+                        "199.59.", "104.244.", "108.160.", "162.125.", "199.96.")
 
-    候选池中的 IP 可能过期 (DNS 已换节点), 每次测速补充当前解析 IP,
-    让测速引擎能选到 DNS 的最新节点。失败静默返回空列表。
+
+def doh_resolve(domain: str, timeout: float = 3.0,
+                endpoints: Optional[Tuple[str, ...]] = None) -> List[str]:
+    """DoH (DNS over HTTPS) JSON 模式解析, 返回干净 A 记录 IPv4 列表
+
+    - 标准库 urllib 实现 (零新依赖), 加密查询无法被 GFW 注入污染
+    - 端点自身结果也可能继承污染 (如阿里端点), 过滤已知污染 IP 段
+    - 失败静默返回空列表 (不抛出异常, 不拖垮调用方)
     """
     if not domain:
         return []
+    for base in (endpoints or DOH_ENDPOINTS):
+        try:
+            url = f"{base}?name={domain}&type=A"
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/dns-json",
+                "User-Agent": "GameArtToolkit/2.0",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            ips = [a.get("data", "") for a in payload.get("Answer", [])
+                   if a.get("type") == 1 and ":" not in a.get("data", "")]
+            clean = [ip for ip in ips if not ip.startswith(POLLUTED_IP_PREFIXES)]
+            if clean:
+                return list(dict.fromkeys(clean))
+        except Exception:
+            continue
+    return []
+
+
+def _udp_resolve_a(domain: str, timeout: float = 0.8) -> List[str]:
+    """UDP 直查公共 DNS 获取域名 A 记录 (绕过被注入的 hosts, 避免解析到 127.0.0.1)"""
     results: List[str] = []
     for dns in _DNS_SERVERS:
         try:
@@ -100,6 +137,36 @@ def _resolve_dns_candidates(domain: str, timeout: float = 0.8) -> List[str]:
         except Exception:
             continue
     return list(dict.fromkeys(results))
+
+
+def _resolve_dns_candidates(domain: str, timeout: float = 0.8, use_doh: bool = True) -> List[str]:
+    """双通道解析: UDP 直查 + DoH (DNS over HTTPS), 规避 DNS 污染
+
+    候选池中的 IP 可能过期 (DNS 已换节点), 每次测速补充当前解析 IP;
+    GFW 对封禁域名 (如 dlsite/patreon/wikipedia) 的 UDP 解析注入伪造 IP。
+
+    判定规则 (实测验证):
+    - DoH 加密查询无法被注入, 拿到干净结果 (已过滤端点自身污染段) 即优先采用;
+      不以"UDP 命中已知污染段"为主判定——污染段列表动态变化且无法穷举
+      (实测 patreon 曾污染到 Dropbox 108.160 段, 后变 162.125 段)
+    - DoH 无干净结果 (端点不可达 / 端点同样被污染, 如 wikipedia 国内 DoH 全污染)
+      时回退 UDP 原行为 (零回归, 无 DoH 环境不受影响)
+    """
+    if not domain:
+        return []
+    udp_box: Dict[str, List[str]] = {"ips": []}
+
+    def _udp_task():
+        udp_box["ips"] = _udp_resolve_a(domain, timeout)
+
+    t = threading.Thread(target=_udp_task, daemon=True)
+    t.start()
+    doh_ips = doh_resolve(domain, timeout=max(timeout * 3, 2.5)) if use_doh else []
+    t.join(timeout=timeout + 0.5)
+    udp_ips = udp_box["ips"]
+    if doh_ips:
+        return doh_ips
+    return udp_ips
 
 
 def _load_proxy_config() -> Optional[Tuple[str, int]]:
@@ -150,9 +217,11 @@ def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeou
 def _suspect_status(status: Optional[int]) -> bool:
     """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 或 Cloudflare 421 重路由)
 
-    注意: 500 豁免——部分服务(如 githubassets.com)对根路径返回 500 但节点真实可用
+    注意: 500 豁免——部分服务(如 githubassets.com)对根路径返回 500 但节点真实可用;
+    530 为 Cloudflare "Origin unreachable" (边缘可达但回源失败, 页面实际打不开),
+    必须判定为可疑, 否则会被误判 rank0 假可用写入 upstream。
     """
-    return status is not None and (status == 421 or 502 <= status <= 504)
+    return status is not None and (status == 421 or 530 <= status <= 530 or 502 <= status <= 504)
 
 
 def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 1.5,

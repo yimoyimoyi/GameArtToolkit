@@ -72,25 +72,25 @@ SERVICE_GROUPS = {
         "id": "gaming",
         "name": "游戏生态",
         "icon": "gamepad",
-        "desc": "Steam 全生态、Ubisoft、EA App"
+        "desc": "Steam 全生态、Epic Games、Battle.net、GOG、Xbox、Minecraft、Ubisoft、EA App"
     },
     "acg": {
         "id": "acg",
         "name": "二次元与创作者",
         "icon": "palette",
-        "desc": "Pixiv全生态、Fanbox、BOOTH、Danbooru、Yande.re、VNDB"
+        "desc": "Pixiv全生态、Fanbox、BOOTH、Danbooru、Yande.re、VNDB、Fantia、MyAnimeList"
     },
     "dev": {
         "id": "dev",
         "name": "开发者与 AI",
         "icon": "terminal",
-        "desc": "GitHub (Web/Raw/Releases)、HuggingFace、GitLab"
+        "desc": "GitHub (Web/Raw/Releases)、HuggingFace、GitLab、PyPI、npm、crates.io"
     }
 }
 
 
 # ==============================================================================
-# 21 项核心加速服务 Profile 注册表 (声明式单源定义)
+# 28 项核心加速服务 Profile 注册表 (声明式单源定义, 支持运行时动态扩展)
 # ==============================================================================
 PROFILES: List[ServiceProfile] = [
     # --------------------------------------------------------------------------
@@ -159,6 +159,72 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_ea_app",
         ssl_sni_mode="host",
         candidate_ips=["23.1.179.144", "184.27.185.73", "23.202.34.90", "23.41.142.46"]
+    ),
+    ServiceProfile(
+        id="epic_games",
+        group="gaming",
+        name="Epic Games 商店",
+        desc="Epic 游戏商店、账号与启动器服务 (Cloudflare 主站 + Akamai 图片)",
+        domains=["epicgames.com", "www.epicgames.com", "store.epicgames.com",
+                 "accounts.epicgames.com", "launcher.epicgames.com",
+                 "cdn1.epicgames.com", "cdn2.epicgames.com", "download.epicgames.com"],
+        icon="shopping_bag",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_epic_games",
+        ssl_sni_mode="host",
+        candidate_ips=["184.192.31.233", "3.211.161.78", "100.50.163.168"]  # 实测: Epic 自有 CDN 节点 (301 重定向正常)
+    ),
+    ServiceProfile(
+        id="battle_net",
+        group="gaming",
+        name="Battle.net 战网国际服",
+        desc="战网国际服账号、商店与补丁 CDN 加速 (Akamai + CloudFront)",
+        domains=["battle.net", "www.battle.net", "us.battle.net", "eu.battle.net",
+                 "kr.battle.net", "account.battle.net", "shop.battle.net",
+                 "blizzard.com", "www.blizzard.com", "us.cdn.blizzard.com",
+                 "level3.blizzard.com", "blznav.akamaized.net"],
+        icon="rocket",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_battle_net",
+        ssl_sni_mode="host",
+        candidate_ips=["99.83.192.184", "166.117.48.155", "166.117.103.183", "166.117.198.189"]  # 实测 Akamai 节点
+    ),
+
+    ServiceProfile(
+        id="gog",
+        group="gaming",
+        name="GOG 游戏商城",
+        desc="CD Projekt 旗下游戏商城与客户端分发 (Fastly Anycast)",
+        domains=["gog.com", "www.gog.com", "api.gog.com", "login.gog.com", "images.gog.com"],
+        icon="shopping_bag",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_gog",
+        ssl_sni_mode="host",
+        candidate_ips=["151.101.129.241", "151.101.1.241", "151.101.65.241", "151.101.193.241", "146.75.45.241"]
+    ),
+    ServiceProfile(
+        id="xbox",
+        group="gaming",
+        name="Xbox 微软游戏生态",
+        desc="Xbox 商店、支持与游戏生态 (Azure + Akamai)",
+        domains=["xbox.com", "www.xbox.com", "store.xbox.com", "support.xbox.com"],
+        icon="gamepad",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_xbox",
+        ssl_sni_mode="host",
+        candidate_ips=["20.76.201.171", "20.70.246.20", "20.231.239.246", "20.112.250.133", "104.83.196.58", "150.171.110.133"]
+    ),
+    ServiceProfile(
+        id="minecraft",
+        group="gaming",
+        name="Minecraft 游戏生态",
+        desc="Minecraft 官网与 Mojang 账号登录 (Akamai)",
+        domains=["minecraft.net", "www.minecraft.net", "account.mojang.com"],
+        icon="gamepad",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_minecraft",
+        ssl_sni_mode="host",
+        candidate_ips=["150.171.110.137", "184.28.7.173", "184.28.7.166", "184.28.7.164"]
     ),
 
     # --------------------------------------------------------------------------
@@ -264,6 +330,30 @@ PROFILES: List[ServiceProfile] = [
         candidate_ips=["217.182.194.133",
                        "2001:1af8:5301:117:1c00:d7ff:fe00:ffd"]  # IPv6 实测可用
     ),
+    ServiceProfile(
+        id="fantia",
+        group="acg",
+        name="Fantia 创作者赞助",
+        desc="Fanbox 竞品, 日本创作者赞助平台 (GCP)",
+        domains=["fantia.jp", "www.fantia.jp", "api.fantia.jp", "fanclub.fantia.jp"],
+        icon="star",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_fantia",
+        ssl_sni_mode="host",
+        candidate_ips=["35.241.8.68"]  # 实测 GCP 节点 (全子域 200)
+    ),
+    ServiceProfile(
+        id="myanimelist",
+        group="acg",
+        name="MyAnimeList 动漫数据库",
+        desc="动漫评分、条目与封面图数据库 (Akamai)",
+        domains=["myanimelist.net", "www.myanimelist.net", "api.myanimelist.net", "cdn.myanimelist.net"],
+        icon="book",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_myanimelist",
+        ssl_sni_mode="host",
+        candidate_ips=["23.33.126.175", "23.33.126.132", "23.33.126.174", "23.33.126.144"]
+    ),
 
     # --------------------------------------------------------------------------
     # 💻 开发者 & AI
@@ -358,6 +448,42 @@ PROFILES: List[ServiceProfile] = [
             "18.64.8.43", "18.64.8.84", "108.138.246.7",
             "54.230.71.56", "3.175.207.30", "3.175.207.31"
         ]
+    ),
+    ServiceProfile(
+        id="npm",
+        group="dev",
+        name="npm 包管理生态",
+        desc="npm 包索引与 registry 镜像加速 (Cloudflare)",
+        domains=["npmjs.com", "registry.npmjs.com", "registry.npmjs.org"],
+        icon="terminal",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_npm",
+        ssl_sni_mode="host",
+        candidate_ips=["104.17.135.117", "104.17.134.117", "104.16.1.34", "104.16.8.34", "104.16.3.34", "104.16.7.34"]
+    ),
+    ServiceProfile(
+        id="pypi",
+        group="dev",
+        name="PyPI Python 包索引",
+        desc="pip 包索引与文件分发加速 (Fastly)",
+        domains=["pypi.org", "www.pypi.org", "files.pythonhosted.org", "warehouse.python.org"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_pypi",
+        ssl_sni_mode="host",
+        candidate_ips=["151.101.64.223", "151.101.0.223", "151.101.128.223", "151.101.192.223"]
+    ),
+    ServiceProfile(
+        id="crates_io",
+        group="dev",
+        name="crates.io Rust 包索引",
+        desc="cargo 包索引与 crates.io 下载加速 (Fastly)",
+        domains=["crates.io", "www.crates.io", "index.crates.io"],
+        icon="terminal",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_crates_io",
+        ssl_sni_mode="host",
+        candidate_ips=["151.101.194.137", "151.101.2.137", "151.101.66.137", "151.101.130.137", "3.170.229.4", "146.75.46.137"]
     )
 ]
 

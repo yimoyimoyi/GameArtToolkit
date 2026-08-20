@@ -410,9 +410,16 @@ def run_full_verification():
 
     # 4.6 MainWindow 初始化与 start_acceleration 生命周期回归
     from pyside_app import MainWindow, emergency_fast_cleanup
+    from service_profile import PROFILES as _REGISTERED_PROFILES
     main_win = MainWindow()
     report.assert_true(main_win is not None, "MainWindow 实例化成功")
-    report.assert_true(len(main_win.service_icon_labels) >= 18, "主控制台服务卡片专属矢量图标全部注册成功")
+    report.assert_true(len(main_win.service_icon_labels) >= len(_REGISTERED_PROFILES),
+                       f"主控制台服务卡片专属矢量图标全部注册成功 ({len(_REGISTERED_PROFILES)}项)")
+    # 动态遍历注册表全量断言挂载 (与"可添加反代目标"架构保持一致, 不硬编码服务列表)
+    for _p in _REGISTERED_PROFILES:
+        report.assert_true(_p.id in main_win.service_cards, f"服务卡片 {_p.id} 成功挂载")
+        report.assert_true(_p.id in main_win.service_switches, f"服务开关 {_p.id} 成功挂载")
+        report.assert_true(_p.id in main_win.service_badges, f"服务测速Badge {_p.id} 成功挂载")
 
     # 4.7 测试服务卡片开关动态变色
     main_win.on_service_toggled("pixiv_web", False)

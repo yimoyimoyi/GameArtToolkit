@@ -28,15 +28,34 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证 18 项服务 Profile 完整性 (fandom/wikipedia/google_translate 已移除)"""
-        self.assertEqual(len(PROFILES), 18)
-        self.assertEqual(len(SERVICES_LIST), 18)
-        self.assertEqual(len(SERVICES_BY_ID), 18)
-        self.assertEqual(len(CANDIDATE_IPS), 18)
+        """验证服务 Profile 基准完整性 (28 项: 10 gaming + 9 acg + 9 dev; fandom/wikipedia/google_translate/dlsite/patreon 已移除)"""
+        self.assertEqual(len(PROFILES), 28)
+        self.assertEqual(len(SERVICES_LIST), 28)
+        self.assertEqual(len(SERVICES_BY_ID), 28)
+        self.assertEqual(len(CANDIDATE_IPS), 28)
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
-        self.assertIn("yandere", SERVICES_BY_ID)  # 实测直连可用, 已默认启用
+        self.assertNotIn("dlsite", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
+        self.assertNotIn("patreon", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
+        self.assertIn("yandere", SERVICES_BY_ID)
+        self.assertIn("epic_games", SERVICES_BY_ID)
+        self.assertIn("battle_net", SERVICES_BY_ID)
+        self.assertIn("gog", SERVICES_BY_ID)
+        self.assertIn("xbox", SERVICES_BY_ID)
+        self.assertIn("minecraft", SERVICES_BY_ID)
+        self.assertIn("fantia", SERVICES_BY_ID)
+        self.assertIn("myanimelist", SERVICES_BY_ID)
+        self.assertIn("npm", SERVICES_BY_ID)
+        self.assertIn("pypi", SERVICES_BY_ID)
+        self.assertIn("crates_io", SERVICES_BY_ID)
+
+    def test_steam_akamai_workshop_domains(self):
+        """steam_akamai 覆盖创意工坊图片与用户上传图域名"""
+        p = get_profile_by_id("steam_akamai")
+        for d in ["steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",
+                  "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"]:
+            self.assertIn(d, p.domains, f"steam_akamai 缺少创意工坊域名: {d}")
 
     def test_profile_lookup(self):
         """测试服务根据 ID 与域名的动态查找与通配匹配"""
@@ -206,9 +225,3 @@ class TestNginxConfigValidation(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-    def test_steam_akamai_workshop_domains(self):
-        """steam_akamai 覆盖创意工坊图片与用户上传图域名"""
-        p = get_profile_by_id("steam_akamai")
-        for d in ["steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",
-                  "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"]:
-            self.assertIn(d, p.domains, f"steam_akamai 缺少创意工坊域名: {d}")

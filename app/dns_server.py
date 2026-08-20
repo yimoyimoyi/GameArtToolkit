@@ -58,6 +58,45 @@ def parse_dns_query(data: bytes) -> Tuple[int, str, int, int]:
     return tx_id, domain, qtype, qclass
 
 
+def _extract_a_ips(resp: bytes) -> List[str]:
+    """从 DNS 响应报文中提取全部 A 记录 (IPv4) IP 列表 (供污染检测)"""
+    if len(resp) < 12:
+        return []
+    ancount = struct.unpack("!H", resp[6:8])[0]
+    if ancount == 0:
+        return []
+    # 跳过 Question 块 (兼容压缩指针)
+    off = 12
+    while off < len(resp):
+        length = resp[off]
+        if length == 0:
+            off += 5  # 0x00 + QType(2B) + QClass(2B)
+            break
+        if length >= 192:  # 0xC0 指针
+            off += 2
+            break
+        off += 1 + length
+    ips: List[str] = []
+    for _ in range(ancount):
+        if off + 2 > len(resp):
+            break
+        # Answer Name: 压缩指针 (2B) 或 label 序列
+        if resp[off] & 0xC0 == 0xC0:
+            off += 2
+        else:
+            while off < len(resp) and resp[off] != 0:
+                off += resp[off] + 1
+            off += 1
+        if off + 10 > len(resp):
+            break
+        rtype, _, _, rdlen = struct.unpack("!HHIH", resp[off:off + 10])
+        off += 10
+        if rtype == 1 and rdlen == 4 and off + 4 <= len(resp):
+            ips.append(socket.inet_ntoa(resp[off:off + 4]))
+        off += rdlen
+    return ips
+
+
 def build_dns_a_response(raw_query: bytes, tx_id: int, ip_str: str, ttl: int = 60) -> bytes:
     """构建标准 DNS A 记录应答报文"""
     # 找到 Question 块的结束位置
@@ -149,7 +188,14 @@ class LocalDnsServer:
         return None
 
     def _forward_upstream(self, raw_query: bytes) -> Optional[bytes]:
-        """将非目标 DNS 查询透明递归转发给上游公共 DNS (支持多上游自动容灾)"""
+        """将非目标 DNS 查询透明递归转发给上游公共 DNS (UDP + DoH 双通道容灾)
+
+        UDP 响应命中已知污染 IP 段时 (GFW 对封禁域名注入伪造解析),
+        改用 DoH 干净解析重建 A 记录响应 (DoH 加密查询无法被注入)。
+        """
+        # 延迟导入避免模块循环依赖 (cdn_optimizer 仅延迟引用 l4_relay, 无循环)
+        from cdn_optimizer import doh_resolve, POLLUTED_IP_PREFIXES
+        tx_id, q_domain, qtype, _ = parse_dns_query(raw_query)
         for dns_ip in self.upstream_dns_list:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as up_sock:
@@ -157,6 +203,13 @@ class LocalDnsServer:
                     up_sock.sendto(raw_query, (dns_ip, self.upstream_port))
                     resp, _ = up_sock.recvfrom(4096)
                     if resp:
+                        # DoH 双通道兜底: 仅 A 记录查询且 UDP 结果命中污染段时重建
+                        if q_domain and qtype == 1:
+                            udp_ips = _extract_a_ips(resp)
+                            if udp_ips and any(ip.startswith(POLLUTED_IP_PREFIXES) for ip in udp_ips):
+                                doh_ips = doh_resolve(q_domain)
+                                if doh_ips:
+                                    return build_dns_a_response(raw_query, tx_id, doh_ips[0])
                         return resp
             except Exception:
                 continue
