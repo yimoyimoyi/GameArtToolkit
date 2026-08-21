@@ -3070,6 +3070,16 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # 0. 命令行极速静默响应 (安装包/卸载器/脚本调用，无界面 0.1s 极速还原)
+    if "--clean-hosts-silent" in sys.argv or "--clean-hosts" in sys.argv:
+        try:
+            from hosts_manager import HostsManager
+            ok, msg = HostsManager().remove_rules()
+            print(f"[CleanHosts] {msg}")
+        except Exception as e:
+            print(f"[CleanHosts Error] {e}")
+        sys.exit(0)
+
     # 1. 如果通过控制台或旧批处理启动，静默隐藏终端窗口
     hide_console_window()
 
