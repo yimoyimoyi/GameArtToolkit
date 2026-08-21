@@ -20,7 +20,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPainterPath, QLinearGradient,
-    QRadialGradient, QMouseEvent, QKeyEvent, QFocusEvent
+    QRadialGradient, QMouseEvent, QKeyEvent, QFocusEvent, QFontMetrics
 )
 from PySide6.QtWidgets import (
     QLayout, QStackedWidget, QLayoutItem,
@@ -53,78 +53,172 @@ except ImportError:
     ThemeManager = _DummyThemeManager
 
 class FlowLayout(QLayout):
-    def __init__(self, parent=None, margin=0, h_spacing=10, v_spacing=10):
+    """
+    MD3 响应式弹性流式布局 (Flex Flow / Auto-Fit Grid)
+    特性:
+    1. 自动忽略隐藏控件 (搜索/过滤时即时紧凑重流)
+    2. 支持 Auto-Fit 弹性均分平铺 (解决右侧留白问题，模拟 CSS repeat(auto-fit, minmax(min_w, 1fr)))
+    3. 支持 min_item_width / max_item_width 约束与 DPI 比例自适应
+    4. 高精度 Height-For-Width 几何计算，杜绝 QScrollArea 震荡抖动
+    """
+    def __init__(self, parent=None, margin=0, h_spacing=10, v_spacing=10,
+                 min_item_width=0, max_item_width=0, flex_fill=True):
         super().__init__(parent)
         self.setContentsMargins(margin, margin, margin, margin)
         self._h_spacing = h_spacing
         self._v_spacing = v_spacing
-        self.itemList = []
+        self._min_item_width = min_item_width
+        self._max_item_width = max_item_width
+        self._flex_fill = flex_fill
+        self.itemList: List[QLayoutItem] = []
 
-    def addItem(self, item):
+    def set_item_constraints(self, min_width=0, max_width=0, flex_fill=True):
+        self._min_item_width = min_width
+        self._max_item_width = max_width
+        self._flex_fill = flex_fill
+        self.invalidate()
+
+    def addItem(self, item: QLayoutItem):
         self.itemList.append(item)
 
-    def count(self):
+    def count(self) -> int:
         return len(self.itemList)
 
-    def itemAt(self, index):
+    def itemAt(self, index: int) -> Optional[QLayoutItem]:
         if 0 <= index < len(self.itemList):
             return self.itemList[index]
         return None
 
-    def takeAt(self, index):
+    def takeAt(self, index: int) -> Optional[QLayoutItem]:
         if 0 <= index < len(self.itemList):
             return self.itemList.pop(index)
         return None
 
-    def expandingDirections(self):
+    def expandingDirections(self) -> Qt.Orientation:
+        if self._flex_fill:
+            return Qt.Orientation.Horizontal
         return Qt.Orientation(0)
 
-    def hasHeightForWidth(self):
+    def hasHeightForWidth(self) -> bool:
         return True
 
-    def heightForWidth(self, width):
-        return self.do_layout(QRect(0, 0, width, 0), True)
+    def heightForWidth(self, width: int) -> int:
+        return self.do_layout(QRect(0, 0, width, 0), test_only=True)
 
-    def setGeometry(self, rect):
+    def setGeometry(self, rect: QRect):
         super().setGeometry(rect)
-        self.do_layout(rect, False)
+        self.do_layout(rect, test_only=False)
 
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         return self.minimumSize()
 
-    def minimumSize(self):
+    def minimumSize(self) -> QSize:
         size = QSize()
+        visible_count = 0
         for item in self.itemList:
+            w = item.widget()
+            if w and w.isHidden():
+                continue
+            visible_count += 1
             size = size.expandedTo(item.minimumSize())
         m = self.contentsMargins()
-        size += QSize(m.left() + m.right(), m.top() + m.bottom())
-        return size
+        if visible_count == 0:
+            return QSize(m.left() + m.right(), m.top() + m.bottom())
+        min_w = self._min_item_width if self._min_item_width > 0 else size.width()
+        return QSize(min_w + m.left() + m.right(), size.height() + m.top() + m.bottom())
 
-    def do_layout(self, rect, test_only):
+    def do_layout(self, rect: QRect, test_only: bool) -> int:
         m = self.contentsMargins()
         effective_rect = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        avail_width = max(1, effective_rect.width())
+
+        # 1. 过滤未显式隐藏的项目 (使用 isHidden 兼容未 show 树与显式过滤)
+        visible_items = []
+        for item in self.itemList:
+            w = item.widget()
+            if w and w.isHidden():
+                continue
+            visible_items.append(item)
+
+        if not visible_items:
+            return m.top() + m.bottom()
+
+        # 2. 确定卡片基准宽度与列数
+        first_hint = visible_items[0].sizeHint()
+        min_widget_w = max((item.minimumSize().width() for item in visible_items), default=0)
+        fallback_min_w = max(self._min_item_width, min_widget_w)
+        if fallback_min_w <= 0:
+            fallback_min_w = first_hint.width() or 200
+        fallback_min_w = max(40, fallback_min_w)
+
+        if self._flex_fill:
+            # Auto-Fit 计算最大容纳列数: floor((avail_width + gap) / (min_w + gap))
+            cols = max(1, (avail_width + self._h_spacing) // (fallback_min_w + self._h_spacing))
+            total_gaps = (cols - 1) * self._h_spacing
+            if cols == 1:
+                # 单列时自适应填充可用宽度，避免在极窄宽度下右侧溢出
+                flex_width = avail_width
+            else:
+                flex_width = max(fallback_min_w, (avail_width - total_gaps) // cols)
+            if self._max_item_width > 0:
+                flex_width = min(flex_width, self._max_item_width)
+        else:
+            cols = 0
+            flex_width = 0
+
+        # 3. 进行网格/流式几何排布
         x = effective_rect.x()
         y = effective_rect.y()
         line_height = 0
+        current_col = 0
 
-        for item in self.itemList:
-            item_width = item.sizeHint().width()
-            item_height = item.sizeHint().height()
+        for item in visible_items:
+            item_w = flex_width if self._flex_fill else item.sizeHint().width()
 
-            next_x = x + item_width
-            if next_x > effective_rect.right() and line_height > 0:
-                x = effective_rect.x()
-                y = y + line_height + self._v_spacing
-                next_x = x + item_width
-                line_height = 0
+            # 优先探测 heightForWidth 动态高度
+            if item.hasHeightForWidth():
+                item_h = item.heightForWidth(item_w)
+            elif item.widget() and item.widget().hasHeightForWidth():
+                item_h = item.widget().heightForWidth(item_w)
+            else:
+                item_hint = item.sizeHint()
+                item_h = item_hint.height() if item_hint.height() > 0 else 40
 
-            if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+            min_h = item.minimumSize().height()
+            if min_h > 0:
+                item_h = max(item_h, min_h)
 
-            x += item_width + self._h_spacing
-            line_height = max(line_height, item_height)
+            if self._flex_fill and cols > 0:
+                if current_col >= cols:
+                    x = effective_rect.x()
+                    y = y + line_height + self._v_spacing
+                    line_height = 0
+                    current_col = 0
+
+                if not test_only:
+                    item.setGeometry(QRect(x, y, item_w, item_h))
+
+                x += item_w + self._h_spacing
+                line_height = max(line_height, item_h)
+                current_col += 1
+            else:
+                next_x = x + item_w
+                if next_x > effective_rect.x() + effective_rect.width() and line_height > 0:
+                    x = effective_rect.x()
+                    y = y + line_height + self._v_spacing
+                    next_x = x + item_w
+                    line_height = 0
+
+                if not test_only:
+                    item.setGeometry(QRect(x, y, item_w, item_h))
+
+                x += item_w + self._h_spacing
+                line_height = max(line_height, item_h)
 
         return y + line_height - rect.y() + m.bottom()
+
+
+FlexFlowLayout = FlowLayout
 
 class AnimatedStackedWidget(QStackedWidget):
     """
@@ -1166,22 +1260,56 @@ class TrafficMonitorChart(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(path_down)
 
-        # 6. 顶部指标排版
+        # 6. 顶部指标排版 (自适应防重叠与字体测量)
         curr_down = self.down_speeds[-1]
         down_txt = f"↓ 下载: {curr_down:.1f} KB/s" if curr_down < 1024 else f"↓ 下载: {curr_down/1024.0:.2f} MB/s"
-        painter.setPen(down_color)
-        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        painter.drawText(QRectF(18, 10, 160, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
-
         curr_up = self.up_speeds[-1]
         up_txt = f"↑ 上传: {curr_up:.1f} KB/s"
-        painter.setPen(up_color)
-        painter.drawText(QRectF(190, 10, 130, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
-
         req_txt = f"已加速请求: {self.total_requests} 次"
-        painter.setPen(QColor(palette.get("text_muted", "#75879E")))
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.drawText(QRectF(w - 240, 10, 222, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
+
+        font_rate = QFont("Segoe UI", 10, QFont.Bold)
+        font_req = QFont("Segoe UI", 9)
+        fm_rate = QFontMetrics(font_rate)
+        fm_req = QFontMetrics(font_req)
+
+        down_w = fm_rate.horizontalAdvance(down_txt) + 8
+        up_w = fm_rate.horizontalAdvance(up_txt) + 8
+        req_w = fm_req.horizontalAdvance(req_txt) + 8
+
+        # 检查是否可以单行容纳全部 3 个指标
+        min_single_row_w = 18 + down_w + 14 + up_w + 16 + req_w + 18
+        if w >= min_single_row_w:
+            # 宽屏单行排布: 左侧下载、中间上传、右侧请求数
+            painter.setFont(font_rate)
+            painter.setPen(down_color)
+            painter.drawText(QRectF(18, 10, down_w, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
+
+            painter.setPen(up_color)
+            painter.drawText(QRectF(18 + down_w + 14, 10, up_w, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
+
+            painter.setFont(font_req)
+            painter.setPen(QColor(palette.get("text_muted", "#75879E")))
+            painter.drawText(QRectF(w - req_w - 18, 10, req_w, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
+        else:
+            # 窄屏/高缩放排布: 优先保证下载与上传速率清晰展示
+            painter.setFont(font_rate)
+            painter.setPen(down_color)
+            painter.drawText(QRectF(14, 10, down_w, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
+
+            avail_for_up = w - (14 + down_w + 10) - 14
+            if avail_for_up >= up_w:
+                painter.setPen(up_color)
+                painter.drawText(QRectF(14 + down_w + 10, 10, up_w, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
+            else:
+                painter.setPen(up_color)
+                painter.drawText(QRectF(14 + down_w + 10, 10, max(20.0, avail_for_up), 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
+
+            # 请求数仅在有充足间隙时绘制于右侧，避免覆盖上传速率
+            req_left = w - req_w - 14
+            if req_left > 14 + down_w + 10 + up_w + 12:
+                painter.setFont(font_req)
+                painter.setPen(QColor(palette.get("text_muted", "#75879E")))
+                painter.drawText(QRectF(req_left, 10, req_w, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
 
         painter.end()
 

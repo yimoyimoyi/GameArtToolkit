@@ -325,8 +325,10 @@ class SteamAccountCard(QFrame):
         meta_box.setSpacing(3)
         lbl_persona = QLabel(acc.get("persona_name", "未知用户"))
         lbl_persona.setProperty("class", "AccountName")
+        lbl_persona.setWordWrap(True)
         lbl_acc_name = QLabel(f"登录名: {acc.get('account_name', '')}")
         lbl_acc_name.setProperty("class", "AccountSteamId")
+        lbl_acc_name.setWordWrap(True)
 
         # 原位备注编辑组件 (Inline Edit)
         self.inline_alias = InlineEditableLabel(
@@ -356,6 +358,7 @@ class SteamAccountCard(QFrame):
         time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "未知"
         lbl_time = QLabel(f"最后登录: {time_str}")
         lbl_time.setProperty("class", "AccountHint")
+        lbl_time.setWordWrap(True)
         bot_box.addWidget(lbl_time)
         bot_box.addStretch()
 
@@ -387,7 +390,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1200, 800)
-        self.setMinimumSize(1020, 660)
+        self.setMinimumSize(1080, 680)
         self.setWindowIcon(get_app_icon())
 
         self.frameless_helper = None
@@ -819,6 +822,7 @@ class MainWindow(QMainWindow):
         self.lbl_main_status.setProperty("class", "MainStatusTitle")
         self.lbl_main_sub = QLabel("点击右侧按钮开启本地代理与 Hosts 规则接管")
         self.lbl_main_sub.setProperty("class", "MainStatusSub")
+        self.lbl_main_sub.setWordWrap(True)
         mc_info.addWidget(self.lbl_main_status)
         mc_info.addWidget(self.lbl_main_sub)
 
@@ -874,8 +878,10 @@ class MainWindow(QMainWindow):
             grp_title_box = QVBoxLayout()
             grp_title = QLabel(grp_info['name'])
             grp_title.setProperty("class", "CategoryTitle")
+            grp_title.setWordWrap(True)
             grp_desc = QLabel(grp_info["desc"])
             grp_desc.setProperty("class", "CategoryDesc")
+            grp_desc.setWordWrap(True)
             grp_title_box.addWidget(grp_title)
             grp_title_box.addWidget(grp_desc)
             grp_header.addLayout(grp_title_box)
@@ -893,15 +899,13 @@ class MainWindow(QMainWindow):
             grp_header.addWidget(btn_disable_all)
             grp_card_layout.addLayout(grp_header)
 
-            items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10)
+            items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10, min_item_width=320, max_item_width=520)
 
             grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
             for idx, srv in enumerate(grp_services):
                 sid = srv["id"]
                 s_item = QFrame()
                 s_item.setProperty("class", "ServiceItem")
-                s_item.setMinimumWidth(280)
-                s_item.setMaximumWidth(460)
                 s_item.setMinimumHeight(56)
                 self.service_cards[sid] = s_item
                 si_layout = QHBoxLayout(s_item)
@@ -922,8 +926,10 @@ class MainWindow(QMainWindow):
                 si_text_box.setSpacing(2)
                 si_name = QLabel(srv["name"])
                 si_name.setProperty("class", "ItemTitle")
+                si_name.setWordWrap(True)
                 si_desc = QLabel(srv["desc"])
                 si_desc.setProperty("class", "ItemDesc")
+                si_desc.setWordWrap(True)
                 si_text_box.addWidget(si_name)
                 si_text_box.addWidget(si_desc)
                 si_layout.addLayout(si_text_box)
@@ -961,6 +967,7 @@ class MainWindow(QMainWindow):
     def create_stat_card(self, label: str, value: str, hint: str, icon_name: str = "zap") -> QFrame:
         card = QFrame()
         card.setProperty("class", "StatCard")
+        card.setMinimumWidth(140)
         l = QVBoxLayout(card)
         l.setContentsMargins(14, 12, 14, 12)
         l.setSpacing(4)
@@ -968,6 +975,7 @@ class MainWindow(QMainWindow):
         top_l = QHBoxLayout()
         lbl_title = QLabel(label)
         lbl_title.setProperty("class", "StatLabel")
+        lbl_title.setWordWrap(True)
         top_l.addWidget(lbl_title)
         top_l.addStretch()
 
@@ -982,13 +990,17 @@ class MainWindow(QMainWindow):
 
         lbl_val = QLabel(value)
         lbl_val.setProperty("class", "StatValue")
+        lbl_val.setWordWrap(True)
         lbl_hint = QLabel(hint)
         lbl_hint.setProperty("class", "StatHint")
+        lbl_hint.setWordWrap(True)
 
         l.addWidget(lbl_val)
         l.addWidget(lbl_hint)
 
         card.lbl_val = lbl_val
+        card.lbl_title = lbl_title
+        card.lbl_hint = lbl_hint
         card.icon_lbl = icon_lbl
         card.icon_name = icon_name
         return card
@@ -1129,7 +1141,7 @@ class MainWindow(QMainWindow):
         sb_layout.addLayout(sb_text_box)
         layout.addWidget(self.steam_banner)
 
-        self.accounts_container = FlowLayout(h_spacing=14, v_spacing=14)
+        self.accounts_container = FlowLayout(h_spacing=14, v_spacing=14, min_item_width=320, max_item_width=480)
         layout.addLayout(self.accounts_container)
         layout.addStretch()
 
@@ -1182,8 +1194,8 @@ class MainWindow(QMainWindow):
         for idx, acc in enumerate(accounts):
             is_active = acc.get("is_active", False)
             card = SteamAccountCard(acc, is_active, self)
-            card.setMinimumWidth(360)
-            card.setMaximumWidth(460)
+            card.setMinimumWidth(320)
+            card.setMaximumWidth(480)
             card.double_clicked.connect(self.switch_steam_account)
             self.accounts_container.addWidget(card)
 
@@ -1323,6 +1335,7 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
         is_dark = ThemeManager.get_instance().is_dark
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
         star_color = "#FBBF24" if is_dark else "#D97706"
         new_cached_lats = {}
 
@@ -1350,6 +1363,7 @@ class MainWindow(QMainWindow):
             card_top = QHBoxLayout()
             lbl_title = QLabel(f"{name} (共 {len(ip_list)} 个候选 IP)")
             lbl_title.setProperty("class", "CategoryTitle")
+            lbl_title.setWordWrap(True)
             card_top.addWidget(lbl_title)
             card_top.addStretch()
 
@@ -1363,13 +1377,12 @@ class MainWindow(QMainWindow):
             card_top.addWidget(btn_single)
             card_l.addLayout(card_top)
 
-            grid = FlowLayout(margin=0, h_spacing=8, v_spacing=8)
+            grid = FlowLayout(margin=0, h_spacing=8, v_spacing=8, min_item_width=230, max_item_width=380)
             for idx, item in enumerate(ip_list):
                 ip_item = QFrame()
                 is_best = idx == 0 and item["available"]
                 ip_item.setProperty("class", "CdnIpCardBest" if is_best else "CdnIpCard")
-                ip_item.setMinimumWidth(180)
-                ip_item.setMaximumWidth(260)
+                ip_item.setMinimumHeight(32)
 
                 il = QHBoxLayout(ip_item)
                 il.setContentsMargins(10, 6, 10, 6)
@@ -1606,6 +1619,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((e_icon, "shield"))
         lbl_e_title = QLabel("网络环境与代理共存诊断")
         lbl_e_title.setProperty("class", "SectionHeaderTitle")
+        lbl_e_title.setWordWrap(True)
         e_title_box.addWidget(e_icon)
         e_title_box.addWidget(lbl_e_title)
         e_title_box.addStretch()
@@ -1618,10 +1632,13 @@ class MainWindow(QMainWindow):
 
         self.lbl_env_sys_proxy = QLabel("系统代理: 检测中...")
         self.lbl_env_sys_proxy.setProperty("class", "ItemTitle")
+        self.lbl_env_sys_proxy.setWordWrap(True)
         self.lbl_env_ports = QLabel("活跃代理: 检测中...")
         self.lbl_env_ports.setProperty("class", "ItemDesc")
+        self.lbl_env_ports.setWordWrap(True)
         self.lbl_env_summary = QLabel("共存状态: GameArt Toolkit 仅接管指定加速域名，可与第三方代理安全共存。")
         self.lbl_env_summary.setProperty("class", "ItemDesc")
+        self.lbl_env_summary.setWordWrap(True)
 
         e_layout.addWidget(self.lbl_env_sys_proxy)
         e_layout.addWidget(self.lbl_env_ports)
@@ -1641,6 +1658,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((g_icon, "settings"))
         lbl_g_title = QLabel("常规偏好与系统外观")
         lbl_g_title.setProperty("class", "SectionHeaderTitle")
+        lbl_g_title.setWordWrap(True)
         g_title_box.addWidget(g_icon)
         g_title_box.addWidget(lbl_g_title)
         g_title_box.addStretch()
@@ -1652,8 +1670,10 @@ class MainWindow(QMainWindow):
         r_th_text.setSpacing(2)
         lbl_th_title = QLabel("外观主题模式")
         lbl_th_title.setProperty("class", "ItemTitle")
+        lbl_th_title.setWordWrap(True)
         lbl_th_desc = QLabel("支持跟随 Windows 10/11 系统明暗模式自动切换，或强制指定深色/浅色")
         lbl_th_desc.setProperty("class", "ItemDesc")
+        lbl_th_desc.setWordWrap(True)
         r_th_text.addWidget(lbl_th_title)
         r_th_text.addWidget(lbl_th_desc)
         row_theme.addLayout(r_th_text)
@@ -1680,8 +1700,10 @@ class MainWindow(QMainWindow):
         r_as_text.setSpacing(2)
         lbl_as_title = QLabel("开机自动启动 GameArt Toolkit")
         lbl_as_title.setProperty("class", "ItemTitle")
+        lbl_as_title.setWordWrap(True)
         lbl_as_desc = QLabel("写入 Windows 注册表当前用户启动项 (HKCU)，无需管理员提权即可在开机时常驻自启")
         lbl_as_desc.setProperty("class", "ItemDesc")
+        lbl_as_desc.setWordWrap(True)
         r_as_text.addWidget(lbl_as_title)
         r_as_text.addWidget(lbl_as_desc)
         row_autostart.addLayout(r_as_text)
@@ -1692,13 +1714,35 @@ class MainWindow(QMainWindow):
         row_autostart.addWidget(self.sw_autostart)
         g_layout.addLayout(row_autostart)
 
-        # 1.3 关闭窗口动作
+        # 1.3 启动时最小化至系统托盘 (直接在后台运行)
+        row_minimized = QHBoxLayout()
+        r_min_text = QVBoxLayout()
+        r_min_text.setSpacing(2)
+        lbl_min_title = QLabel("启动时最小化至系统托盘 (直接在后台运行)")
+        lbl_min_title.setProperty("class", "ItemTitle")
+        lbl_min_title.setWordWrap(True)
+        lbl_min_desc = QLabel("程序启动时不显示主窗口界面，直接最小化至右下角系统托盘静默常驻")
+        lbl_min_desc.setProperty("class", "ItemDesc")
+        lbl_min_desc.setWordWrap(True)
+        r_min_text.addWidget(lbl_min_title)
+        r_min_text.addWidget(lbl_min_desc)
+        row_minimized.addLayout(r_min_text)
+        row_minimized.addStretch()
+
+        self.sw_start_minimized = MDSwitch(checked=cfg.get("start_minimized", False))
+        self.sw_start_minimized.toggled.connect(self.on_start_minimized_toggled)
+        row_minimized.addWidget(self.sw_start_minimized)
+        g_layout.addLayout(row_minimized)
+
+        # 1.4 关闭窗口动作
         row_close = QVBoxLayout()
         row_close.setSpacing(6)
         lbl_cl_title = QLabel("主窗口关闭按钮动作 (X)")
         lbl_cl_title.setProperty("class", "ItemTitle")
+        lbl_cl_title.setWordWrap(True)
         lbl_cl_desc = QLabel("自定义点击窗口右上角关闭按钮时的默认处理方式")
         lbl_cl_desc.setProperty("class", "ItemDesc")
+        lbl_cl_desc.setWordWrap(True)
         row_close.addWidget(lbl_cl_title)
         row_close.addWidget(lbl_cl_desc)
 
@@ -1719,21 +1763,23 @@ class MainWindow(QMainWindow):
         row_close.addLayout(cl_radio_box)
         g_layout.addLayout(row_close)
 
-        # 1.4 托盘气泡通知
+        # 1.5 系统托盘与运行气泡提示 (不再弹出提示)
         row_notif = QHBoxLayout()
         r_nt_text = QVBoxLayout()
         r_nt_text.setSpacing(2)
-        lbl_nt_title = QLabel("系统托盘气泡通知")
+        lbl_nt_title = QLabel("系统托盘与运行气泡提示")
         lbl_nt_title.setProperty("class", "ItemTitle")
-        lbl_nt_desc = QLabel("在窗口最小化至托盘、服务启停或 Hosts 权限异常时弹出 Windows 系统提示")
+        lbl_nt_title.setWordWrap(True)
+        lbl_nt_desc = QLabel("关闭后将彻底静默，在窗口最小化、后台运行、服务启停或异常时均不再弹出 Windows 系统提示")
         lbl_nt_desc.setProperty("class", "ItemDesc")
+        lbl_nt_desc.setWordWrap(True)
         r_nt_text.addWidget(lbl_nt_title)
         r_nt_text.addWidget(lbl_nt_desc)
         row_notif.addLayout(r_nt_text)
         row_notif.addStretch()
 
         self.sw_tray_notif = MDSwitch(checked=cfg.get("tray_notifications", True))
-        self.sw_tray_notif.toggled.connect(lambda c: update_config_key("tray_notifications", c))
+        self.sw_tray_notif.toggled.connect(self.on_tray_notif_toggled)
         row_notif.addWidget(self.sw_tray_notif)
         g_layout.addLayout(row_notif)
 
@@ -1752,6 +1798,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((h_icon, "file_text"))
         lbl_h_title = QLabel("Hosts 托管与退出清理")
         lbl_h_title.setProperty("class", "SectionHeaderTitle")
+        lbl_h_title.setWordWrap(True)
         h_title_box.addWidget(h_icon)
         h_title_box.addWidget(lbl_h_title)
         h_title_box.addStretch()
@@ -1763,8 +1810,10 @@ class MainWindow(QMainWindow):
         r_he_text.setSpacing(2)
         lbl_he_title = QLabel("退出与关机时自动修正/还原 Hosts")
         lbl_he_title.setProperty("class", "ItemTitle")
+        lbl_he_title.setWordWrap(True)
         lbl_he_desc = QLabel("退出或 Windows 关机/重启时，自动清理加速规则并刷新 DNS 缓存，避免断网")
         lbl_he_desc.setProperty("class", "ItemDesc")
+        lbl_he_desc.setWordWrap(True)
         r_he_text.addWidget(lbl_he_title)
         r_he_text.addWidget(lbl_he_desc)
         row_h_exit.addLayout(r_he_text)
@@ -1781,8 +1830,10 @@ class MainWindow(QMainWindow):
         r_hh_text.setSpacing(2)
         lbl_hh_title = QLabel("启动时自动环境检查")
         lbl_hh_title.setProperty("class", "ItemTitle")
+        lbl_hh_title.setWordWrap(True)
         lbl_hh_desc = QLabel("启动时自动检测并修复非正常关机残留、只读/隐藏限制属性及破损不对称标签")
         lbl_hh_desc.setProperty("class", "ItemDesc")
+        lbl_hh_desc.setWordWrap(True)
         r_hh_text.addWidget(lbl_hh_title)
         r_hh_text.addWidget(lbl_hh_desc)
         row_h_heal.addLayout(r_hh_text)
@@ -1823,6 +1874,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((ct_icon, "zap"))
         lbl_ct_title = QLabel("IPv4 / IPv6 协议偏好与 CDN 性能微调")
         lbl_ct_title.setProperty("class", "SectionHeaderTitle")
+        lbl_ct_title.setWordWrap(True)
         ct_title_box.addWidget(ct_icon)
         ct_title_box.addWidget(lbl_ct_title)
         ct_title_box.addStretch()
@@ -1834,8 +1886,10 @@ class MainWindow(QMainWindow):
         r_im_text.setSpacing(2)
         lbl_im_title = QLabel("测速与节点优选协议偏好")
         lbl_im_title.setProperty("class", "ItemTitle")
+        lbl_im_title.setWordWrap(True)
         lbl_im_desc = QLabel("推荐 IPv4 优先以防止部分宽带 IPv6 Anycast 跨洋绕路；纯 v6 环境可选择 IPv6 优先")
         lbl_im_desc.setProperty("class", "ItemDesc")
+        lbl_im_desc.setWordWrap(True)
         r_im_text.addWidget(lbl_im_title)
         r_im_text.addWidget(lbl_im_desc)
         row_ip_mode.addLayout(r_im_text)
@@ -1862,6 +1916,7 @@ class MainWindow(QMainWindow):
 
         lbl_to = QLabel("单节点超时门限:")
         lbl_to.setProperty("class", "ItemTitle")
+        lbl_to.setWordWrap(True)
         self.cmb_timeout = NoWheelComboBox()
         self.cmb_timeout.addItem("0.8 秒 (极速探测)", 0.8)
         self.cmb_timeout.addItem("1.5 秒 (推荐标准)", 1.5)
@@ -1876,6 +1931,7 @@ class MainWindow(QMainWindow):
 
         lbl_wk = QLabel("最大并发线程:")
         lbl_wk.setProperty("class", "ItemTitle")
+        lbl_wk.setWordWrap(True)
         self.cmb_workers = NoWheelComboBox()
         self.cmb_workers.addItem("8 线程 (低占用)", 8)
         self.cmb_workers.addItem("16 线程 (推荐标准)", 16)
@@ -1902,8 +1958,10 @@ class MainWindow(QMainWindow):
         r_cs_text.setSpacing(2)
         lbl_cs_title = QLabel("启动时自动测速并优选 CDN 节点")
         lbl_cs_title.setProperty("class", "ItemTitle")
+        lbl_cs_title.setWordWrap(True)
         lbl_cs_desc = QLabel("客户端启动后在后台静默并发探测候选节点延迟，自动选举最低延迟 IP 并热重载生效")
         lbl_cs_desc.setProperty("class", "ItemDesc")
+        lbl_cs_desc.setWordWrap(True)
         r_cs_text.addWidget(lbl_cs_title)
         r_cs_text.addWidget(lbl_cs_desc)
         row_cdn_startup.addLayout(r_cs_text)
@@ -1920,8 +1978,10 @@ class MainWindow(QMainWindow):
         r_coe_text.setSpacing(2)
         lbl_coe_title = QLabel("仅测速当前已勾选启用的加速服务")
         lbl_coe_title.setProperty("class", "ItemTitle")
+        lbl_coe_title.setWordWrap(True)
         lbl_coe_desc = QLabel("开启时启动测速仅探测已启用的服务 (耗时缩短至 2~3 秒)；关闭时将探测全量 18 项服务")
         lbl_coe_desc.setProperty("class", "ItemDesc")
+        lbl_coe_desc.setWordWrap(True)
         r_coe_text.addWidget(lbl_coe_title)
         r_coe_text.addWidget(lbl_coe_desc)
         row_cdn_only_en.addLayout(r_coe_text)
@@ -1938,6 +1998,7 @@ class MainWindow(QMainWindow):
 
         lbl_db = QLabel("启动测速防抖间隔:")
         lbl_db.setProperty("class", "ItemTitle")
+        lbl_db.setWordWrap(True)
         self.cmb_debounce = NoWheelComboBox()
         self.cmb_debounce.addItem("15 分钟", 15)
         self.cmb_debounce.addItem("30 分钟 (推荐)", 30)
@@ -1952,6 +2013,7 @@ class MainWindow(QMainWindow):
 
         lbl_hl = QLabel("健康巡检周期:")
         lbl_hl.setProperty("class", "ItemTitle")
+        lbl_hl.setWordWrap(True)
         self.cmb_health_freq = NoWheelComboBox()
         self.cmb_health_freq.addItem("15 秒 (高灵敏)", 15)
         self.cmb_health_freq.addItem("30 秒 (推荐)", 30)
@@ -1987,6 +2049,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((p_icon, "wifi"))
         lbl_p_title = QLabel("测速代理设置")
         lbl_p_title.setProperty("class", "SectionHeaderTitle")
+        lbl_p_title.setWordWrap(True)
         p_title_box.addWidget(p_icon)
         p_title_box.addWidget(lbl_p_title)
         p_title_box.addStretch()
@@ -1997,8 +2060,10 @@ class MainWindow(QMainWindow):
         r_pe_text.setSpacing(2)
         lbl_pe_title = QLabel("启用测速专用本地代理")
         lbl_pe_title.setProperty("class", "ItemTitle")
+        lbl_pe_title.setWordWrap(True)
         lbl_pe_desc = QLabel("通过本地 Clash / Sing-box / v2ray 混合代理端口并发探测境外 Anycast 延迟 (仅供节点筛选)")
         lbl_pe_desc.setProperty("class", "ItemDesc")
+        lbl_pe_desc.setWordWrap(True)
         r_pe_text.addWidget(lbl_pe_title)
         r_pe_text.addWidget(lbl_pe_desc)
         row_pxy_en.addLayout(r_pe_text)
@@ -2015,12 +2080,14 @@ class MainWindow(QMainWindow):
 
         lbl_phost = QLabel("代理主机:")
         lbl_phost.setProperty("class", "ItemTitle")
+        lbl_phost.setWordWrap(True)
         self.txt_proxy_host = QLineEdit(proxy_cfg.get("host", "127.0.0.1"))
         self.txt_proxy_host.setFixedWidth(130)
         self.txt_proxy_host.textChanged.connect(self.on_proxy_config_changed)
 
         lbl_pport = QLabel("代理端口:")
         lbl_pport.setProperty("class", "ItemTitle")
+        lbl_pport.setWordWrap(True)
         self.txt_proxy_port = QLineEdit(str(proxy_cfg.get("port", 7897)))
         self.txt_proxy_port.setFixedWidth(80)
         self.txt_proxy_port.textChanged.connect(self.on_proxy_config_changed)
@@ -2052,6 +2119,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((d_icon, "activity"))
         lbl_d_title = QLabel("本地 DNS 智能分流与上游解析服务器")
         lbl_d_title.setProperty("class", "SectionHeaderTitle")
+        lbl_d_title.setWordWrap(True)
         d_title_box.addWidget(d_icon)
         d_title_box.addWidget(lbl_d_title)
         d_title_box.addStretch()
@@ -2063,8 +2131,10 @@ class MainWindow(QMainWindow):
         r_dns_text.setSpacing(2)
         lbl_dns_title = QLabel("启用本地 DNS 智能分流 (UDP 5353)")
         lbl_dns_title.setProperty("class", "ItemTitle")
+        lbl_dns_title.setWordWrap(True)
         lbl_dns_desc = QLabel("开启轻量本地 DNS 解析服务，加速域名智能命中，普通公网域名透明递归转发")
         lbl_dns_desc.setProperty("class", "ItemDesc")
+        lbl_dns_desc.setWordWrap(True)
         r_dns_text.addWidget(lbl_dns_title)
         r_dns_text.addWidget(lbl_dns_desc)
         row_dns.addLayout(r_dns_text)
@@ -2080,6 +2150,7 @@ class MainWindow(QMainWindow):
         row_presets.setSpacing(8)
         lbl_pr_title = QLabel("常用公共 DNS 快速填入:")
         lbl_pr_title.setProperty("class", "ItemTitle")
+        lbl_pr_title.setWordWrap(True)
         row_presets.addWidget(lbl_pr_title)
 
         dns_presets = [
@@ -2107,12 +2178,14 @@ class MainWindow(QMainWindow):
 
         lbl_pdns = QLabel("主力上游 DNS:")
         lbl_pdns.setProperty("class", "ItemTitle")
+        lbl_pdns.setWordWrap(True)
         self.txt_dns_primary = QLineEdit(primary_dns)
         self.txt_dns_primary.setFixedWidth(130)
         self.txt_dns_primary.textChanged.connect(self.on_custom_dns_changed)
 
         lbl_sdns = QLabel("备用上游 DNS:")
         lbl_sdns.setProperty("class", "ItemTitle")
+        lbl_sdns.setWordWrap(True)
         self.txt_dns_secondary = QLineEdit(sec_dns)
         self.txt_dns_secondary.setFixedWidth(130)
         self.txt_dns_secondary.textChanged.connect(self.on_custom_dns_changed)
@@ -2139,6 +2212,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((s_icon, "users"))
         lbl_s_title = QLabel("Steam 客户端路径与游戏高级启动参数")
         lbl_s_title.setProperty("class", "SectionHeaderTitle")
+        lbl_s_title.setWordWrap(True)
         s_title_box.addWidget(s_icon)
         s_title_box.addWidget(lbl_s_title)
         s_title_box.addStretch()
@@ -2149,6 +2223,7 @@ class MainWindow(QMainWindow):
         row_sp.setSpacing(10)
         lbl_sp = QLabel("Steam 路径:")
         lbl_sp.setProperty("class", "ItemTitle")
+        lbl_sp.setWordWrap(True)
         current_sp = str(steam_mgr.steam_path) if steam_mgr.steam_path else ""
         self.txt_steam_path = QLineEdit(current_sp)
         self.txt_steam_path.setPlaceholderText("自动检测或点击右侧浏览选择 steam.exe 路径")
@@ -2171,6 +2246,7 @@ class MainWindow(QMainWindow):
         # 6.2 常用启动参数预设
         lbl_args_intro = QLabel("快捷启动参数预设 (启动 Steam 或免密切号时自动追加):")
         lbl_args_intro.setProperty("class", "ItemTitle")
+        lbl_args_intro.setWordWrap(True)
         s_layout.addWidget(lbl_args_intro)
 
         current_args = cfg.get("steam_launch_args", ["-tcp"])
@@ -2204,6 +2280,7 @@ class MainWindow(QMainWindow):
         row_cust_args.setSpacing(10)
         lbl_ca = QLabel("自定义附加参数:")
         lbl_ca.setProperty("class", "ItemTitle")
+        lbl_ca.setWordWrap(True)
         self.txt_steam_custom_args = QLineEdit(cfg.get("steam_custom_args_str", ""))
         self.txt_steam_custom_args.setPlaceholderText("例如: -silent -console -language schinese")
         self.txt_steam_custom_args.textChanged.connect(lambda t: update_config_key("steam_custom_args_str", t.strip()))
@@ -2232,6 +2309,7 @@ class MainWindow(QMainWindow):
         self.settings_icon_labels.append((cc_icon, "lock"))
         lbl_cc_title = QLabel("系统根证书与本地数据诊断")
         lbl_cc_title.setProperty("class", "SectionHeaderTitle")
+        lbl_cc_title.setWordWrap(True)
         cc_title_box.addWidget(cc_icon)
         cc_title_box.addWidget(lbl_cc_title)
         cc_title_box.addStretch()
@@ -2240,6 +2318,7 @@ class MainWindow(QMainWindow):
         # 7.1 证书管理
         self.lbl_cert_detail = QLabel("证书状态: 检测中...")
         self.lbl_cert_detail.setProperty("class", "SectionHeaderDesc")
+        self.lbl_cert_detail.setWordWrap(True)
         cc_l.addWidget(self.lbl_cert_detail)
 
         cc_btn_box = QHBoxLayout()
@@ -2260,8 +2339,10 @@ class MainWindow(QMainWindow):
         r_cm_text.setSpacing(2)
         lbl_ca_title = QLabel("GameArt 本地图片与静态资源磁盘缓存")
         lbl_ca_title.setProperty("class", "ItemTitle")
+        lbl_ca_title.setWordWrap(True)
         self.lbl_cache_size_desc = QLabel(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {self._get_cache_size_str()})。")
         self.lbl_cache_size_desc.setProperty("class", "ItemDesc")
+        self.lbl_cache_size_desc.setWordWrap(True)
         r_cm_text.addWidget(lbl_ca_title)
         r_cm_text.addWidget(self.lbl_cache_size_desc)
         row_cache_mgmt.addLayout(r_cm_text)
@@ -2278,8 +2359,10 @@ class MainWindow(QMainWindow):
         r_ac_text.setSpacing(2)
         lbl_ac_title = QLabel("退出程序时自动清空图片磁盘缓存")
         lbl_ac_title.setProperty("class", "ItemTitle")
+        lbl_ac_title.setWordWrap(True)
         lbl_ac_desc = QLabel("开启后每次完全退出程序时自动清理临时图片缓存，保持磁盘空间清爽")
         lbl_ac_desc.setProperty("class", "ItemDesc")
+        lbl_ac_desc.setWordWrap(True)
         r_ac_text.addWidget(lbl_ac_title)
         r_ac_text.addWidget(lbl_ac_desc)
         row_auto_clear.addLayout(r_ac_text)
@@ -2296,8 +2379,10 @@ class MainWindow(QMainWindow):
         r_git_text.setSpacing(2)
         lbl_git_title = QLabel("Git 命令行网络与大文件传输优化")
         lbl_git_title.setProperty("class", "ItemTitle")
+        lbl_git_title.setWordWrap(True)
         lbl_git_desc = QLabel("自动将 Git 全局 http.postBuffer 提升至 500MB，解除低速超时限制，解决 git pull / clone 卡顿")
         lbl_git_desc.setProperty("class", "ItemDesc")
+        lbl_git_desc.setWordWrap(True)
         r_git_text.addWidget(lbl_git_title)
         r_git_text.addWidget(lbl_git_desc)
         row_git.addLayout(r_git_text)
@@ -2312,8 +2397,10 @@ class MainWindow(QMainWindow):
         # 7.4 端口诊断
         lbl_po_title = QLabel("本地 80 / 443 端口诊断")
         lbl_po_title.setProperty("class", "ItemTitle")
+        lbl_po_title.setWordWrap(True)
         self.lbl_port_detail = QLabel("端口状态: 检测中...")
         self.lbl_port_detail.setProperty("class", "SectionHeaderDesc")
+        self.lbl_port_detail.setWordWrap(True)
         cc_l.addWidget(lbl_po_title)
         cc_l.addWidget(self.lbl_port_detail)
 
@@ -2419,9 +2506,23 @@ class MainWindow(QMainWindow):
         show_toast(self, msg, toast_type="success" if ok else "error", duration=3000)
 
     def on_autostart_toggled(self, checked: bool):
-        ok, msg = set_autostart(checked, start_minimized=True)
+        cfg = load_config()
+        start_min = cfg.get("start_minimized", True)
+        ok, msg = set_autostart(checked, start_minimized=start_min)
         update_config_key("auto_start", checked)
         show_toast(self, msg, toast_type="success" if ok else "error", duration=2500)
+
+    def on_start_minimized_toggled(self, checked: bool):
+        update_config_key("start_minimized", checked)
+        if is_autostart_enabled():
+            set_autostart(True, start_minimized=checked)
+        tip = "已开启启动时最小化到后台" if checked else "已关闭启动时最小化 (启动时显示主窗口)"
+        show_toast(self, tip, toast_type="info", duration=2000)
+
+    def on_tray_notif_toggled(self, checked: bool):
+        update_config_key("tray_notifications", checked)
+        tip = "已开启系统托盘与运行气泡提示" if checked else "已关闭所有气泡提示 (彻底静默模式)"
+        show_toast(self, tip, toast_type="info", duration=2000)
 
     def on_close_action_changed(self, action: str):
         update_config_key("close_action", action)
@@ -2549,6 +2650,17 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _, sid=acc["steamid"]: self.switch_steam_account(sid))
             self.steam_submenu.addAction(act)
 
+    def notify_tray(self, title: str, message: str, icon=QSystemTrayIcon.Information, duration: int = 2000):
+        """统一托盘通知网关，集中遵从 tray_notifications 配置实现彻底静默"""
+        cfg = load_config()
+        if not cfg.get("tray_notifications", True):
+            return
+        if hasattr(self, "tray") and self.tray and self.tray.supportsMessages():
+            try:
+                self.tray.showMessage(title, message, icon, duration)
+            except Exception as e:
+                print(f"[Tray] 弹出通知异常: {e}")
+
     def on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             if self.isVisible() and not self.isMinimized():
@@ -2604,13 +2716,12 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
             self.hide()
-            if cfg.get("tray_notifications", True) and hasattr(self, "tray") and self.tray and self.tray.supportsMessages():
-                self.tray.showMessage(
-                    "GameArt Toolkit 后台运行中",
-                    "程序已最小化至系统托盘，网络加速与自动托管将持续运行。",
-                    QSystemTrayIcon.Information,
-                    2000
-                )
+            self.notify_tray(
+                "GameArt Toolkit 后台运行中",
+                "程序已最小化至系统托盘，网络加速与自动托管将持续运行。",
+                QSystemTrayIcon.Information,
+                2000
+            )
 
     def quit_application(self):
         print("[GameArt Toolkit] 正在完全退出程序...")
@@ -2806,8 +2917,8 @@ class MainWindow(QMainWindow):
                         toast_type="warning", duration=6000,
                         action_text="提权", on_action=elevate_relaunch
                     )
-                elif self.tray and self.tray.supportsMessages():
-                    self.tray.showMessage("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。", QSystemTrayIcon.Warning, 3000)
+                else:
+                    self.notify_tray("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。", QSystemTrayIcon.Warning, 3000)
             elif show_toast_on_fail:
                 show_toast(
                     self, f"{h_msg} (需管理员权限修改 Hosts)",
@@ -2823,8 +2934,8 @@ class MainWindow(QMainWindow):
             hosts_mgr.remove_rules()
             if show_toast_on_fail:
                 show_toast(self, f"Nginx 启动失败: {n_msg}", toast_type="error", duration=4000)
-            elif self.tray and self.tray.supportsMessages():
-                self.tray.showMessage("Nginx 启动提示", n_msg, QSystemTrayIcon.Warning, 2500)
+            else:
+                self.notify_tray("Nginx 启动提示", n_msg, QSystemTrayIcon.Warning, 2500)
             return
 
         # 同步启动 L4 Relay 代理转发器 (预检端口 + 恢复既有 relay 路由) 与持续健康巡检
@@ -2968,6 +3079,18 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GameArtToolkit.Material.Desktop")
         except Exception:
             pass
+        try:
+            # 声明 Per-Monitor V2 DPI 感知，避免多显示器与高分屏缩放模糊
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    # 显式配置 Qt 6 High-DPI 缩放舍入策略为 PassThrough，杜绝非整数倍 DPI (125%/150%) 舍入失真
+    if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication(sys.argv)
     app.aboutToQuit.connect(emergency_fast_cleanup)
@@ -2992,7 +3115,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     window = MainWindow()
-    if "--minimized" in sys.argv or (cfg.get("auto_start", False) and cfg.get("start_minimized", True) and "--minimized" in sys.argv):
+    is_minimized = ("--minimized" in sys.argv) or cfg.get("start_minimized", False)
+    if is_minimized:
         window.hide()
     else:
         window.show()

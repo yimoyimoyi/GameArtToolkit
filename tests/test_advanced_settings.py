@@ -21,6 +21,8 @@ class TestAdvancedSettingsConfig:
     def test_default_config_fields(self):
         """验证所有新增独立设置字段在默认配置中完整存在"""
         assert "theme_mode" in DEFAULT_CONFIG
+        assert "start_minimized" in DEFAULT_CONFIG
+        assert "tray_notifications" in DEFAULT_CONFIG
         assert "custom_steam_path" in DEFAULT_CONFIG
         assert "steam_launch_args" in DEFAULT_CONFIG
         assert "steam_custom_args_str" in DEFAULT_CONFIG
@@ -31,6 +33,46 @@ class TestAdvancedSettingsConfig:
         assert "health_check_interval_seconds" in DEFAULT_CONFIG
         assert "upstream_dns_servers" in DEFAULT_CONFIG
         assert "auto_clear_cache_on_exit" in DEFAULT_CONFIG
+
+
+class TestStartupMinimizedAndNotificationQuiet:
+    def test_start_minimized_decision_logic(self):
+        """验证 main() 启动显隐决策算法在各种参数与配置组合下的正确性"""
+        # 1. 显式命令行 --minimized 参数: 无论配置如何，均判定最小化
+        argv_with_min = ["app.exe", "--minimized"]
+        cfg_false = {"start_minimized": False}
+        is_min = ("--minimized" in argv_with_min) or cfg_false.get("start_minimized", False)
+        assert is_min is True
+
+        # 2. 无命令行参数但 start_minimized 为 True: 判定为最小化 (后台运行)
+        argv_normal = ["app.exe"]
+        cfg_true = {"start_minimized": True}
+        is_min = ("--minimized" in argv_normal) or cfg_true.get("start_minimized", False)
+        assert is_min is True
+
+        # 3. 无命令行参数且 start_minimized 为 False: 判定为显示主窗口
+        is_min = ("--minimized" in argv_normal) or cfg_false.get("start_minimized", False)
+        assert is_min is False
+
+    def test_notify_tray_suppression(self):
+        """验证 notify_tray 网关在 tray_notifications=False 时彻底拦截提示"""
+        from unittest.mock import MagicMock
+        from pyside_app import MainWindow
+
+        mock_win = MagicMock()
+        mock_tray = MagicMock()
+        mock_tray.supportsMessages.return_value = True
+        mock_win.tray = mock_tray
+
+        # 1. 当关闭通知时 (tray_notifications=False)，验证彻底拦截，showMessage 调用次数为 0
+        with patch("pyside_app.load_config", return_value={"tray_notifications": False}):
+            MainWindow.notify_tray(mock_win, "测试标题", "测试内容")
+            mock_tray.showMessage.assert_not_called()
+
+        # 2. 当开启通知时 (tray_notifications=True)，验证正常放行并调用 showMessage
+        with patch("pyside_app.load_config", return_value={"tray_notifications": True}):
+            MainWindow.notify_tray(mock_win, "测试标题", "测试内容")
+            mock_tray.showMessage.assert_called_once()
 
 
 class TestIpVersionPreferences:

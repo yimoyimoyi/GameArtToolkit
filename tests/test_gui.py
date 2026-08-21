@@ -434,6 +434,9 @@ def run_full_verification():
     report.assert_true(hasattr(main_win.card_stat_steam, 'icon_lbl'), "Steam 状态卡片具备专属矢量图标")
     report.assert_true(main_win.lbl_main_icon is not None, "巨型主控卡片具备动态状态大图标")
     report.assert_true(main_win.lbl_sidebar_logo is not None, "侧边栏具备 34x34 专属极光渐变品牌 Logo")
+    report.assert_true(hasattr(main_win, "sw_start_minimized") and main_win.sw_start_minimized is not None, "设置页成功挂载启动时最小化独立开关")
+    report.assert_true(hasattr(main_win, "sw_tray_notif") and main_win.sw_tray_notif is not None, "设置页成功挂载托盘气泡通知开关")
+    report.assert_true(hasattr(main_win, "notify_tray") and callable(main_win.notify_tray), "MainWindow 具备统一托盘通知网关方法 notify_tray")
 
     # 4.9 测试亮色模式淡冰蓝调色板
     from material_theme import MATERIAL_LIGHT_QSS

@@ -238,6 +238,24 @@ class NativeFramelessHelper:
                 return True, 0
             return True, 0
 
+        # 1.5 拦截 WM_GETMINMAXINFO 保证系统级拖拽缩放不低于最小尺寸 (带 DPI 缩放换算)
+        elif msg.message == WM_GETMINMAXINFO:
+            if hasattr(self, "window") and self.window:
+                min_size = self.window.minimumSize()
+                if min_size.isValid() and (min_size.width() > 0 or min_size.height() > 0):
+                    try:
+                        info = MINMAXINFO.from_address(msg.lParam)
+                        hwnd = int(self.window.winId())
+                        dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+                        scale = dpi / 96.0 if dpi > 0 else 1.0
+                        if min_size.width() > 0:
+                            info.ptMinTrackSize.x = int(min_size.width() * scale)
+                        if min_size.height() > 0:
+                            info.ptMinTrackSize.y = int(min_size.height() * scale)
+                        return True, 0
+                    except Exception:
+                        pass
+
         # 2. 命中测试 (NCHITTEST): 边缘拉伸、标题栏拖拽、Win11 最大化按钮贴靠菜单
         elif msg.message == WM_NCHITTEST:
             # 使用 Qt 校准后的标准全局逻辑坐标，消除 High-DPI 缩放下的像素错位
