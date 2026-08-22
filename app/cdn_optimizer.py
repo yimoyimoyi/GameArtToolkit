@@ -108,6 +108,12 @@ _DOH_CACHE_LOCK = threading.Lock()
 _DOH_CACHE_TTL = 600.0  # 10 分钟有效
 
 
+def clear_doh_cache() -> None:
+    """清空 DoH 解析内存缓存 (供单测隔离与手动重置使用)"""
+    with _DOH_CACHE_LOCK:
+        _DOH_CACHE.clear()
+
+
 def doh_resolve(domain: str, timeout: float = 3.0,
                 endpoints: Optional[Tuple[str, ...]] = None,
                 use_cache: bool = True) -> List[str]:
@@ -237,21 +243,23 @@ def _resolve_dns_candidates(domain: str, timeout: float = 0.8, use_doh: bool = T
 
 
 def _load_proxy_config() -> Optional[Tuple[str, int]]:
-    """读取 config.json 的 upstream_proxy 配置; 若未启用或不可达, 自动尝试嗅探本地活跃代理"""
+    """读取 config.json 的 upstream_proxy 配置; 若未启用或不可达, 在 auto_proxy 开启时尝试嗅探本地活跃代理"""
     try:
-        cfg = load_config().get("upstream_proxy", {})
+        full_cfg = load_config()
+        cfg = full_cfg.get("upstream_proxy", {})
         if cfg.get("enabled", False):
             host = str(cfg.get("host", DEFAULT_PROXY[0]))
             port = int(cfg.get("port", DEFAULT_PROXY[1]))
             if is_proxy_available((host, port), timeout=0.2):
                 return (host, port)
+        
+        # 仅在用户开启 auto_proxy (默认 True) 时自动探测活跃代理 (Clash/v2rayN/sing-box 等)
+        if full_cfg.get("auto_proxy", True):
+            detected = auto_detect_active_proxy(timeout=0.15)
+            if detected and is_proxy_available(detected, timeout=0.2):
+                return detected
     except Exception:
         pass
-    
-    # 自动探测活跃代理 (Clash Verge 7897 / Clash 7890 / v2rayN 10809 等)
-    detected = auto_detect_active_proxy(timeout=0.15)
-    if detected and is_proxy_available(detected, timeout=0.2):
-        return detected
     return None
 
 

@@ -4,7 +4,7 @@ GameArt Toolkit - 加速服务元数据、域名映射与 CDN 候选池 (对接 
 
 向后兼容导出:
 - SERVICE_GROUPS: 服务分组字典
-- SERVICES_LIST: 28 项服务列表 (全部为已实测直连可用服务)
+- SERVICES_LIST: 核心服务列表 (全部为已实测直连可用服务)
 - SERVICES_BY_ID: 服务字典索引
 - CANDIDATE_IPS: 各服务优质候选 CDN IP 池
 - DEFAULT_ENABLED_SERVICES: 默认开启的服务列表

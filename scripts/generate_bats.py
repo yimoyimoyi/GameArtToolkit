@@ -7,10 +7,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # 1. 桌面客户端双击运行脚本 (无黑框静默拉起)
-# 1. 桌面客户端双击运行脚本 (无黑框静默拉起)
 start_gui_bat = """@echo off
 chcp 65001 >nul
-title PixivToolkit 桌面客户端
+title GameArt Toolkit 桌面客户端
 cd /d "%~dp0"
 
 :: 优先使用无黑框控制台的 pythonw 静默启动应用程序
@@ -39,7 +38,7 @@ exit /b 1
 # 2. 打包为 EXE
 build_exe_bat = """@echo off
 chcp 65001 >nul
-title PixivToolkit - 打包为 EXE
+title GameArt Toolkit - 打包为 EXE
 cd /d "%~dp0"
 
 echo ========================================================
@@ -49,15 +48,15 @@ python build.py
 echo.
 echo 打包结束，按任意键打开发布目录...
 pause >nul
-if exist "%~dp0dist\\PixivToolkit" (
-    start explorer "%~dp0dist\\PixivToolkit"
+if exist "%~dp0dist\\GameArtToolkit" (
+    start explorer "%~dp0dist\\GameArtToolkit"
 )
 """
 
 # 3. 辅助清理与安装脚本 (自动申请管理员权限)
 clean_hosts_bat = """@echo off
 chcp 65001 >nul
-title PixivToolkit - 安全清理 Hosts
+title GameArt Toolkit - 安全清理 Hosts
 cd /d "%~dp0.."
 
 :: 检查并自动请求管理员权限
@@ -69,7 +68,7 @@ if %errorLevel% neq 0 (
 )
 
 echo ========================================================
-echo   正在从系统 Hosts 中清理 PixivToolkit 加速规则...
+echo   正在从系统 Hosts 中清理 GameArt Toolkit 加速规则...
 echo ========================================================
 python -c "import sys; sys.path.insert(0, 'app'); from hosts_manager import HostsManager; ok, msg = HostsManager().remove_rules(); print(msg)"
 pause
@@ -77,7 +76,7 @@ pause
 
 install_cert_bat = """@echo off
 chcp 65001 >nul
-title PixivToolkit - 安装根证书
+title GameArt Toolkit - 安装根证书
 cd /d "%~dp0.."
 
 :: 检查并自动请求管理员权限

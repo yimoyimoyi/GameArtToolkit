@@ -236,15 +236,15 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QFrame#NavSidebar {
     background-color: #0F1420;
     border-right: 1px solid #182032;
-    min-width: 220px;
-    max-width: 220px;
+    min-width: 240px;
+    max-width: 240px;
 }
 
 QLabel#BrandTitle {
     color: #7EB9F5;
-    font-size: 18px;
+    font-size: 15px;
     font-weight: bold;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.3px;
 }
 
 QLabel#BrandSubtitle {
@@ -950,15 +950,15 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QFrame#NavSidebar {
     background-color: #E4EFFB;
     border-right: 1px solid #D0E2F5;
-    min-width: 220px;
-    max-width: 220px;
+    min-width: 240px;
+    max-width: 240px;
 }
 
 QLabel#BrandTitle {
     color: #0284C7;
-    font-size: 17px;
+    font-size: 15px;
     font-weight: bold;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.3px;
 }
 
 QLabel#BrandSubtitle {
@@ -1673,8 +1673,8 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QFrame#NavSidebar {
     background-color: #FFF0F3;
     border-right: 1px solid #FFE4E8;
-    min-width: 210px;
-    max-width: 210px;
+    min-width: 240px;
+    max-width: 240px;
 }
 
 QLabel#BrandTitle {

@@ -23,14 +23,14 @@ DEFAULT_CONFIG = {
     # 运行生命周期与托盘行为
     "auto_proxy": True,
     "auto_start": False,
-    "start_minimized": True,
+    "start_minimized": False,
     "close_action": "minimize_to_tray",  # "minimize_to_tray" | "quit_directly"
 
     # Hosts 规则与自动恢复
     "auto_clean_hosts_on_exit": True,
     "auto_heal_on_startup": True,
 
-    # 服务与路由规则 (默认开启 18 项已验证服务)
+    # 服务与路由规则 (默认开启预设服务)
     "enabled_services": list(DEFAULT_ENABLED_SERVICES),
     "steam_account_aliases": {},
     "custom_steam_path": "",

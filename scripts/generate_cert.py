@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PixivToolkit - 本地 SSL 根证书与服务端多域名 SAN 证书生成 CLI 脚本
+GameArt Toolkit - 本地 SSL 根证书与服务端多域名 SAN 证书生成 CLI 脚本
 基于 CertManager 统一底层引擎，支持按需/强制重新签发
 """
 
@@ -15,7 +15,7 @@ from service_profile import TOTAL_SERVICES_COUNT
 
 def main():
     print("========================================================")
-    print(f"   PixivToolkit - 本地 SSL 证书生成器 ({TOTAL_SERVICES_COUNT} 项加速服务)")
+    print("   GameArt Toolkit - 本地 SSL 证书生成器")
     print("========================================================")
 
     all_sans = get_all_san_domains()

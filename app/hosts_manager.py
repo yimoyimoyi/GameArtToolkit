@@ -347,7 +347,7 @@ class HostsManager:
             with open(self.hosts_file, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            if BLOCK_START not in content and "# Pixiv Start" not in content:
+            if BLOCK_START not in content and LEGACY_BLOCK_START not in content and "# Pixiv Start" not in content:
                 return True
 
             clean_content = self.remove_rules_from_content(content)

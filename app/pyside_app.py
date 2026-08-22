@@ -6,7 +6,7 @@ GameArt Toolkit - Material Design 3 桌面客户端
 2. 全局 MD3 Floating Toast Overlay 悬浮通知体系，不使用阻塞式 QMessageBox
 3. Steam 账号管家卡片内 Inline Edit 备注编辑与双击卡片免密切换
 4. CDN 测速骨架屏 (Skeleton Screen) 与热重载
-5. 单调三次样条平滑网络监控波形图与 18 项加速规则独立/分组原子管理
+5. 单调三次样条平滑网络监控波形图与加速规则独立/分组原子管理
 """
 
 import os
@@ -672,7 +672,7 @@ class MainWindow(QMainWindow):
         # 品牌区域 (34x34 专属矢量 Logo + 标题 + 副标题)
         brand_widget = QWidget()
         brand_layout = QHBoxLayout(brand_widget)
-        brand_layout.setContentsMargins(4, 0, 4, 16)
+        brand_layout.setContentsMargins(0, 0, 0, 16)
         brand_layout.setSpacing(10)
 
         self.lbl_sidebar_logo = QLabel()
@@ -775,7 +775,7 @@ class MainWindow(QMainWindow):
         # 页面标题
         title = QLabel("加速控制中心")
         title.setObjectName("PageTitle")
-        desc = QLabel(f"自动托管网络代理与 Hosts 规则，加速 {TOTAL_SERVICES_COUNT} 项海外游戏、创作与开发服务")
+        desc = QLabel("自动托管网络代理与 Hosts 规则，加速热门海外游戏、创作与开发服务")
         desc.setObjectName("PageDesc")
         layout.addWidget(title)
         layout.addWidget(desc)
@@ -792,7 +792,7 @@ class MainWindow(QMainWindow):
 
         self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存", "server")
         self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库", "lock")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", f"{TOTAL_SERVICES_COUNT} 项服务规则隔离", "file_text")
+        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "专属规则块隔离", "file_text")
         self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换", "gamepad")
 
         stat_grid.addWidget(self.card_stat_nginx, 0, 0)
@@ -855,7 +855,7 @@ class MainWindow(QMainWindow):
         search_box.addWidget(self.txt_service_search)
         layout.addLayout(search_box)
 
-        # 4. 18 项加速服务 (3 大分类分组卡片, FlowLayout 流式自适应排布)
+        # 4. 加速服务列表 (3 大分类分组卡片, FlowLayout 流式自适应排布)
         cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
         for grp_id, grp_info in SERVICE_GROUPS.items():
@@ -1244,7 +1244,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("CDN 测速与动态 Upstream 优选")
         title.setObjectName("PageTitle")
-        desc = QLabel(f"多线程并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
+        desc = QLabel("多线程并发探测全量服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
         desc.setObjectName("PageDesc")
         title_box.addWidget(title)
         title_box.addWidget(desc)
@@ -1282,7 +1282,7 @@ class MainWindow(QMainWindow):
 
         lbl_ci_title = QLabel("测速引擎已就绪")
         lbl_ci_title.setProperty("class", "ItemTitle")
-        lbl_ci_desc = QLabel(f"点击右上角【开始全量测速】，系统将并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的延迟并筛选延迟最低的节点。")
+        lbl_ci_desc = QLabel("点击右上角【开始全量测速】，系统将并发探测全量服务的延迟并筛选延迟最低的节点。")
         lbl_ci_desc.setProperty("class", "ItemDesc")
         ci_layout.addWidget(ci_icon, 0, Qt.AlignCenter)
         ci_layout.addWidget(lbl_ci_title, 0, Qt.AlignCenter)
@@ -1309,7 +1309,7 @@ class MainWindow(QMainWindow):
         for _ in range(4):
             self.cdn_results_layout.addWidget(SkeletonCard())
 
-        show_toast(self, f"正在并发探测全部 {TOTAL_SERVICES_COUNT} 项服务的候选节点延迟...", toast_type="info", duration=2500)
+        show_toast(self, "正在并发探测全量服务的候选节点延迟...", toast_type="info", duration=2500)
 
         self.cdn_worker = CDNTestWorker()
         self.cdn_worker.finished.connect(self.on_cdn_ping_finished)
@@ -1559,7 +1559,7 @@ class MainWindow(QMainWindow):
         if ok:
             cfg = load_config()
             cfg["last_optimal_time"] = int(time.time())
-            # 同步更新主控制台全部 18 项服务延迟微徽章与持久化
+            # 同步更新主控制台全部服务延迟微徽章与持久化
             saved_lats = {}
             for sid, ip_list in self.cached_cdn_results.items():
                 if ip_list and sid in self.service_badges:
@@ -1979,7 +1979,7 @@ class MainWindow(QMainWindow):
         lbl_coe_title = QLabel("仅测速当前已勾选启用的加速服务")
         lbl_coe_title.setProperty("class", "ItemTitle")
         lbl_coe_title.setWordWrap(True)
-        lbl_coe_desc = QLabel("开启时启动测速仅探测已启用的服务 (耗时缩短至 2~3 秒)；关闭时将探测全量 18 项服务")
+        lbl_coe_desc = QLabel("开启时启动测速仅探测已启用的服务 (测速更快)；关闭时将探测全量服务")
         lbl_coe_desc.setProperty("class", "ItemDesc")
         lbl_coe_desc.setWordWrap(True)
         r_coe_text.addWidget(lbl_coe_title)
@@ -2507,7 +2507,7 @@ class MainWindow(QMainWindow):
 
     def on_autostart_toggled(self, checked: bool):
         cfg = load_config()
-        start_min = cfg.get("start_minimized", True)
+        start_min = cfg.get("start_minimized", False)
         ok, msg = set_autostart(checked, start_minimized=start_min)
         update_config_key("auto_start", checked)
         show_toast(self, msg, toast_type="success" if ok else "error", duration=2500)

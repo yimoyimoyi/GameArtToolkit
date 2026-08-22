@@ -1,6 +1,6 @@
 ﻿@echo off
 chcp 65001 >nul
-title PixivToolkit - 安全清理 Hosts
+title GameArt Toolkit - 安全清理 Hosts
 cd /d "%~dp0.."
 
 :: 检查并自动请求管理员权限
@@ -12,7 +12,7 @@ if %errorLevel% neq 0 (
 )
 
 echo ========================================================
-echo   正在从系统 Hosts 中清理 PixivToolkit 加速规则...
+echo   正在从系统 Hosts 中清理 GameArt Toolkit 加速规则...
 echo ========================================================
 python -c "import sys; sys.path.insert(0, 'app'); from hosts_manager import HostsManager; ok, msg = HostsManager().remove_rules(); print(msg)"
 pause

@@ -174,7 +174,7 @@ def is_autostart_enabled(app_name: str = DEFAULT_APP_NAME) -> bool:
     except Exception:
         return False
 
-def set_autostart(enable: bool, start_minimized: bool = True, app_name: str = DEFAULT_APP_NAME) -> tuple[bool, str]:
+def set_autostart(enable: bool, start_minimized: bool = False, app_name: str = DEFAULT_APP_NAME) -> tuple[bool, str]:
     """设置或取消 Windows 开机自启动 (写入 HKCU 免 UAC 弹窗)"""
     import sys
     import winreg

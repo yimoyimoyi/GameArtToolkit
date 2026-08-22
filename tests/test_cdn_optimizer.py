@@ -858,6 +858,14 @@ class _FakeUrlOpen:
 class TestDohDualChannel:
     """验证 DoH 解析与 UDP+DoH 双通道污染规避"""
 
+    def setup_method(self):
+        from cdn_optimizer import clear_doh_cache
+        clear_doh_cache()
+
+    def teardown_method(self):
+        from cdn_optimizer import clear_doh_cache
+        clear_doh_cache()
+
     def _mock_json(self, answers):
         return _FakeUrlOpen({"Status": 0, "Answer": answers})
 

@@ -205,7 +205,7 @@ class CertManager:
             return False, f"生成本地 Root CA 异常: {e}"
 
     def generate_server_cert(self, force: bool = False) -> Tuple[bool, str]:
-        """使用本地 Root CA 签发全量 18 项服务通用通配服务端证书 (10年有效期)"""
+        """使用本地 Root CA 签发全量服务通用通配服务端证书 (10年有效期)"""
         self._ensure_dirs()
         all_sans = get_all_san_domains()
 

@@ -341,35 +341,35 @@ class NativeFramelessHelper:
                         self.window.title_bar._on_toggle_maximize()
                 return True, 0
 
-        # 4. 最小追踪尺寸限制
-        elif msg.message == WM_GETMINMAXINFO:
-            min_size = self.window.minimumSize()
-            if min_size.isValid():
-                mmi = MINMAXINFO.from_address(msg.lParam)
-                mmi.ptMinTrackSize.x = min_size.width()
-                mmi.ptMinTrackSize.y = min_size.height()
-                return True, 0
-
-        # 5. DPI 变化处理 (交由 Qt 原生处理以保持设备像素比与自适应排版一致)
+        # 4. DPI 变化处理 (交由 Qt 原生处理以保持设备像素比与自适应排版一致)
         elif msg.message == WM_DPICHANGED:
             return False, 0
 
         return False, 0
 
     def set_immersive_dark_mode(self, is_dark: bool):
-        """动态切换窗口暗色模式"""
+        """动态切换窗口暗色模式 (兼容 Win11/Win10 1903+ 的 20 与 Win10 1809 的 19)"""
         if sys.platform != "win32":
             return
         try:
             hwnd = int(self.window.winId())
             dwmapi = ctypes.windll.dwmapi
             dark_mode = ctypes.c_int(1 if is_dark else 0)
-            dwmapi.DwmSetWindowAttribute(
+            # 优先使用现代 DWMWA_USE_IMMERSIVE_DARK_MODE (20)
+            hr = dwmapi.DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
                 ctypes.byref(dark_mode),
                 ctypes.sizeof(dark_mode)
             )
+            if hr != 0:
+                # 兼容旧版 Win10 (1809 之前常量为 19)
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    19,
+                    ctypes.byref(dark_mode),
+                    ctypes.sizeof(dark_mode)
+                )
             self.window.update()
         except Exception:
             pass

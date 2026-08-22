@@ -1,6 +1,6 @@
 ﻿@echo off
 chcp 65001 >nul
-title PixivToolkit - 安装根证书
+title GameArt Toolkit - 安装根证书
 cd /d "%~dp0.."
 
 :: 检查并自动请求管理员权限

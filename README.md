@@ -20,9 +20,9 @@
 
 ### ✨ 核心特性
 
-- **🚀 本地多协议反代加速数据平面 (覆盖 3 大生态 18 项服务)**
-  - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、Yande.re 高清壁纸、VNDB 视觉小说资料库。
-  - **游戏生态**：Steam 商店/结账、Steam 社区 118 修复、Steam Akamai 图片 CDN、Ubisoft 育碧商城、EA App / Origin。
+- **🚀 本地多协议反代加速数据平面 (覆盖 3 大生态热门核心服务)**
+  - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、Yande.re 高清壁纸、VNDB 视觉小说资料库、Fantia 创作者俱乐部、MyAnimeList 动漫数据库、DLsite 同人发布、Patreon 创作者赞助。
+  - **游戏生态**：Steam 商店/结账、Steam 社区 118 修复、Steam Akamai 图片 CDN、Ubisoft 育碧商城、EA App / Origin、Battle.net 战网国际服、GOG 游戏商城、Xbox 微软游戏生态、Minecraft 游戏生态。
   - **开发者与 AI 生态**：GitHub 主站 Web/API、GitHub 静态资产与 Raw 直连、GitHub Releases 附件极速下载 (L4 Relay 旁路直通)、GitHub 前端 JS/CSS CDN、GitLab 国际版、HuggingFace AI 大模型权重直连。
   - **本地磁盘二级缓存**：二次打开插画与静态资源实现本地 0ms 闪电响应。
   - **L4 Relay 旁路隧道**：针对直连受阻的海外服务，自动经由本地上游代理端口透明转发，无需修改系统全局代理。
@@ -39,7 +39,7 @@
 
 - **💎 Material Design 3 现代桌面交互**
   - 采用 Windows 11 Fluent 调色板与 DWM 原生贴靠无边框设计。
-  - 完美支持深色 (Dark) 与浅色 (Light) 双主题无缝自适应切换，全矢量 SVG 图标开关联动变色。
+  - 完美支持深色 (Dark)、浅色 (Light) 与樱粉 (Pink) **三套主题**无缝自适应切换 (快捷键 `Alt+T`)，全矢量 SVG 图标开关联动变色。
   - **零侵入交互 (Zero-Modal)**：彻底移除系统弹窗，统一采用平滑悬浮 Toast 通知。
   - 单调三次样条 (Monotone Spline) 实时网络流量监控波形图。
 
@@ -116,14 +116,16 @@ dist/GameArtToolkit/GameArtToolkit.exe
 GameArtToolkit/
 ├── app/                     # Python 核心控制平面与 PySide6 客户端
 │   ├── pyside_app.py        # 客户端主程序入口 (UI 架构 / 系统托盘 / 守护监听)
-│   ├── service_profile.py   # 18 项服务 Profile 声明式元数据与路由注册表
-│   ├── material_theme.py    # Material Design 3 双主题调色板与 QSS 样式表
+│   ├── service_profile.py   # 服务 Profile 声明式元数据与路由注册表
+│   ├── material_theme.py    # Material Design 3 三套主题调色板与 QSS 样式表
 │   ├── md_widgets.py        # MD3 原生自绘控件 (波形图/延迟微徽章/开关/Toast)
 │   ├── svg_icons.py         # MD3 / Lucide 矢量 SVG 渲染工厂
 │   ├── steam_manager.py     # Steam 路径嗅探、VDF 词法解析与账号免密切换
 │   ├── nginx_manager.py     # Nginx 进程生命周期、端口健康与热重载
 │   ├── nginx_generator.py   # 动态 Nginx 站点配置模板生成引擎
 │   ├── cdn_optimizer.py     # 多线程 Anycast CDN 延迟并发测速与优选
+│   ├── dns_server.py        # 本地轻量 UDP DNS 解析器 (无污染分流)
+│   ├── l4_relay.py          # L4 TCP SNI 透明代理隧道
 │   ├── cert_manager.py      # Windows CryptoAPI 原生根证书自检与静默管理
 │   ├── hosts_manager.py     # 标签化 Hosts 原子读写、体检修复与备份轮转
 │   ├── config_store.py      # 配置原子持久化与自动迁移
@@ -136,11 +138,7 @@ GameArtToolkit/
 │   └── conf/                # Nginx 配置文件与分站规则模板
 ├── backups/                 # 自动备份管理子目录
 │   └── hosts/               # Hosts 结构化历史备份 (自动保持 5 份轮转)
-├── tests/                   # 自动化测试与质量保障套件
-│   ├── test_gui.py          # 桌面端 GUI 控件交互与主题断言测试
-│   ├── test_cdn_optimizer.py# CDN 测速调度与负载均衡生成测试
-│   ├── test_lifecycle.py    # 退出清理、关机响应与 Hosts 轮转测试
-│   └── test_regression.py   # 6 大核心业务专项回归测试
+├── tests/                   # 自动化测试与质量保障套件 (全量专项回归测试模块)
 ├── scripts/                 # 图标生成与维护工具脚本
 ├── build.py                 # PyInstaller 自动化一键打包构建程序
 └── README.md                # 项目设计与使用说明文档

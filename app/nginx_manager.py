@@ -138,7 +138,9 @@ class NginxManager:
                 self.reload()
                 return True, "Nginx 配置已刷新并处于运行状态"
 
-        # 检查 443 端口
+        # 检查 80 与 443 端口
+        if is_port_in_use(80):
+            return False, "80 端口已被其他程序(如 IIS/Skype/World Wide Web Publishing)占用，请先关闭占用程序！"
         if is_port_in_use(443):
             return False, "443 端口已被其他程序占用，请先关闭占用程序！"
 
