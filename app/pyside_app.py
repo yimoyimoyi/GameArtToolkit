@@ -66,7 +66,10 @@ cert_mgr = CertManager()
 hosts_mgr = HostsManager()
 nginx_mgr = NginxManager()
 cdn_opt = CDNOptimizer()
-health_monitor = CDNHealthMonitor(cdn_opt, on_healed=nginx_mgr.reload)
+# 巡检周期从配置读取 (health_check_interval_seconds), 支持设置页运行中调整
+health_monitor = CDNHealthMonitor(cdn_opt,
+                                  check_interval=float(load_config().get("health_check_interval_seconds") or 30),
+                                  on_healed=nginx_mgr.reload)
 
 # ==================== 全局快速退出与 Windows 关机安全清理通道 ====================
 _CLEANUP_LOCK = threading.Lock()
@@ -2449,6 +2452,7 @@ class MainWindow(QMainWindow):
         val = self.cmb_health_freq.itemData(index)
         if val is not None:
             update_config_key("health_check_interval_seconds", int(val))
+            health_monitor.set_check_interval(int(val))  # 运行中即时生效, 无需重启
 
     def apply_preset_dns(self, primary: str, secondary: str):
         if hasattr(self, "txt_dns_primary") and hasattr(self, "txt_dns_secondary"):

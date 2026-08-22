@@ -21,11 +21,12 @@ import threading
 import ipaddress
 import urllib.request
 import concurrent.futures
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any
 
 from path_utils import NGINX_DIR
-from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID
+from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID, PROFILES_BY_ID
 from config_store import load_config
 from win_utils import is_port_in_use, get_physical_adapter_ip, auto_detect_active_proxy
 
@@ -47,6 +48,85 @@ PSEUDO_SNI_SERVICES = {p_id for p_id, m in SNI_MODES.items() if m not in ("host"
 
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
 SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
+
+
+@dataclass(frozen=True)
+class ProbeDefaults:
+    """统一测速参数中心: 收敛全部探测预算/超时魔数 (按服务档位等比缩放)
+
+    档位换算: scale = clamp(实际档位 / 1.5, 0.6, 2.0), 各阶段预算 = budget * scale
+    不变量: hard_budget == tcp_budget + tls_budget + http_budget (测试锁定)
+    """
+    tcp_budget: float = 1.5      # TCP 握手阶段预算上限 (默认档)
+    tls_budget: float = 2.6      # TLS 握手阶段预算上限 (默认档)
+    http_budget: float = 1.8     # HTTP 状态码探测阶段预算上限 (默认档)
+    hard_budget: float = 5.9     # 单节点硬超时总预算 (原 4.5s, 晚高峰跨洋高丢包放宽)
+    prefilter_timeout: float = 1.2  # Stage1 TCP 预筛超时 (原 0.8s; 恒小于 tcp_budget)
+    prefilter_floor: float = 0.3    # 预筛存活率下限: 低于此值跳过预筛直接全池深测
+    health_probe_timeout: float = 2.0  # 健康巡检探针超时
+    relay_probe_timeout: float = 1.0   # 健康巡检 relay 端口探针超时
+    retry_delay: float = 0.08      # 探测微重试间隔
+
+
+PROBE_DEFAULTS = ProbeDefaults()
+
+# 档位换算基准 (默认档 cdn_timeout_seconds=1.5)
+_TIER_BASE = 1.5
+_TIER_SCALE_MIN = 0.6
+_TIER_SCALE_MAX = 2.0
+
+
+def tier_scale(timeout: float) -> float:
+    """从探测档位派生预算缩放系数 (0.8 档更快, 3.0 档更宽容)"""
+    return max(_TIER_SCALE_MIN, min(timeout / _TIER_BASE, _TIER_SCALE_MAX))
+
+
+def probe_timeout_for(srv_id: str, cfg_timeout: Optional[float] = None) -> float:
+    """服务级探测档位: profile.probe_timeout 优先, 回退全局 cdn_timeout_seconds, 最终 1.5"""
+    profile = PROFILES_BY_ID.get(srv_id)
+    if profile is not None and getattr(profile, "probe_timeout", None):
+        return float(profile.probe_timeout)
+    if cfg_timeout:
+        return float(cfg_timeout)
+    return float(load_config().get("cdn_timeout_seconds", 1.5))
+
+
+def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
+                      stable_set: Optional[set] = None) -> Tuple:
+    """统一测速排序键: (rank, v6/v4 偏好惩罚, 稳定段惩罚, 延迟)
+
+    - rank 永远第一 (可用性优先, Fastly 全灭时仍由 rank0 兜底)
+    - 稳定性优先于延迟: 短命 Anycast 延迟优势不可信, 已知稳定段优先
+    - ip_mode/stable_set 为 None 时跳过对应维度 (apply_optimal 防御性排序复用)
+    - 空 stable_ips 的服务退化为旧键序 (rank, v_penalty, latency), 行为不变
+    """
+    rank = item.get("rank", 3)
+    lat = item.get("latency") if item.get("latency") is not None else 99999
+    v_penalty = 0
+    if ip_mode:
+        is_v6 = ":" in str(item.get("ip", ""))
+        if ip_mode == "prefer_ipv4" and is_v6:
+            v_penalty = 1
+        elif ip_mode == "prefer_ipv6" and not is_v6:
+            v_penalty = 1
+    stable_penalty = 0
+    if stable_set is not None:
+        stable_penalty = 0 if str(item.get("ip", "")) in stable_set else 1
+    return (rank, v_penalty, stable_penalty, lat)
+
+
+def _apply_prefilter_floor(pool_ips: List[str], alive_ips: set, floor: float) -> List[str]:
+    """预筛存活率兜底: 存活数低于 max(1, floor*池大小) 时返回全池 (防预筛误杀慢节点)
+
+    Stage1 预筛淘汰的"慢但活着"节点过多时, 宁可在 Stage2 慢一档也不漏测真可用节点
+    """
+    if not pool_ips:
+        return []
+    threshold = max(1, int(floor * len(pool_ips)))
+    survived = [ip for ip in pool_ips if ip in alive_ips]
+    if len(survived) < threshold:
+        return list(pool_ips)
+    return survived
 
 
 def relay_port_for(srv_id: str) -> int:
@@ -344,13 +424,15 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
     def _do_probe_once() -> Dict:
         out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
                "tls_latency": None, "http_ok": False, "http_status": None, "error": ""}
-        deadline = time.monotonic() + 4.5  # 单节点硬超时预算，绝不无限挂起线程
+        # 档位缩放: 0.8 档更快 / 3.0 档更宽容 (默认 1.5 档 = 原始预算)
+        scale = tier_scale(timeout)
+        deadline = time.monotonic() + PROBE_DEFAULTS.hard_budget * scale  # 单节点硬超时预算
         sock = None
         ssock = None
         try:
             # 1. TCP 握手 (直连或经 CONNECT 隧道)
             try:
-                tcp_timeout = min(timeout, 1.2)
+                tcp_timeout = min(timeout, PROBE_DEFAULTS.tcp_budget * scale)
                 if proxy:
                     t0 = time.perf_counter()
                     sock = socket.create_connection(proxy, timeout=tcp_timeout)
@@ -391,7 +473,7 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                 else:
                     server_hostname = sni_mode
 
-                tls_timeout = max(0.8, min(deadline - time.monotonic(), 2.2))
+                tls_timeout = max(1.0, min(deadline - time.monotonic(), PROBE_DEFAULTS.tls_budget * scale))
                 sock.settimeout(tls_timeout)
                 t0 = time.perf_counter()
                 ssock = ctx.wrap_socket(sock, server_hostname=server_hostname)
@@ -404,7 +486,7 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
 
             # 3. HTTP 状态码探测
             try:
-                http_timeout = max(0.5, min(deadline - time.monotonic(), 1.5))
+                http_timeout = max(0.6, min(deadline - time.monotonic(), PROBE_DEFAULTS.http_budget * scale))
                 ssock.settimeout(http_timeout)
                 req_headers = (
                     f"GET / HTTP/1.1\r\n"
@@ -505,15 +587,18 @@ class CDNOptimizer:
         # 最近一次生成的 relay 代理转发服务集合 (供自愈探针分流与 UI 展示)
         self.last_relay_services: set = set()
 
-    def test_service_dual(self, srv_id: str, max_workers: int = 8) -> List[Dict]:
+    def test_service_dual(self, srv_id: str, max_workers: Optional[int] = None) -> List[Dict]:
         """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)"""
+        if max_workers is None:
+            max_workers = int(load_config().get("cdn_max_workers", 16))
         ips = CANDIDATE_IPS.get(srv_id, [])
         return self.test_group(srv_id, ips, max_workers=max_workers)
 
     def test_group(self, group_name: str, ip_list: List[str], max_workers: int = 16) -> List[Dict]:
         """测试指定服务的一组候选 IP (双通道三态探测, 自动补充 DNS 当前解析节点, 遵从 IPv4/v6 偏好)"""
         cfg = load_config()
-        timeout = float(cfg.get("cdn_timeout_seconds", 2.0))
+        # 服务级档位优先 (profile.probe_timeout), 回退全局 cdn_timeout_seconds
+        timeout = probe_timeout_for(group_name, float(cfg.get("cdn_timeout_seconds", 1.5)))
         ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
 
         srv = SERVICES_BY_ID.get(group_name, {})
@@ -556,18 +641,9 @@ class CDNOptimizer:
                             "direct": None, "proxy": None, "proxy_used": proxy_ready}
                 results.append(item)
 
-        def _sort_key(x):
-            rank = x.get("rank", 3)
-            lat = x.get("latency") if x.get("latency") is not None else 99999
-            is_v6 = ":" in str(x.get("ip", ""))
-            v_penalty = 0
-            if ip_mode == "prefer_ipv4" and is_v6:
-                v_penalty = 1
-            elif ip_mode == "prefer_ipv6" and not is_v6:
-                v_penalty = 1
-            return (rank, v_penalty, lat)
-
-        results.sort(key=_sort_key)
+        # 排序键统一: (rank, v6/v4 偏好, 稳定段, 延迟); 无 stable_ips 时退化为旧键序
+        stable_set = set(getattr(PROFILES_BY_ID.get(group_name), "stable_ips", [])) or None
+        results.sort(key=lambda x: _service_sort_key(x, ip_mode, stable_set))
         return results
 
     def test_all_services(self, max_workers: int = 64, total_timeout: float = 30.0,
@@ -579,7 +655,7 @@ class CDNOptimizer:
         彻底消灭任务排队导致的超时误杀，单次测速 100% 捕获全量可用 CDN。
         """
         cfg = load_config()
-        timeout = float(cfg.get("cdn_timeout_seconds", 2.0))
+        timeout = float(cfg.get("cdn_timeout_seconds", 1.5))
         max_workers = int(cfg.get("cdn_max_workers", max_workers))
         ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
 
@@ -619,11 +695,11 @@ class CDNOptimizer:
             for ip in ips:
                 all_unique_ips.add(ip)
 
-        # 3. Stage 1: 高并发轻量 TCP 快速预筛 (800ms 超时)
+        # 3. Stage 1: 高并发轻量 TCP 快速预筛 (1.2s 超时, 对跨洋高丢包链路宽容)
         alive_ips_set = set()
         if all_unique_ips:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(all_unique_ips), max_workers)) as pre_exec:
-                ping_futures = {pre_exec.submit(fast_tcp_ping, ip, 443, 0.8): ip for ip in all_unique_ips}
+                ping_futures = {pre_exec.submit(fast_tcp_ping, ip, 443, PROBE_DEFAULTS.prefilter_timeout): ip for ip in all_unique_ips}
                 for f in concurrent.futures.as_completed(ping_futures):
                     ip = ping_futures[f]
                     try:
@@ -633,26 +709,31 @@ class CDNOptimizer:
                     except Exception:
                         pass
 
-        # 4. 组装 Stage 2 深度探测任务 (若某服务在预筛中全部未通过，则保留全部原 IP 兜底)
+        # 4. 组装 Stage 2 深度探测任务 (预筛存活率低于下限时全池深测, 防预筛误杀慢节点)
         flat_tasks = []
         results_by_srv: Dict[str, List[Dict]] = {srv_id: [] for srv_id in CANDIDATE_IPS}
+
+        # 全局兜底: 整轮存活率过低说明预筛被系统性干扰 (如跨洋链路集体抖动), 跳过预筛过滤
+        if all_unique_ips and len(alive_ips_set) < PROBE_DEFAULTS.prefilter_floor * len(all_unique_ips):
+            alive_ips_set = set(all_unique_ips)
 
         for srv_id, ips in service_raw_ips.items():
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
             sni_mode = SNI_MODES.get(srv_id, "host")
+            # 服务级探测档位 (profile.probe_timeout 优先, 回退全局 cdn_timeout_seconds)
+            task_timeout = probe_timeout_for(srv_id, timeout)
 
-            # 筛选出存活 IP, 若全部未通过则保留原池兜底
-            survived_ips = [ip for ip in ips if ip in alive_ips_set]
-            final_ips = survived_ips if survived_ips else ips
+            # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
+            final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
-                flat_tasks.append((srv_id, ip, domain, sni_mode))
+                flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout))
 
         def run_both(task):
-            srv_id, ip, domain, sni_mode = task
-            direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None, quick_retry=True)
-            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy, quick_retry=False) if proxy else None
+            srv_id, ip, domain, sni_mode, task_timeout = task
+            direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None, quick_retry=True)
+            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy, quick_retry=False) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -673,18 +754,7 @@ class CDNOptimizer:
                                 "direct": None, "proxy": None, "proxy_used": proxy_ready}
                     results_by_srv[srv_id].append(item)
 
-        def _sort_key(x):
-            rank = x.get("rank", 3)
-            lat = x.get("latency") if x.get("latency") is not None else 99999
-            is_v6 = ":" in str(x.get("ip", ""))
-            v_penalty = 0
-            if ip_mode == "prefer_ipv4" and is_v6:
-                v_penalty = 1
-            elif ip_mode == "prefer_ipv6" and not is_v6:
-                v_penalty = 1
-            return (rank, v_penalty, lat)
-
-        # 6. 补齐未完成/兜底项并按 rank 升序与延时升序保序排序
+        # 6. 补齐未完成/兜底项并按统一排序键 (rank → 协议偏好 → 稳定段 → 延迟) 保序排序
         for srv_id, items in results_by_srv.items():
             done_ips = {it["ip"] for it in items}
             for expected_ip in CANDIDATE_IPS.get(srv_id, []):
@@ -694,7 +764,8 @@ class CDNOptimizer:
                     items.append({"ip": expected_ip, "latency": None, "available": False, "rank": 3,
                                   "via_proxy": False, "recommend": "none", "sni_mode": SNI_MODES.get(srv_id, "host"),
                                   "direct": None, "proxy": None, "proxy_used": proxy_ready})
-            items.sort(key=_sort_key)
+            stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
+            items.sort(key=lambda x: _service_sort_key(x, ip_mode, stable_set))
 
         return results_by_srv
 
@@ -790,8 +861,10 @@ class CDNOptimizer:
             if not usable:
                 usable = [{"ip": it["ip"]} for it in ip_items if "ip" in it and it["ip"]]
 
-            # 防御性排序: 保证 rank0 在前、延迟升序, 不依赖调用方预排序
-            usable.sort(key=lambda x: (x.get("rank", 3), x.get("latency") if x.get("latency") is not None else 99999))
+            # 防御性排序: 复用统一排序键 (稳定段优先于延迟), 不依赖调用方预排序
+            # 若这里只按延迟排序, 会覆盖 test_all_services 的稳优先结果导致白做
+            stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
+            usable.sort(key=lambda x: _service_sort_key(x, None, stable_set))
             valid_ips = [it["ip"] for it in usable if it.get("ip")]
             primary_ips = valid_ips[:2]
             backup_ips = valid_ips[2:4]
@@ -914,6 +987,12 @@ class CDNHealthMonitor:
             if current_results:
                 self.cached_results = dict(current_results)
 
+    def set_check_interval(self, seconds: float):
+        """运行中调整巡检周期 (线程安全; _worker_loop 每轮自然读取新值生效)"""
+        seconds = max(5.0, float(seconds))
+        with self._lock:
+            self.check_interval = seconds
+
     def check_and_heal_service(self, srv_id: str) -> bool:
         """检查单个服务的当前主力节点，并在故障时自动选举自愈"""
         srv = SERVICES_BY_ID.get(srv_id)
@@ -936,7 +1015,7 @@ class CDNHealthMonitor:
         if srv_id in getattr(self.optimizer, "last_relay_services", set()):
             port = relay_port_for(srv_id)
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                with socket.create_connection(("127.0.0.1", port), timeout=PROBE_DEFAULTS.relay_probe_timeout):
                     pass
                 with self._lock:
                     self.failure_counts[srv_id] = 0
@@ -955,15 +1034,17 @@ class CDNHealthMonitor:
                 return True
             return False
 
-        # 轻量探针检查当前主力节点
+        # 轻量探针检查当前主力节点 (三态验证: TCP+TLS 通且 HTTP 非 5xx/421 才算健康)
         sni_mode = SNI_MODES.get(srv_id, "host")
         domain = srv["domains"][0] if srv["domains"] else ""
-        probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain, timeout=2.0, sni_mode=sni_mode)
+        probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain,
+                                         timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode)
 
-        if probe_res.get("tls_ok", False):
+        if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
+                and not _suspect_status(probe_res.get("http_status"))):
             with self._lock:
                 self.failure_counts[srv_id] = 0
-            return False  # 主力节点健康，无需自愈
+            return False  # 主力节点健康 (HTTP 被 RST/421/502 不再误判健康)，无需自愈
 
         # 连续失败计数累加
         with self._lock:

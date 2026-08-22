@@ -53,6 +53,8 @@ class ServiceProfile:
     enable_cache: bool = False               # 是否启用本地磁盘缓存
     path_rules: List[PathRule] = field(default_factory=list) # 特殊路径规则列表
     custom_headers: Dict[str, str] = field(default_factory=dict) # 自定义 HTTP 头部
+    probe_timeout: Optional[float] = None    # 服务级探测档位 (秒), 覆盖全局 cdn_timeout_seconds
+    stable_ips: List[str] = field(default_factory=list) # 已知稳定段 IP, 测速排序"稳优先"信号
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -347,7 +349,10 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_web",
         ssl_sni_mode="host",
-        candidate_ips=["140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4", "20.27.177.113", "20.200.245.247"]
+        probe_timeout=3.0,  # Fastly/Azure 跨洋链路高丢包, 放宽探测档位防晚高峰误判超时
+        stable_ips=["20.27.177.113", "20.200.245.247"],  # Azure 亚太稳定段, 排序稳优先
+        candidate_ips=["20.27.177.113", "20.200.245.247",  # Azure 亚太优先 (稳)
+                       "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4"]  # Fastly Anycast 兜底
     ),
     ServiceProfile(
         id="github_raw",

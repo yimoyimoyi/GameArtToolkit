@@ -947,3 +947,215 @@ class TestDohDualChannel:
              patch("cdn_optimizer.doh_resolve", return_value=["151.101.64.223"]):
             ips = _resolve_dns_candidates("pypi.org", timeout=0.2)
         assert ips == ["151.101.64.223"]
+# ==============================================================================
+# 20. 统一测速参数中心 (ProbeDefaults / 档位换算)
+# ==============================================================================
+class TestProbeDefaults:
+    def test_hard_budget_invariant(self):
+        """不变量: hard_budget == tcp+tls+http (总预算由三阶段预算构成)"""
+        from cdn_optimizer import PROBE_DEFAULTS
+        assert PROBE_DEFAULTS.hard_budget == pytest.approx(
+            PROBE_DEFAULTS.tcp_budget + PROBE_DEFAULTS.tls_budget + PROBE_DEFAULTS.http_budget)
+
+    def test_prefilter_below_tcp_budget(self):
+        """预筛超时须小于 Stage2 TCP 预算 (预筛淘汰的节点 Stage2 也必然淘汰, 不自相矛盾)"""
+        from cdn_optimizer import PROBE_DEFAULTS
+        assert PROBE_DEFAULTS.prefilter_timeout < PROBE_DEFAULTS.tcp_budget
+
+    def test_tier_scale_monotonic_and_clamped(self):
+        """档位换算单调且夹钳: 0.8 档更快 / 1.5 档=1.0 / 3.0 档更宽容, 极值不失控"""
+        from cdn_optimizer import tier_scale
+        assert tier_scale(0.8) == pytest.approx(0.6)   # clamp 下限
+        assert tier_scale(1.5) == pytest.approx(1.0)   # 基准档
+        assert tier_scale(3.0) == pytest.approx(2.0)   # clamp 上限
+        assert tier_scale(0.1) == pytest.approx(0.6)   # 极低档不失控
+        assert tier_scale(5.0) == pytest.approx(2.0)   # 极高档不失控
+        assert tier_scale(1.0) < tier_scale(2.5)
+
+
+# ==============================================================================
+# 21. 预筛存活率兜底 (防预筛误杀慢节点)
+# ==============================================================================
+class TestPrefilterFloor:
+    POOL = ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]  # 池大小 4, 下限 max(1, 1)=1
+
+    def test_all_alive_returns_full_subset(self):
+        """全存活 -> 存活数 >= 下限, 返回全池"""
+        from cdn_optimizer import _apply_prefilter_floor
+        assert _apply_prefilter_floor(self.POOL, set(self.POOL), 0.3) == self.POOL
+
+    def test_above_floor_filters_dead(self):
+        """存活 2 个 >= 下限 -> 过滤为存活子集 (预筛正常生效)"""
+        from cdn_optimizer import _apply_prefilter_floor
+        alive = {"1.1.1.1", "2.2.2.2"}
+        assert _apply_prefilter_floor(self.POOL, alive, 0.3) == ["1.1.1.1", "2.2.2.2"]
+
+    def test_below_floor_returns_full_pool(self):
+        """存活 1 个 < 下限 2 (floor=0.5, 阈值 max(1, 2)=2) -> 返回全池深测 (防预筛误杀)"""
+        from cdn_optimizer import _apply_prefilter_floor
+        alive = {"1.1.1.1"}
+        assert _apply_prefilter_floor(self.POOL, alive, 0.5) == self.POOL
+
+    def test_empty_pool(self):
+        """空池 -> 空列表"""
+        from cdn_optimizer import _apply_prefilter_floor
+        assert _apply_prefilter_floor([], set(), 0.3) == []
+
+    def test_tiny_pool_floor_at_least_one(self):
+        """极小池下限至少 1: 存活 1 个即不触发兜底"""
+        from cdn_optimizer import _apply_prefilter_floor
+        pool = ["1.1.1.1", "2.2.2.2"]
+        assert _apply_prefilter_floor(pool, {"1.1.1.1"}, 0.3) == ["1.1.1.1"]
+
+
+# ==============================================================================
+# 22. 统一排序键稳优先 (稳定性先于延迟, rank 永远第一)
+# ==============================================================================
+class TestSortStability:
+    @staticmethod
+    def _items():
+        return [
+            {"ip": "140.82.121.4", "rank": 0, "latency": 30.0, "available": True},   # Fastly 快
+            {"ip": "20.27.177.113", "rank": 0, "latency": 80.0, "available": True},  # Azure 稳
+            {"ip": "8.8.8.8", "rank": 3, "latency": None, "available": False},
+        ]
+
+    def test_stable_rank0_beats_fast_unstable(self):
+        """稳定段 rank0 胜于低延迟不稳定 rank0 (稳优先于延迟)"""
+        from cdn_optimizer import _service_sort_key
+        items = self._items()
+        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", {"20.27.177.113"}))
+        assert items[0]["ip"] == "20.27.177.113"
+
+    def test_empty_stable_falls_back_to_latency(self):
+        """无 stable_ips -> 退化为旧键序 (同 rank 内延迟升序)"""
+        from cdn_optimizer import _service_sort_key
+        items = self._items()
+        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", None))
+        assert items[0]["ip"] == "140.82.121.4"
+
+    def test_v6_penalty_before_stability(self):
+        """v6 偏好惩罚仍在稳定度之前: prefer_ipv4 下 v6 稳定段不敌 v4 非稳定段"""
+        from cdn_optimizer import _service_sort_key
+        items = [
+            {"ip": "2606:50c0:8000::154", "rank": 0, "latency": 5.0},
+            {"ip": "140.82.121.4", "rank": 0, "latency": 30.0},
+        ]
+        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", {"2606:50c0:8000::154"}))
+        assert items[0]["ip"] == "140.82.121.4"
+
+    def test_rank_always_first(self):
+        """rank 永远第一: rank0 非稳定段仍胜于 rank1 稳定段"""
+        from cdn_optimizer import _service_sort_key
+        items = [
+            {"ip": "140.82.121.4", "rank": 0, "latency": 200.0},
+            {"ip": "20.27.177.113", "rank": 1, "latency": 10.0},
+        ]
+        items.sort(key=lambda x: _service_sort_key(x, None, {"20.27.177.113"}))
+        assert items[0]["ip"] == "140.82.121.4"
+
+
+# ==============================================================================
+# 23. 健康巡检 HTTP 验证 (TLS 通但 HTTP 不可用不再误判健康)
+# ==============================================================================
+class TestHealthHttpVerify:
+    @staticmethod
+    def _monitor(fake):
+        m = CDNHealthMonitor(fake)
+        m.update_services(["github_web"], {"github_web": fake.current})
+        return m
+
+    def test_tls_ok_but_http_timeout_counts_failure(self):
+        """TLS 通 + HTTP 超时(http_ok=False) -> 不判健康, 计数失败"""
+        fake = FakeOptimizer()
+        monitor = self._monitor(fake)
+        with patch("cdn_optimizer.probe_ip_endpoint_v2",
+                   return_value={"tls_ok": True, "tcp_ok": True, "http_ok": False, "http_status": None}):
+            assert monitor.check_and_heal_service("github_web") is False
+            assert monitor.failure_counts.get("github_web", 0) == 1, "HTTP 不可用必须计数失败"
+
+    def test_tls_ok_http_502_counts_failure(self):
+        """TLS 通 + HTTP 502 -> 可疑节点不判健康, 计数失败"""
+        fake = FakeOptimizer()
+        monitor = self._monitor(fake)
+        with patch("cdn_optimizer.probe_ip_endpoint_v2",
+                   return_value={"tls_ok": True, "tcp_ok": True, "http_ok": True, "http_status": 502}):
+            assert monitor.check_and_heal_service("github_web") is False
+            assert monitor.failure_counts.get("github_web", 0) == 1
+
+    def test_tls_ok_http_200_healthy(self):
+        """TLS + HTTP 200 -> 健康, 计数清零"""
+        fake = FakeOptimizer()
+        monitor = self._monitor(fake)
+        with patch("cdn_optimizer.probe_ip_endpoint_v2",
+                   return_value={"tls_ok": True, "tcp_ok": True, "http_ok": True, "http_status": 200}):
+            assert monitor.check_and_heal_service("github_web") is False
+            assert monitor.failure_counts.get("github_web", 0) == 0
+
+
+# ==============================================================================
+# 24. 服务级探测档位 (probe_timeout 覆盖全局配置)
+# ==============================================================================
+class TestServiceProbeOverride:
+    def test_profile_override_beats_config(self):
+        """profile.probe_timeout 覆盖全局 cdn_timeout_seconds"""
+        from cdn_optimizer import probe_timeout_for
+        assert probe_timeout_for("github_web", cfg_timeout=1.5) == pytest.approx(3.0)
+
+    def test_missing_override_falls_back_to_config(self):
+        """无服务级档位的服务回退全局配置"""
+        from cdn_optimizer import probe_timeout_for
+        assert probe_timeout_for("steam_store", cfg_timeout=1.5) == pytest.approx(1.5)
+        assert probe_timeout_for("steam_store", cfg_timeout=0.8) == pytest.approx(0.8)
+
+    def test_missing_everything_falls_back_default(self):
+        """无 profile 且无 config -> 默认 1.5"""
+        from cdn_optimizer import probe_timeout_for
+        assert probe_timeout_for("unknown_srv", cfg_timeout=None) == pytest.approx(1.5)
+
+
+# ==============================================================================
+# 25. github_web 服务参数卡 (Azure 亚太稳定段优先)
+# ==============================================================================
+class TestGithubWebProfile:
+    def test_candidate_ips_azure_first(self):
+        """github_web 候选池 Azure 亚太在前, Fastly 兜底在后"""
+        from ip_pool import PROFILES_BY_ID
+        profile = PROFILES_BY_ID["github_web"]
+        assert len(profile.candidate_ips) >= 2
+        assert profile.candidate_ips[0].startswith("20."), "Azure 亚太应排首位"
+        assert profile.candidate_ips[1].startswith("20.")
+        assert "140.82.121.4" in profile.candidate_ips, "Fastly 仍保留作兜底"
+
+    def test_probe_timeout_override(self):
+        """github_web 服务级探测档位 3.0s (跨洋高丢包放宽)"""
+        from ip_pool import PROFILES_BY_ID
+        assert PROFILES_BY_ID["github_web"].probe_timeout == pytest.approx(3.0)
+
+    def test_stable_ips_nonempty(self):
+        """github_web 声明 Azure 稳定段"""
+        from ip_pool import PROFILES_BY_ID
+        stable = PROFILES_BY_ID["github_web"].stable_ips
+        assert len(stable) == 2
+        assert all(ip.startswith("20.") for ip in stable)
+
+
+# ==============================================================================
+# 26. 巡检周期运行中调整 (set_check_interval)
+# ==============================================================================
+class TestHealthIntervalSetter:
+    def test_set_check_interval_updates(self):
+        """set_check_interval 运行中调整巡检周期 (含 5s 下限保护)"""
+        monitor = CDNHealthMonitor(FakeOptimizer())
+        assert monitor.check_interval == 300.0  # 构造默认
+        monitor.set_check_interval(60)
+        assert monitor.check_interval == 60
+        monitor.set_check_interval(1)
+        assert monitor.check_interval == 5.0, "过小间隔应被下限保护钳制"
+
+    def test_worker_loop_reads_latest_interval(self):
+        """_worker_loop 每轮 wait 读取最新 check_interval (新值自然生效)"""
+        monitor = CDNHealthMonitor(FakeOptimizer())
+        monitor.set_check_interval(7)
+        assert monitor.check_interval == 7
+        monitor.stop()
