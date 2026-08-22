@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
 
 # 旧版粗粒度服务 ID 到细粒度 ID 的映射转换字典 (自动兼容历史配置)
 _LEGACY_SERVICE_MAPPING = {
-    "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "danbooru", "yandere", "vndb"],
+    "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "danbooru", "vndb"],
     "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft", "ea_app"],
     "github": ["github_web", "github_raw", "github_release", "github_assets", "gitlab"],
     "huggingface": ["huggingface"],

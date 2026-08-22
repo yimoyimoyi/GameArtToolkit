@@ -1019,8 +1019,8 @@ class MainWindow(QMainWindow):
         alias_map = {
             "gh": ["github"], "px": ["pixiv"], "st": ["steam"], "hf": ["huggingface"],
             "db": ["danbooru"], "gl": ["gitlab"], "fb": ["fanbox"], "bt": ["booth"],
-            "yd": ["yandere"], "vn": ["vndb"], "ubi": ["ubisoft"], "origin": ["ea_app"],
-            "ea": ["ea_app"], "art": ["pixiv", "fanbox", "booth", "danbooru", "yandere"],
+            "vn": ["vndb"], "ubi": ["ubisoft"], "origin": ["ea_app"],
+            "ea": ["ea_app"], "art": ["pixiv", "fanbox", "booth", "danbooru"],
             "game": ["steam", "ea_app", "ubisoft"], "dev": ["github", "gitlab", "huggingface"]
         }
         expanded_keywords = [kw]

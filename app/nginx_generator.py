@@ -46,12 +46,8 @@ class NginxConfGenerator:
             domains_list.append("*.fanbox.cc")
         elif profile.id == "gitlab" and "*.gitlab.com" not in domains_list:
             domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
-        elif profile.id == "yandere" and "*.yande.re" not in domains_list:
-            domains_list.append("*.yande.re")
         elif profile.id == "dlsite" and "*.dlsite.com" not in domains_list:
             domains_list.append("*.dlsite.com")
-        elif profile.id == "epic_games" and "*.epicgames.com" not in domains_list:
-            domains_list.append("*.epicgames.com")
         elif profile.id == "battle_net":
             for _wd in ("*.battle.net", "*.blizzard.com"):
                 if _wd not in domains_list:
@@ -112,19 +108,30 @@ class NginxConfGenerator:
             "        proxy_set_header Upgrade $http_upgrade;",
             "        proxy_set_header Connection $connection_upgrade;",
             f"        proxy_set_header Host {host_header};",
-            "        proxy_set_header X-Real-IP $remote_addr;",
-            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-            "        proxy_set_header X-Forwarded-Proto https;",
+            "        proxy_set_header User-Agent $http_user_agent;",
+            "        proxy_set_header Accept-Encoding $http_accept_encoding;",
+            "        proxy_set_header Accept-Language $http_accept_language;",
             f"        proxy_ssl_name {sni_str};",
             "        proxy_ssl_server_name on;",
             "        proxy_ssl_verify off;",
             "        proxy_ssl_session_reuse on;",
         ])
 
-        # Steam 社区与图库重定向防死循环自适应
-        if profile.id in ("steam_community", "yandere"):
-            if profile.id == "steam_community":
-                lines.insert(len(lines) - 4, '        proxy_set_header User-Agent "${http_user_agent} Googlebot/2.1 (+http://www.google.com/bot.html)";')
+        # 本地静态资源/图片磁盘缓存挂载
+        if profile.enable_cache:
+            lines.extend([
+                "        # 开启本地磁盘缓存 (消除频次冲击与 0ms 秒开)",
+                "        proxy_cache pixiv_img_cache;",
+                "        proxy_cache_valid 200 304 7d;",
+                "        proxy_cache_valid 404 1m;",
+                "        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;",
+                "        proxy_cache_revalidate on;",
+                "        proxy_cache_lock on;",
+                "        add_header X-Cache-Status $upstream_cache_status;",
+            ])
+
+        # Steam 社区重定向防死循环自适应
+        if profile.id == "steam_community":
             lines.extend([
                 "        proxy_redirect default;",
                 "        proxy_redirect http:// https://;",

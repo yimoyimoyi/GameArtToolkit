@@ -31,13 +31,15 @@ class TestNginxGenerator(unittest.TestCase):
         gaming_text = results["site-gaming.conf"]
         self.assertIn("store.steampowered.com", gaming_text)
         self.assertIn("steamcommunity.com", gaming_text)
-        self.assertIn("statuspage.akamaized.net", gaming_text)
+        self.assertIn("steambroadcast.akamaized.net", gaming_text)
+        self.assertNotIn("epicgames.com", gaming_text)  # epic_games 服务已移除
 
         acg_text = results["site-acg.conf"]
         self.assertIn("www.pixiv.net", acg_text)
         self.assertIn("i.pximg.net", acg_text)
         self.assertIn("proxy_cache pixiv_img_cache", acg_text)
-        self.assertIn("assets.yande.re", acg_text)
+        self.assertNotIn("yande.re", acg_text)  # yandere 服务已移除
+        self.assertNotIn("assets.yande.re", acg_text)
         self.assertNotIn("fandom.com", acg_text)  # fandom 服务已移除
         self.assertNotIn("static.wikia.nocookie.net", acg_text)
 

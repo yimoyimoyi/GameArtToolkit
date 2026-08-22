@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 PixivToolkit - 全加速项实机真实连通性与反代可用性探测脚本 (纯文本安全版)
 """
@@ -16,7 +16,6 @@ TARGET_SERVICES = [
     {"group": "游戏生态", "name": "Steam 商店与结账", "host": "store.steampowered.com", "ips": ["23.1.179.144", "104.71.154.102"], "path": "/"},
     {"group": "游戏生态", "name": "Steam 社区主页", "host": "steamcommunity.com", "ips": ["23.1.179.144", "96.7.99.225"], "path": "/"},
     {"group": "游戏生态", "name": "Steam Akamai 静态 CDN", "host": "community.akamai.steamstatic.com", "ips": ["184.27.185.73", "23.202.34.90"], "path": "/public/images/v6/logo_steam.svg"},
-    {"group": "游戏生态", "name": "Epic Games 商城", "host": "store.epicgames.com", "ips": ["151.101.194.133", "151.101.66.133"], "path": "/"},
     {"group": "游戏生态", "name": "Ubisoft 育碧商城", "host": "store.ubi.com", "ips": ["23.41.142.46", "104.91.87.202"], "path": "/"},
     {"group": "游戏生态", "name": "EA App / Origin", "host": "api.origin.com", "ips": ["23.41.142.46", "104.91.87.202"], "path": "/"},
     {"group": "游戏生态", "name": "GOG Galaxy 商城", "host": "gog.com", "ips": ["151.101.194.133", "151.101.66.133"], "path": "/"},
@@ -28,7 +27,6 @@ TARGET_SERVICES = [
     {"group": "二次元创作", "name": "Pixiv Fanbox 赞助", "host": "fanbox.cc", "ips": ["172.64.146.116", "172.64.146.247"], "path": "/"},
     {"group": "二次元创作", "name": "BOOTH 同人商城", "host": "booth.pm", "ips": ["151.101.65.140", "151.101.129.140"], "path": "/"},
     {"group": "二次元创作", "name": "Danbooru 图库", "host": "danbooru.donmai.us", "ips": ["104.21.49.191", "172.67.168.170"], "path": "/"},
-    {"group": "二次元创作", "name": "Yande.re 动漫壁纸", "host": "yande.re", "ips": ["104.26.12.197", "172.67.69.123"], "path": "/post"},
     {"group": "二次元创作", "name": "ArtStation 艺术库", "host": "www.artstation.com", "ips": ["151.101.194.133", "151.101.66.133"], "path": "/"},
     {"group": "二次元创作", "name": "VNDB 视觉小说库", "host": "vndb.org", "ips": ["217.182.194.133"], "path": "/"},
     {"group": "二次元创作", "name": "Kemono 创作者归档", "host": "kemono.su", "ips": ["104.21.61.122", "172.67.147.234"], "path": "/"},

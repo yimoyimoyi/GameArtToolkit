@@ -72,13 +72,13 @@ SERVICE_GROUPS = {
         "id": "gaming",
         "name": "游戏生态",
         "icon": "gamepad",
-        "desc": "Steam 全生态、Epic Games、Battle.net、GOG、Xbox、Minecraft、Ubisoft、EA App"
+        "desc": "Steam 全生态、Battle.net、GOG、Xbox、Minecraft、Ubisoft、EA App"
     },
     "acg": {
         "id": "acg",
         "name": "二次元与创作者",
         "icon": "palette",
-        "desc": "Pixiv全生态、Fanbox、BOOTH、Danbooru、Yande.re、VNDB、Fantia、MyAnimeList"
+        "desc": "Pixiv全生态、Fanbox、BOOTH、Danbooru、VNDB、Fantia、MyAnimeList"
     },
     "dev": {
         "id": "dev",
@@ -90,7 +90,7 @@ SERVICE_GROUPS = {
 
 
 # ==============================================================================
-# 28 项核心加速服务 Profile 注册表 (声明式单源定义, 支持运行时动态扩展)
+# 26 项核心加速服务 Profile 注册表 (声明式单源定义, 支持运行时动态扩展)
 # ==============================================================================
 PROFILES: List[ServiceProfile] = [
     # --------------------------------------------------------------------------
@@ -105,8 +105,8 @@ PROFILES: List[ServiceProfile] = [
         icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_store",
-        ssl_sni_mode="host",
-        candidate_ips=["23.1.179.144", "104.71.154.102", "96.7.99.225", "23.41.142.46"]
+        ssl_sni_mode="steambroadcast.akamaized.net",  # 统一伪 SNI
+        candidate_ips=["23.1.179.144", "23.46.229.9", "104.91.87.202", "96.7.99.225"]
     ),
     ServiceProfile(
         id="steam_community",
@@ -117,8 +117,8 @@ PROFILES: List[ServiceProfile] = [
         icon="gamepad",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_community",
-        ssl_sni_mode="statuspage.akamaized.net",  # 伪 SNI 绕过 GFW
-        candidate_ips=["104.69.160.135", "104.91.87.202", "23.1.179.144", "96.7.99.225"],
+        ssl_sni_mode="steambroadcast.akamaized.net",  # 实测最佳伪 SNI 绕过 GFW 且 Akamai 响应 200 OK
+        candidate_ips=["23.1.179.144", "23.46.229.9", "104.91.87.202", "96.7.99.225"],
         custom_headers={"Host": "steamcommunity.com"}
     ),
     ServiceProfile(
@@ -127,14 +127,14 @@ PROFILES: List[ServiceProfile] = [
         name="Steam 静态图片 CDN",
         desc="解决好友头像加载失败、创意工坊 Mod 预览图破图",
         domains=["community.akamai.steamstatic.com", "avatars.akamai.steamstatic.com", "clan.akamai.steamstatic.com",
-                 "community.akamai.steamstatic.com",
                  "steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",  # 创意工坊封面/用户上传图
                  "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"],  # 静态资源 CDN
         icon="zap",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_akamai",
-        ssl_sni_mode="community.steamstatic.com",
-        candidate_ips=["184.27.185.73", "23.202.34.90", "23.46.197.62"]
+        ssl_sni_mode="steambroadcast.akamaized.net",  # 统一伪 SNI
+        enable_cache=True,  # 开启本地磁盘缓存，防击穿并消除频次冲击
+        candidate_ips=["23.1.179.144", "23.46.229.9", "23.32.91.49", "184.27.185.73"]
     ),
     ServiceProfile(
         id="ubisoft",
@@ -159,20 +159,6 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_ea_app",
         ssl_sni_mode="host",
         candidate_ips=["23.1.179.144", "184.27.185.73", "23.202.34.90", "23.41.142.46"]
-    ),
-    ServiceProfile(
-        id="epic_games",
-        group="gaming",
-        name="Epic Games 商店",
-        desc="Epic 游戏商店、账号与启动器服务 (Cloudflare 主站 + Akamai 图片)",
-        domains=["epicgames.com", "www.epicgames.com", "store.epicgames.com",
-                 "accounts.epicgames.com", "launcher.epicgames.com",
-                 "cdn1.epicgames.com", "cdn2.epicgames.com", "download.epicgames.com"],
-        icon="shopping_bag",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_epic_games",
-        ssl_sni_mode="host",
-        candidate_ips=["184.192.31.233", "3.211.161.78", "100.50.163.168"]  # 实测: Epic 自有 CDN 节点 (301 重定向正常)
     ),
     ServiceProfile(
         id="battle_net",
@@ -304,18 +290,6 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_danbooru",
         ssl_sni_mode="host",
         candidate_ips=["104.21.49.191", "172.67.168.170"]
-    ),
-    ServiceProfile(
-        id="yandere",
-        group="acg",
-        name="Yande.re 高清动漫壁纸",
-        desc="解决超高清壁纸原图下载超时与死循环重定向",
-        domains=["yande.re", "www.yande.re", "files.yande.re", "assets.yande.re"],
-        icon="image",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_yandere",
-        ssl_sni_mode="host",
-        candidate_ips=["104.26.12.197", "172.67.69.123", "172.64.150.76"]
     ),
     ServiceProfile(
         id="vndb",

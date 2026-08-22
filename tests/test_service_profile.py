@@ -28,18 +28,18 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证服务 Profile 基准完整性 (28 项: 10 gaming + 9 acg + 9 dev; fandom/wikipedia/google_translate/dlsite/patreon 已移除)"""
-        self.assertEqual(len(PROFILES), 28)
-        self.assertEqual(len(SERVICES_LIST), 28)
-        self.assertEqual(len(SERVICES_BY_ID), 28)
-        self.assertEqual(len(CANDIDATE_IPS), 28)
+        """验证服务 Profile 基准完整性 (26 项: 9 gaming + 8 acg + 9 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere 已移除)"""
+        self.assertEqual(len(PROFILES), 26)
+        self.assertEqual(len(SERVICES_LIST), 26)
+        self.assertEqual(len(SERVICES_BY_ID), 26)
+        self.assertEqual(len(CANDIDATE_IPS), 26)
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
         self.assertNotIn("dlsite", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
         self.assertNotIn("patreon", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
-        self.assertIn("yandere", SERVICES_BY_ID)
-        self.assertIn("epic_games", SERVICES_BY_ID)
+        self.assertNotIn("yandere", SERVICES_BY_ID)
+        self.assertNotIn("epic_games", SERVICES_BY_ID)
         self.assertIn("battle_net", SERVICES_BY_ID)
         self.assertIn("gog", SERVICES_BY_ID)
         self.assertIn("xbox", SERVICES_BY_ID)
@@ -61,7 +61,7 @@ class TestServiceProfile(unittest.TestCase):
         """测试服务根据 ID 与域名的动态查找与通配匹配"""
         p_steam = get_profile_by_id("steam_community")
         self.assertIsNotNone(p_steam)
-        self.assertEqual(p_steam.ssl_sni_mode, "statuspage.akamaized.net")
+        self.assertEqual(p_steam.ssl_sni_mode, "steambroadcast.akamaized.net")
 
         # 域名查找
         p_pixiv = get_profile_by_domain("i.pximg.net")
