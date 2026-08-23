@@ -68,7 +68,7 @@ _LEGACY_SERVICE_MAPPING = {
 }
 
 # 新版本引入的服务: 自动纳入已存在用户配置的 enabled_services (不打扰用户已关闭项)
-_NEW_SERVICES_AUTO_ENABLE = ["pixivision", "yande", "jsdelivr", "nuget", "maven_central", "google_fonts"]
+_NEW_SERVICES_AUTO_ENABLE = ["pixivision", "jsdelivr", "nuget", "maven_central", "google_fonts"]
 
 def _sanitize_config(data: dict) -> dict:
     """清洗配置项，自动迁移旧版粗粒度服务 ID 并移除废弃字段"""

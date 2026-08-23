@@ -299,26 +299,6 @@
    ]
   ]
  },
- "yandere": {
-  "total": 3,
-  "usable": 2,
-  "best_latency": 238.5,
-  "best_ip": "104.26.12.197",
-  "best_rank": 0,
-  "proxy_used": false,
-  "ips": [
-   [
-    "104.26.12.197",
-    0,
-    238.5
-   ],
-   [
-    "172.67.69.123",
-    0,
-    249.6
-   ]
-  ]
- },
  "vndb": {
   "total": 1,
   "usable": 1,

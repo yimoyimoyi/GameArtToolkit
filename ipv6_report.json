@@ -214,17 +214,5 @@
    "http_status": null,
    "error": "tcp error: timed out"
   }
- ],
- "yandere": [
-  {
-   "ip": "2001::681f:8e58",
-   "tcp_ok": false,
-   "tcp_latency": null,
-   "tls_ok": false,
-   "tls_latency": null,
-   "http_ok": false,
-   "http_status": null,
-   "error": "tcp error: timed out"
-  }
  ]
 }

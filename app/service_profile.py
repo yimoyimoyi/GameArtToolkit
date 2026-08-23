@@ -342,18 +342,6 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         candidate_ips=["172.64.145.76", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
     ),
-    ServiceProfile(
-        id="yande",
-        group="acg",
-        name="Yande.re 高清壁纸",
-        desc="Moebooru 系高清壁纸库; 直连被区域策略 301 循环, 自动经本地代理 relay 出网",
-        domains=["yande.re", "www.yande.re"],
-        icon="image",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_yande",
-        ssl_sni_mode="host",
-        candidate_ips=["104.18.22.203", "172.64.150.76", "104.16.1.34"]
-    ),
 
     # --------------------------------------------------------------------------
     # 开发者 & AI

@@ -47,7 +47,7 @@ SERVICES_BY_ID = {s["id"]: s for s in SERVICES_LIST}
 CANDIDATE_IPS = {p.id: p.candidate_ips for p in PROFILES}
 
 # 默认开启全部已实测直连可用的服务 (需代理的 fandom/wikipedia/google_translate 已移除;
-# yandere 实测直连可用, 一并默认启用)
+# yandere 区域 301 循环已知不可用已移除)
 EXPERIMENTAL_OR_PROXY_SERVICES = set()
 DEFAULT_ENABLED_SERVICES = [p.id for p in PROFILES if p.id not in EXPERIMENTAL_OR_PROXY_SERVICES]
 
