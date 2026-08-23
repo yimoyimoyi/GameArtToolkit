@@ -514,6 +514,33 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         enable_cache=True,  # 字体与 CSS 静态资源, 缓存消除重复回源
         candidate_ips=["142.250.72.228", "120.253.253.161", "120.253.255.33"]
+    ),
+    ServiceProfile(
+        id="turnstile",
+        group="dev",
+        name="Cloudflare Turnstile 验证码",
+        desc="Turnstile 人机验证 JS/挑战端 (解决验证码转圈加载失败)",
+        domains=["challenges.cloudflare.com"],
+        icon="shield",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_turnstile",
+        ssl_sni_mode="host",
+        enable_cache=True,  # 验证码 JS 静态资源缓存加速
+        candidate_ips=["104.18.94.41", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+    ServiceProfile(
+        id="hcaptcha",
+        group="dev",
+        name="hCaptcha 人机验证",
+        desc="hCaptcha 验证码全套 (JS/API/资源域, 解决登录与提交卡验证)",
+        domains=["hcaptcha.com", "www.hcaptcha.com", "api.hcaptcha.com",
+                 "assets.hcaptcha.com", "newassets.hcaptcha.com"],
+        icon="shield",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_hcaptcha",
+        ssl_sni_mode="host",
+        enable_cache=True,
+        candidate_ips=["104.19.230.21", "104.19.229.21", "104.18.22.203", "172.64.150.76"]
     )
 ]
 
