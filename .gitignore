@@ -117,3 +117,13 @@ ehthumbs.db
 Thumbs.db
 [Dd]esktop.ini
 .BIN/
+
+# ==============================================================================
+# 本地测试产物 (不上传: 网络探测脚本与不可用项存档)
+# ==============================================================================
+# 候选对象连通性探测脚本与结果 (仅本地排查用)
+scripts/probe_candidates.py
+scripts/probe_candidates_retest.py
+scripts/probe_candidates_results.json
+# 已测试不可用对象存档报告
+TEST_REPORT_UNUSABLE.md

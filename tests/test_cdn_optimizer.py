@@ -583,12 +583,15 @@ class TestIPv6Candidates:
 # ==============================================================================
 class TestRelayPortFor:
     def test_deterministic_and_in_range(self):
-        """同一服务两次调用结果一致, 且落在 44311 起始递增区间 (28 项服务)"""
+        """同一服务两次调用结果一致且全服务端口唯一; 落在 44311 起始 64 端口哈希区间"""
+        ports = []
         for srv_id in CANDIDATE_IPS:
             p1 = relay_port_for(srv_id)
             p2 = relay_port_for(srv_id)
             assert p1 == p2, f"{srv_id} 的 relay 端口两次调用不一致"
-            assert 44311 <= p1 < 44311 + len(CANDIDATE_IPS), f"{srv_id} -> {p1} 超出合法区间"
+            assert 44311 <= p1 < 44311 + 64, f"{srv_id} -> {p1} 超出合法区间"
+            assert p1 not in ports, f"{srv_id} -> {p1} 与既有服务端口冲突"
+            ports.append(p1)
 
     def test_unknown_service_falls_back_to_base(self):
         """未知服务回退基址 44311"""

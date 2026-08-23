@@ -67,6 +67,9 @@ _LEGACY_SERVICE_MAPPING = {
     "huggingface": ["huggingface"],
 }
 
+# 新版本引入的服务: 自动纳入已存在用户配置的 enabled_services (不打扰用户已关闭项)
+_NEW_SERVICES_AUTO_ENABLE = ["pixivision", "yande", "jsdelivr", "nuget", "maven_central", "google_fonts"]
+
 def _sanitize_config(data: dict) -> dict:
     """清洗配置项，自动迁移旧版粗粒度服务 ID 并移除废弃字段"""
     # 1. 移除废弃的 Web 控制台端口字段
@@ -84,6 +87,10 @@ def _sanitize_config(data: dict) -> dict:
                 for target_id in _LEGACY_SERVICE_MAPPING[sid]:
                     if target_id in SERVICES_BY_ID:
                         new_services.add(target_id)
+        # 自动纳入新版本引入的服务 (保留用户已有关闭项)
+        for sid in _NEW_SERVICES_AUTO_ENABLE:
+            if sid in SERVICES_BY_ID:
+                new_services.add(sid)
         if not new_services:
             new_services = set(DEFAULT_ENABLED_SERVICES)
         data["enabled_services"] = sorted(list(new_services))

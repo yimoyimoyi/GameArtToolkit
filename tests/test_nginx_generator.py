@@ -38,8 +38,7 @@ class TestNginxGenerator(unittest.TestCase):
         self.assertIn("www.pixiv.net", acg_text)
         self.assertIn("i.pximg.net", acg_text)
         self.assertIn("proxy_cache pixiv_img_cache", acg_text)
-        self.assertNotIn("yande.re", acg_text)  # yandere 服务已移除
-        self.assertNotIn("assets.yande.re", acg_text)
+        self.assertIn("yande.re", acg_text)  # yande.re 已重新加入 (直连区域 301 循环, 自动经代理 relay)
         self.assertNotIn("fandom.com", acg_text)  # fandom 服务已移除
         self.assertNotIn("static.wikia.nocookie.net", acg_text)
 

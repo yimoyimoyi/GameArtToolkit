@@ -19,6 +19,7 @@ import struct
 import random
 import threading
 import ipaddress
+import zlib
 import urllib.request
 import concurrent.futures
 from dataclasses import dataclass
@@ -129,12 +130,27 @@ def _apply_prefilter_floor(pool_ips: List[str], alive_ips: set, floor: float) ->
     return survived
 
 
+_RELAY_PORT_MAP: Dict[str, int] = {}
+
+
 def relay_port_for(srv_id: str) -> int:
-    """确定性 relay 端口映射: RELAY_PORT_BASE + CANDIDATE_IPS 顺序索引 (零冲突, 跨会话稳定)"""
-    try:
-        return RELAY_PORT_BASE + list(CANDIDATE_IPS.keys()).index(srv_id)
-    except ValueError:
-        return RELAY_PORT_BASE
+    """确定性 relay 端口映射: crc32 稳定哈希 + 全量线性探测防冲突
+
+    - 按服务 ID 排序后统一分配, 不依赖 CANDIDATE_IPS 插入顺序
+      (新增 Profile 不再引发既有服务端口漂移冲突, 跨会话/跨进程稳定)
+    - 哈希基址落在 [RELAY_PORT_BASE, RELAY_PORT_BASE+64), 冲突时
+      线性探测取下一个未被其他服务最终占用的空闲端口
+    - 未知服务回退基址 (保持向后兼容)
+    """
+    if not _RELAY_PORT_MAP:
+        used: set = set()
+        for sid in sorted(CANDIDATE_IPS.keys()):
+            port = RELAY_PORT_BASE + (zlib.crc32(sid.encode("utf-8")) % 64)
+            while port in used:
+                port += 1
+            used.add(port)
+            _RELAY_PORT_MAP[sid] = port
+    return _RELAY_PORT_MAP.get(srv_id, RELAY_PORT_BASE)
 
 
 # 公共 DNS 服务器 (用于绕过被注入 hosts 的动态候选解析)

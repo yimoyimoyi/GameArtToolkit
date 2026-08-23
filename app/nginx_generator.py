@@ -48,6 +48,8 @@ class NginxConfGenerator:
             domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
         elif profile.id == "dlsite" and "*.dlsite.com" not in domains_list:
             domains_list.append("*.dlsite.com")
+        elif profile.id == "yande" and "*.yande.re" not in domains_list:
+            domains_list.append("*.yande.re")
         elif profile.id == "battle_net":
             for _wd in ("*.battle.net", "*.blizzard.com"):
                 if _wd not in domains_list:

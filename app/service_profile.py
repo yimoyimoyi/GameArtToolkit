@@ -330,6 +330,30 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         candidate_ips=["23.33.126.175", "23.33.126.132", "23.33.126.174", "23.33.126.144"]
     ),
+    ServiceProfile(
+        id="pixivision",
+        group="acg",
+        name="Pixivision 官方杂志",
+        desc="Pixiv 官方艺术杂志 (Cloudflare, 49ms 实测)",
+        domains=["pixivision.net", "www.pixivision.net"],
+        icon="palette",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_pixivision",
+        ssl_sni_mode="host",
+        candidate_ips=["172.64.145.76", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+    ServiceProfile(
+        id="yande",
+        group="acg",
+        name="Yande.re 高清壁纸",
+        desc="Moebooru 系高清壁纸库; 直连被区域策略 301 循环, 自动经本地代理 relay 出网",
+        domains=["yande.re", "www.yande.re"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_yande",
+        ssl_sni_mode="host",
+        candidate_ips=["104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
 
     # --------------------------------------------------------------------------
     # 开发者 & AI
@@ -463,6 +487,56 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_crates_io",
         ssl_sni_mode="host",
         candidate_ips=["151.101.194.137", "151.101.2.137", "151.101.66.137", "151.101.130.137", "3.170.229.4", "146.75.46.137"]
+    ),
+    ServiceProfile(
+        id="jsdelivr",
+        group="dev",
+        name="jsDelivr 前端 CDN",
+        desc="npm/GitHub 等开源前端资源全球分发 CDN (Cloudflare)",
+        domains=["cdn.jsdelivr.net", "data.jsdelivr.net"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_jsdelivr",
+        ssl_sni_mode="host",
+        enable_cache=True,  # 纯静态 JS/CSS, 本地磁盘缓存收益大
+        candidate_ips=["104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+    ServiceProfile(
+        id="nuget",
+        group="dev",
+        name="NuGet 包索引",
+        desc=".NET 包索引与文件分发加速 (Azure, 110ms 实测)",
+        domains=["api.nuget.org", "www.nuget.org", "globalcdn.nuget.org"],
+        icon="terminal",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_nuget",
+        ssl_sni_mode="host",
+        candidate_ips=["23.101.10.141", "23.101.10.113", "23.101.8.183"]
+    ),
+    ServiceProfile(
+        id="maven_central",
+        group="dev",
+        name="Maven Central 包索引",
+        desc="Java 包索引与构建依赖分发 (Apache/Cloudflare)",
+        domains=["repo.maven.apache.org", "repo1.maven.org", "search.maven.org"],
+        icon="terminal",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_maven_central",
+        ssl_sni_mode="host",
+        candidate_ips=["104.18.19.12", "172.64.150.76", "104.16.1.34"]
+    ),
+    ServiceProfile(
+        id="google_fonts",
+        group="dev",
+        name="Google Fonts 字体 CDN",
+        desc="Google 字体与 CSS 分发 (GFW 白名单直连, 官方证书可达节点)",
+        domains=["fonts.googleapis.com", "fonts.gstatic.com"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_google_fonts",
+        ssl_sni_mode="host",
+        enable_cache=True,  # 字体与 CSS 静态资源, 缓存消除重复回源
+        candidate_ips=["142.250.72.228", "120.253.253.161", "120.253.255.33"]
     )
 ]
 

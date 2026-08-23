@@ -29,7 +29,6 @@ TARGET_SERVICES = [
     {"group": "二次元创作", "name": "Danbooru 图库", "host": "danbooru.donmai.us", "ips": ["104.21.49.191", "172.67.168.170"], "path": "/"},
     {"group": "二次元创作", "name": "ArtStation 艺术库", "host": "www.artstation.com", "ips": ["151.101.194.133", "151.101.66.133"], "path": "/"},
     {"group": "二次元创作", "name": "VNDB 视觉小说库", "host": "vndb.org", "ips": ["217.182.194.133"], "path": "/"},
-    {"group": "二次元创作", "name": "Kemono 创作者归档", "host": "kemono.su", "ips": ["104.21.61.122", "172.67.147.234"], "path": "/"},
 
     # 开发者 & AI
     {"group": "开发者 & AI", "name": "GitHub 主站 Web", "host": "github.com", "ips": ["20.205.243.166", "140.82.112.3"], "path": "/"},
