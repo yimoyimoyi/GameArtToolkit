@@ -3,7 +3,7 @@
 ; ========================================================
 
 #define MyAppName "GameArt Toolkit"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "GameArt Project"
 #define MyAppURL "https://github.com/yimoyimoyi/PixivToolkit"
 #define MyAppExeName "GameArtToolkit.exe"

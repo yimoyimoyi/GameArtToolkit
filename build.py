@@ -39,7 +39,7 @@ def get_app_version() -> str:
                             return parts[1].strip().strip("'\"")
         except Exception:
             pass
-    return "1.0.0"
+    return "1.1.0"
 
 def find_iscc() -> str:
     """寻找系统安装的 Inno Setup 编译器 ISCC.exe"""
