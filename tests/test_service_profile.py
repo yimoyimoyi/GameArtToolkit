@@ -28,24 +28,24 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证服务 Profile 基准完整性 (31 项: 9 gaming + 9 acg + 13 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere 已移除)"""
-        self.assertEqual(len(PROFILES), 31)
-        self.assertEqual(len(SERVICES_LIST), 31)
-        self.assertEqual(len(SERVICES_BY_ID), 31)
-        self.assertEqual(len(CANDIDATE_IPS), 31)
+        """验证服务 Profile 基准完整性 (30 项: 9 gaming + 8 acg + 13 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
+        self.assertEqual(len(PROFILES), 30)
+        self.assertEqual(len(SERVICES_LIST), 30)
+        self.assertEqual(len(SERVICES_BY_ID), 30)
+        self.assertEqual(len(CANDIDATE_IPS), 30)
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
         self.assertNotIn("dlsite", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
         self.assertNotIn("patreon", SERVICES_BY_ID)  # GFW 全面阻断 (DNS 污染 + SNI RST)
         self.assertNotIn("yandere", SERVICES_BY_ID)
+        self.assertNotIn("myanimelist", SERVICES_BY_ID)  # Akamai 反爬 503 间歇, 反代失效已移除
         self.assertNotIn("epic_games", SERVICES_BY_ID)
         self.assertIn("battle_net", SERVICES_BY_ID)
         self.assertIn("gog", SERVICES_BY_ID)
         self.assertIn("xbox", SERVICES_BY_ID)
         self.assertIn("minecraft", SERVICES_BY_ID)
         self.assertIn("fantia", SERVICES_BY_ID)
-        self.assertIn("myanimelist", SERVICES_BY_ID)
         self.assertIn("npm", SERVICES_BY_ID)
         self.assertIn("pypi", SERVICES_BY_ID)
         self.assertIn("crates_io", SERVICES_BY_ID)

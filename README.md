@@ -21,7 +21,7 @@
 ### ✨ 核心特性
 
 - **🚀 本地多协议反代加速数据平面 (覆盖 3 大生态热门核心服务)**
-  - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Pixivision 官方杂志、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、VNDB 视觉小说资料库、Fantia 创作者俱乐部、MyAnimeList 动漫数据库。
+  - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Pixivision 官方杂志、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、VNDB 视觉小说资料库、Fantia 创作者俱乐部。
   - **游戏生态**：Steam 商店/结账、Steam 社区 118 修复、Steam Akamai 图片 CDN、Ubisoft 育碧商城、EA App / Origin、Battle.net 战网国际服、GOG 游戏商城、Xbox 微软游戏生态、Minecraft 游戏生态。
   - **开发者与 AI 生态**：GitHub 主站 Web/API、GitHub 静态资产与 Raw 直连、GitHub Releases 附件极速下载 (L4 Relay 旁路直通)、GitHub 前端 JS/CSS CDN、GitLab 国际版、HuggingFace AI 大模型权重直连。
   - **本地磁盘二级缓存**：二次打开插画与静态资源实现本地 0ms 闪电响应。

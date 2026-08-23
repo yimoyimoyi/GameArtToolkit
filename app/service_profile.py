@@ -319,18 +319,6 @@ PROFILES: List[ServiceProfile] = [
         candidate_ips=["35.241.8.68"]  # 实测 GCP 节点 (全子域 200)
     ),
     ServiceProfile(
-        id="myanimelist",
-        group="acg",
-        name="MyAnimeList 动漫数据库",
-        desc="动漫评分、条目与封面图数据库 (Akamai)",
-        domains=["myanimelist.net", "www.myanimelist.net", "api.myanimelist.net", "cdn.myanimelist.net"],
-        icon="book",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_myanimelist",
-        ssl_sni_mode="host",
-        candidate_ips=["23.33.126.175", "23.33.126.132", "23.33.126.174", "23.33.126.144"]
-    ),
-    ServiceProfile(
         id="pixivision",
         group="acg",
         name="Pixivision 官方杂志",
