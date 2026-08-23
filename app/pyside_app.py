@@ -56,7 +56,7 @@ from win_utils import (
     fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window,
     is_windows_dark_mode
 )
-from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT
+from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT, CANDIDATE_IPS
 from frameless_helper import NativeFramelessHelper
 from md_widgets import (
     MDSwitch, TrafficMonitorChart, LatencyBadge, TitleBar,
@@ -431,6 +431,19 @@ class MainWindow(QMainWindow):
         self._single_cdn_workers: Dict[str, SingleCDNTestWorker] = {}
         self._startup_cdn_worker: Optional[StartupAutoCDNWorker] = None
 
+        # 控制台分块折叠
+        self.collapsed_sections: Set[str] = set(load_config().get("collapsed_dashboard_sections", []))
+        self.group_collapse_buttons: Dict[str, QPushButton] = {}
+        self.group_content_widgets: Dict[str, QWidget] = {}
+        self.chart_collapse_btn: Optional[QPushButton] = None
+        self.chart_container: Optional[QWidget] = None
+        self.btn_toggle_all_collapse: Optional[QPushButton] = None
+
+        # CDN 测速页面状态横幅
+        self.cdn_status_banner: Optional[QFrame] = None
+        self.lbl_cdn_status_summary: Optional[QLabel] = None
+        self.lbl_cdn_last_time: Optional[QLabel] = None
+
         # 1. 注册 Win32 原生无边框辅助器
         self.frameless_helper = NativeFramelessHelper(self)
 
@@ -601,8 +614,16 @@ class MainWindow(QMainWindow):
             for lbl, icon_name in getattr(self, "settings_icon_labels", []):
                 lbl.setPixmap(SvgIconFactory.get_pixmap(icon_name, primary_icon_color, 18))
 
-            if getattr(self, "cdn_intro_icon", None):
-                self.cdn_intro_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_color, 36))
+            if getattr(self, "chart_collapse_btn", None):
+                is_c = ("traffic_chart" in self.collapsed_sections)
+                self.chart_collapse_btn.setIcon(SvgIconFactory.get_icon("chevron_down" if is_c else "chevron_up", primary_icon_color, 14))
+
+            for gid, btn in getattr(self, "group_collapse_buttons", {}).items():
+                is_c = (gid in self.collapsed_sections)
+                btn.setIcon(SvgIconFactory.get_icon("chevron_down" if is_c else "chevron_up", primary_icon_color, 14))
+
+            for sid, btn in getattr(self, "cdn_single_buttons", {}).items():
+                btn.setIcon(SvgIconFactory.get_icon("zap", primary_icon_color, 12))
 
         
     def refresh_inline_styles(self):
@@ -781,17 +802,63 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(28, 20, 20, 20)
         layout.setSpacing(18)
 
-        # 页面标题
+        # 页面标题与一键收拢/展开操作
+        header_row = QHBoxLayout()
+        title_box = QVBoxLayout()
         title = QLabel("加速控制中心")
         title.setObjectName("PageTitle")
         desc = QLabel("自动托管网络代理与 Hosts 规则，加速热门海外游戏、创作与开发服务")
         desc.setObjectName("PageDesc")
-        layout.addWidget(title)
-        layout.addWidget(desc)
+        title_box.addWidget(title)
+        title_box.addWidget(desc)
+        header_row.addLayout(title_box)
+        header_row.addStretch()
 
-        # 1. 实时网络流量监控波形图 (MD3 单调三次样条平滑自绘控件)
+        is_all_collapsed = (len(self.collapsed_sections) >= len(SERVICE_GROUPS) + 1)
+        self.btn_toggle_all_collapse = QPushButton("全部展开" if is_all_collapsed else "全部折叠")
+        self.btn_toggle_all_collapse.setProperty("class", "MDBtnOutlined")
+        self.btn_toggle_all_collapse.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_all_collapse.clicked.connect(self.toggle_all_sections_collapse)
+        header_row.addWidget(self.btn_toggle_all_collapse)
+        layout.addLayout(header_row)
+
+        # 1. 实时网络流量监控波形图 (带独立收拢折叠控制)
+        is_dark = ThemeManager.get_instance().is_dark
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
+        chart_card = QFrame()
+        chart_card.setProperty("class", "MDCard")
+        cc_layout = QVBoxLayout(chart_card)
+        cc_layout.setContentsMargins(20, 14, 20, 14)
+        cc_layout.setSpacing(10)
+
+        chart_head = QHBoxLayout()
+        lbl_chart_icon = QLabel()
+        lbl_chart_icon.setFixedSize(20, 20)
+        if SvgIconFactory:
+            lbl_chart_icon.setPixmap(SvgIconFactory.get_pixmap("activity", primary_c, 18))
+        chart_head.addWidget(lbl_chart_icon)
+
+        lbl_chart_title = QLabel("实时网络流量监控")
+        lbl_chart_title.setProperty("class", "CategoryTitle")
+        chart_head.addWidget(lbl_chart_title)
+        chart_head.addStretch()
+
+        is_chart_collapsed = ("traffic_chart" in self.collapsed_sections)
+        self.chart_collapse_btn = QPushButton("展开" if is_chart_collapsed else "收起")
+        self.chart_collapse_btn.setProperty("class", "MDBtnOutlined")
+        self.chart_collapse_btn.setCursor(Qt.PointingHandCursor)
+        chart_btn_icon = "chevron_down" if is_chart_collapsed else "chevron_up"
+        self.chart_collapse_btn.setIcon(SvgIconFactory.get_icon(chart_btn_icon, primary_c, 14) if SvgIconFactory else QIcon())
+        self.chart_collapse_btn.clicked.connect(lambda: self.toggle_section_collapse("traffic_chart"))
+        chart_head.addWidget(self.chart_collapse_btn)
+        cc_layout.addLayout(chart_head)
+
         self.traffic_chart = TrafficMonitorChart()
-        layout.addWidget(self.traffic_chart)
+        cc_layout.addWidget(self.traffic_chart)
+        if is_chart_collapsed:
+            self.traffic_chart.setVisible(False)
+        self.chart_container = chart_card
+        layout.addWidget(chart_card)
 
         # 2. 顶部四合一状态指示卡片
         stat_grid = QGridLayout()
@@ -817,7 +884,6 @@ class MainWindow(QMainWindow):
         mc_layout.setContentsMargins(24, 18, 24, 18)
         mc_layout.setSpacing(16)
 
-        is_dark = ThemeManager.get_instance().is_dark
         self.lbl_main_icon = QLabel()
         self.lbl_main_icon.setFixedSize(40, 40)
         self.lbl_main_icon.setAlignment(Qt.AlignCenter)
@@ -864,8 +930,18 @@ class MainWindow(QMainWindow):
         search_box.addWidget(self.txt_service_search)
         layout.addLayout(search_box)
 
+        # 4. 加速服务列表 (3 大分类分组卡片, 具备一键收起/展开功能, FlowLayout 流式排布)
+        cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
+        for grp_id, grp_info in SERVICE_GROUPS.items():
+            grp_card = self._build_service_group_card(grp_id, grp_info, cfg_services)
+            layout.addWidget(grp_card)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
     def _build_service_group_card(self, grp_id: str, grp_info: dict, cfg_services: set) -> QFrame:
-        """构建单个服务生态分类卡片 (包含头部操作栏与 FlowLayout 服务列表)"""
+        """构建单个服务生态分类卡片 (包含头部操作栏、收起/展开折叠控件与 FlowLayout 服务列表)"""
         grp_card = QFrame()
         grp_card.setProperty("class", "MDCard")
         self.group_cards[grp_id] = grp_card
@@ -874,6 +950,8 @@ class MainWindow(QMainWindow):
         grp_card_layout.setSpacing(12)
 
         grp_header = QHBoxLayout()
+        grp_header.setSpacing(10)
+
         grp_icon_lbl = QLabel()
         grp_icon_lbl.setFixedSize(22, 22)
         is_dark = ThemeManager.get_instance().is_dark
@@ -883,6 +961,7 @@ class MainWindow(QMainWindow):
         grp_header.addWidget(grp_icon_lbl)
 
         grp_title_box = QVBoxLayout()
+        grp_title_box.setSpacing(2)
         grp_title = QLabel(grp_info['name'])
         grp_title.setProperty("class", "CategoryTitle")
         grp_title.setWordWrap(True)
@@ -892,19 +971,40 @@ class MainWindow(QMainWindow):
         grp_title_box.addWidget(grp_title)
         grp_title_box.addWidget(grp_desc)
         grp_header.addLayout(grp_title_box)
+
         grp_header.addStretch()
 
         btn_enable_all = QPushButton("全选")
         btn_enable_all.setProperty("class", "MDBtnOutlined")
+        btn_enable_all.setCursor(Qt.PointingHandCursor)
         btn_enable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, True))
 
         btn_disable_all = QPushButton("全关")
         btn_disable_all.setProperty("class", "MDBtnOutlined")
+        btn_disable_all.setCursor(Qt.PointingHandCursor)
         btn_disable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, False))
+
+        # 收起/展开折叠切换按钮
+        is_collapsed = (grp_id in self.collapsed_sections)
+        btn_collapse = QPushButton("展开" if is_collapsed else "收起")
+        btn_collapse.setProperty("class", "MDBtnOutlined")
+        btn_collapse.setCursor(Qt.PointingHandCursor)
+        btn_icon_name = "chevron_down" if is_collapsed else "chevron_up"
+        btn_collapse.setIcon(SvgIconFactory.get_icon(btn_icon_name, "#7EB9F5" if is_dark else "#0284C7", 14) if SvgIconFactory else QIcon())
+        btn_collapse.clicked.connect(lambda _, g=grp_id: self.toggle_section_collapse(g))
+        self.group_collapse_buttons[grp_id] = btn_collapse
 
         grp_header.addWidget(btn_enable_all)
         grp_header.addWidget(btn_disable_all)
+        grp_header.addWidget(btn_collapse)
         grp_card_layout.addLayout(grp_header)
+
+        # 折叠主体内容容器
+        grp_content = QWidget()
+        self.group_content_widgets[grp_id] = grp_content
+        grp_content_layout = QVBoxLayout(grp_content)
+        grp_content_layout.setContentsMargins(0, 4, 0, 0)
+        grp_content_layout.setSpacing(0)
 
         items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10, min_item_width=320, max_item_width=520)
 
@@ -964,113 +1064,76 @@ class MainWindow(QMainWindow):
 
             items_flow.addWidget(s_item)
 
-        grp_card_layout.addLayout(items_flow)
+        grp_content_layout.addLayout(items_flow)
+        grp_card_layout.addWidget(grp_content)
+
+        if is_collapsed:
+            grp_content.setVisible(False)
+
         return grp_card
 
-    # ------------------ PAGE 1: 加速控制台 ------------------
-    def create_dashboard_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setObjectName("MainScrollArea")
-        scroll.setWidgetResizable(True)
+    def toggle_section_collapse(self, section_id: str):
+        """折叠/展开主控制台指定分块并持久化状态"""
+        cfg = load_config()
+        collapsed = set(cfg.get("collapsed_dashboard_sections", []))
+        if section_id in collapsed:
+            collapsed.discard(section_id)
+            is_collapsed = False
+        else:
+            collapsed.add(section_id)
+            is_collapsed = True
 
-        content = QWidget()
-        content.setObjectName("ScrollContent")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(28, 20, 20, 20)
-        layout.setSpacing(18)
+        cfg["collapsed_dashboard_sections"] = list(collapsed)
+        save_config(cfg)
+        self.collapsed_sections = collapsed
 
-        # 页面标题
-        title = QLabel("加速控制中心")
-        title.setObjectName("PageTitle")
-        desc = QLabel("自动托管网络代理与 Hosts 规则，加速热门海外游戏、创作与开发服务")
-        desc.setObjectName("PageDesc")
-        layout.addWidget(title)
-        layout.addWidget(desc)
+        self._update_section_collapse_ui(section_id, is_collapsed)
+        self._update_toggle_all_button_text()
 
-        # 1. 实时网络流量监控波形图 (MD3 单调三次样条平滑自绘控件)
-        self.traffic_chart = TrafficMonitorChart()
-        layout.addWidget(self.traffic_chart)
+    def toggle_all_sections_collapse(self):
+        """一键全部折叠或全部展开控制台分块"""
+        all_ids = set(SERVICE_GROUPS.keys()) | {"traffic_chart"}
+        cfg = load_config()
+        if len(self.collapsed_sections) >= len(all_ids):
+            # 当前全部处于折叠状态 -> 全部展开
+            self.collapsed_sections.clear()
+        else:
+            # 否则全部折叠
+            self.collapsed_sections = set(all_ids)
 
-        # 2. 顶部四合一状态指示卡片
-        stat_grid = QGridLayout()
-        stat_grid.setSpacing(12)
-        for c_idx in range(4):
-            stat_grid.setColumnStretch(c_idx, 1)
+        cfg["collapsed_dashboard_sections"] = list(self.collapsed_sections)
+        save_config(cfg)
 
-        self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存", "server")
-        self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库", "lock")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "专属规则块隔离", "file_text")
-        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换", "gamepad")
+        for sid in all_ids:
+            self._update_section_collapse_ui(sid, sid in self.collapsed_sections)
+        self._update_toggle_all_button_text()
 
-        stat_grid.addWidget(self.card_stat_nginx, 0, 0)
-        stat_grid.addWidget(self.card_stat_cert, 0, 1)
-        stat_grid.addWidget(self.card_stat_hosts, 0, 2)
-        stat_grid.addWidget(self.card_stat_steam, 0, 3)
-        layout.addLayout(stat_grid)
+    def _update_toggle_all_button_text(self):
+        if hasattr(self, "btn_toggle_all_collapse") and self.btn_toggle_all_collapse:
+            all_ids = set(SERVICE_GROUPS.keys()) | {"traffic_chart"}
+            if len(self.collapsed_sections) >= len(all_ids):
+                self.btn_toggle_all_collapse.setText("全部展开")
+            else:
+                self.btn_toggle_all_collapse.setText("全部折叠")
 
-        # 3. 巨型主控卡片
-        main_control_card = QFrame()
-        main_control_card.setProperty("class", "MDCard")
-        mc_layout = QHBoxLayout(main_control_card)
-        mc_layout.setContentsMargins(24, 18, 24, 18)
-        mc_layout.setSpacing(16)
-
+    def _update_section_collapse_ui(self, section_id: str, is_collapsed: bool):
+        """刷新指定分块在折叠/展开状态下的可视性与按钮图标文字"""
         is_dark = ThemeManager.get_instance().is_dark
-        self.lbl_main_icon = QLabel()
-        self.lbl_main_icon.setFixedSize(40, 40)
-        self.lbl_main_icon.setAlignment(Qt.AlignCenter)
-        if SvgIconFactory:
-            self.lbl_main_icon.setPixmap(SvgIconFactory.get_pixmap("rocket", "#7EB9F5" if is_dark else "#0284C7", 36))
-        mc_layout.addWidget(self.lbl_main_icon)
-
-        mc_info = QVBoxLayout()
-        mc_info.setSpacing(4)
-        self.lbl_main_status = QLabel("加速服务已停止")
-        self.lbl_main_status.setProperty("class", "MainStatusTitle")
-        self.lbl_main_sub = QLabel("点击右侧按钮开启本地代理与 Hosts 规则接管")
-        self.lbl_main_sub.setProperty("class", "MainStatusSub")
-        self.lbl_main_sub.setWordWrap(True)
-        mc_info.addWidget(self.lbl_main_status)
-        mc_info.addWidget(self.lbl_main_sub)
-
-        self.chk_auto_proxy = QCheckBox("开启自动托管代理 (开机/启动自动加速与后台自动检查恢复)")
-        self.chk_auto_proxy.setChecked(load_config().get("auto_proxy", True))
-        self.chk_auto_proxy.toggled.connect(self.on_auto_proxy_toggled)
-        mc_info.addWidget(self.chk_auto_proxy)
-
-        mc_layout.addLayout(mc_info)
-        mc_layout.addStretch()
-
-        self.btn_toggle_acc = QPushButton("启动加速服务")
-        self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
-        self.btn_toggle_acc.setFixedSize(160, 48)
-        self.btn_toggle_acc.clicked.connect(self.toggle_acceleration)
-        mc_layout.addWidget(self.btn_toggle_acc)
-
-        layout.addWidget(main_control_card)
-
-        # 3.5 服务即时搜索与过滤栏
-        search_box = QHBoxLayout()
-        search_box.setSpacing(10)
-        self.txt_service_search = QLineEdit()
-        self.txt_service_search.setProperty("class", "ServiceSearchInput")
-        self.txt_service_search.setPlaceholderText("快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
-        if SvgIconFactory:
-            self.txt_service_search.addAction(SvgIconFactory.get_icon("search", "#75879E" if is_dark else "#94A3B8", 16), QLineEdit.LeadingPosition)
-        self.txt_service_search.setClearButtonEnabled(True)
-        self.txt_service_search.textChanged.connect(self.on_service_search_changed)
-        search_box.addWidget(self.txt_service_search)
-        layout.addLayout(search_box)
-
-        # 4. 加速服务列表 (3 大分类分组卡片, FlowLayout 流式自适应排布)
-        cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
-        for grp_id, grp_info in SERVICE_GROUPS.items():
-            grp_card = self._build_service_group_card(grp_id, grp_info, cfg_services)
-            layout.addWidget(grp_card)
-
-        layout.addStretch()
-        scroll.setWidget(content)
-        return scroll
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
+        if section_id == "traffic_chart":
+            if hasattr(self, "traffic_chart") and self.traffic_chart:
+                self.traffic_chart.setVisible(not is_collapsed)
+            if hasattr(self, "chart_collapse_btn") and self.chart_collapse_btn:
+                self.chart_collapse_btn.setText("展开" if is_collapsed else "收起")
+                icon_name = "chevron_down" if is_collapsed else "chevron_up"
+                self.chart_collapse_btn.setIcon(SvgIconFactory.get_icon(icon_name, primary_c, 14) if SvgIconFactory else QIcon())
+        elif section_id in self.group_content_widgets:
+            self.group_content_widgets[section_id].setVisible(not is_collapsed)
+            btn = self.group_collapse_buttons.get(section_id)
+            if btn:
+                btn.setText("展开" if is_collapsed else "收起")
+                icon_name = "chevron_down" if is_collapsed else "chevron_up"
+                btn.setIcon(SvgIconFactory.get_icon(icon_name, primary_c, 14) if SvgIconFactory else QIcon())
 
     def create_stat_card(self, label: str, value: str, hint: str, icon_name: str = "zap") -> QFrame:
         card = QFrame()
@@ -1114,13 +1177,17 @@ class MainWindow(QMainWindow):
         return card
 
     def on_service_search_changed(self, keyword: str):
-        """主控制台加速服务实时模糊搜索与分类动态折叠 (支持中文/英文/缩写别名)"""
+        """主控制台加速服务实时模糊搜索与分类动态折叠联动 (支持中文/英文/缩写别名，命中时自动展开折叠)"""
         kw = keyword.strip().lower()
         if not kw:
             for s_card in self.service_cards.values():
                 s_card.setVisible(True)
-            for g_card in self.group_cards.values():
+            for gid, g_card in self.group_cards.items():
                 g_card.setVisible(True)
+                # 恢复用户持久化的折叠状态
+                is_col = (gid in self.collapsed_sections)
+                if gid in self.group_content_widgets:
+                    self.group_content_widgets[gid].setVisible(not is_col)
             return
 
         # 别名映射辅助快速检索 (如 'gh' 匹配 github, 'px' 匹配 pixiv)
@@ -1154,9 +1221,14 @@ class MainWindow(QMainWindow):
                     group_has_visible[gid] = True
 
         for gid, grp_card in self.group_cards.items():
-            grp_card.setVisible(group_has_visible.get(gid, False))
+            has_match = group_has_visible.get(gid, False)
+            grp_card.setVisible(has_match)
+            # 若该组有匹配结果，自动临时展开内容以便用户即时查看与操作
+            if has_match and gid in self.group_content_widgets:
+                self.group_content_widgets[gid].setVisible(True)
 
     def toggle_group_services(self, group_id: str, enable: bool):
+        """批量启用或关闭某生态分组全量服务，并即刻同步 Hosts 与界面胶囊"""
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
@@ -1174,17 +1246,19 @@ class MainWindow(QMainWindow):
                     sw.blockSignals(False)
                 self._update_service_icon(sid, enable)
 
-        new_list = list(services)
+        new_list = sorted(list(services))
         cfg["enabled_services"] = new_list
         save_config(cfg)
 
-        if nginx_mgr.is_running():
+        # 若加速运行中或 Hosts 已注入，即刻动态调整 Hosts 规则并刷新 DNS
+        if nginx_mgr.is_running() or hosts_mgr.is_applied():
             hosts_mgr.apply_rules(new_list)
 
         action_name = "启用" if enable else "禁用"
-        show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务", toast_type="info", duration=2000)
+        show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务并同步更新 Hosts", toast_type="info", duration=2000)
 
     def on_service_toggled(self, service_id: str, checked: bool):
+        """单个加速服务开关切换: 立即更新配置并在加速激活时自动调整 Hosts 规则"""
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -1193,12 +1267,20 @@ class MainWindow(QMainWindow):
         else:
             services.discard(service_id)
 
-        new_list = list(services)
+        new_list = sorted(list(services))
         cfg["enabled_services"] = new_list
         save_config(cfg)
 
-        if nginx_mgr.is_running():
-            hosts_mgr.apply_rules(new_list)
+        srv_info = SERVICES_BY_ID.get(service_id)
+
+        # 若加速处于运行状态或 Hosts 规则已注入，即刻动态调整 Hosts
+        if nginx_mgr.is_running() or hosts_mgr.is_applied():
+            h_ok, h_msg = hosts_mgr.apply_rules(new_list)
+            srv_name = srv_info["name"] if srv_info else service_id
+            if not checked:
+                show_toast(self, f"已关闭 [{srv_name}] 加速，已自动从 Hosts 移除对应规则", toast_type="info", duration=1800)
+            elif h_ok:
+                show_toast(self, f"已开启 [{srv_name}] 加速并注入 Hosts 规则", toast_type="success", duration=1800)
 
     # ------------------ PAGE 2: Steam 账号管家 ------------------
     def create_steam_page(self) -> QWidget:
@@ -1361,45 +1443,108 @@ class MainWindow(QMainWindow):
 
         self.btn_start_ping = QPushButton("开始全量测速")
         self.btn_start_ping.setProperty("class", "MDBtnPrimary")
+        self.btn_start_ping.setCursor(Qt.PointingHandCursor)
         self.btn_start_ping.clicked.connect(self.start_cdn_ping)
         header.addWidget(self.btn_start_ping)
 
         self.btn_apply_cdn = QPushButton("应用测速结果")
         self.btn_apply_cdn.setProperty("class", "MDBtnTonal")
+        self.btn_apply_cdn.setCursor(Qt.PointingHandCursor)
         self.btn_apply_cdn.setEnabled(False)
         self.btn_apply_cdn.clicked.connect(self.apply_optimal_cdn)
         header.addWidget(self.btn_apply_cdn)
 
         layout.addLayout(header)
 
+        # 测速状态概览横幅
+        is_dark = ThemeManager.get_instance().is_dark
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
+        self.cdn_status_banner = QFrame()
+        self.cdn_status_banner.setProperty("class", "MDCard")
+        banner_l = QHBoxLayout(self.cdn_status_banner)
+        banner_l.setContentsMargins(18, 12, 18, 12)
+        banner_l.setSpacing(12)
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(22, 22)
+        if SvgIconFactory:
+            icon_lbl.setPixmap(SvgIconFactory.get_pixmap("zap", primary_c, 20))
+        banner_l.addWidget(icon_lbl)
+
+        banner_text_l = QVBoxLayout()
+        banner_text_l.setSpacing(2)
+        self.lbl_cdn_status_summary = QLabel("测速目标已就绪")
+        self.lbl_cdn_status_summary.setProperty("class", "CategoryTitle")
+        self.lbl_cdn_last_time = QLabel("默认加载所有测速目标及历史最优节点，支持一键全量测速或单项独立测速")
+        self.lbl_cdn_last_time.setProperty("class", "CategoryDesc")
+        banner_text_l.addWidget(self.lbl_cdn_status_summary)
+        banner_text_l.addWidget(self.lbl_cdn_last_time)
+        banner_l.addLayout(banner_text_l)
+        banner_l.addStretch()
+
+        layout.addWidget(self.cdn_status_banner)
+
         self.cdn_results_layout = QVBoxLayout()
         self.cdn_results_layout.setSpacing(14)
         layout.addLayout(self.cdn_results_layout)
 
-        self.cdn_intro_card = QFrame()
-        self.cdn_intro_card.setProperty("class", "MDCard")
-        ci_layout = QVBoxLayout(self.cdn_intro_card)
-        ci_layout.setContentsMargins(32, 32, 32, 32)
-        ci_layout.setAlignment(Qt.AlignCenter)
-
-        ci_icon = QLabel()
-        ci_icon.setAlignment(Qt.AlignCenter)
-        is_dark = ThemeManager.get_instance().is_dark
-        ci_icon.setPixmap(SvgIconFactory.get_pixmap("zap", "#7EB9F5" if is_dark else "#0284C7", 36))
-        self.cdn_intro_icon = ci_icon
-
-        lbl_ci_title = QLabel("测速引擎已就绪")
-        lbl_ci_title.setProperty("class", "ItemTitle")
-        lbl_ci_desc = QLabel("点击右上角【开始全量测速】，系统将并发探测全量服务的延迟并筛选延迟最低的节点。")
-        lbl_ci_desc.setProperty("class", "ItemDesc")
-        ci_layout.addWidget(ci_icon, 0, Qt.AlignCenter)
-        ci_layout.addWidget(lbl_ci_title, 0, Qt.AlignCenter)
-        ci_layout.addWidget(lbl_ci_desc, 0, Qt.AlignCenter)
-        self.cdn_results_layout.addWidget(self.cdn_intro_card)
+        # 默认即刻呈现所有测速目标及上次测速结果
+        initial_results = self.get_current_or_initial_cdn_results()
+        self.render_cdn_results(initial_results)
 
         layout.addStretch()
         scroll.setWidget(content)
         return scroll
+
+    def get_current_or_initial_cdn_results(self) -> Dict[str, List[Dict]]:
+        """获取当前或历史持久化的测速结果；若无则为全量服务构建包含全部候选 IP 的初始目标结构"""
+        if self.cached_cdn_results:
+            return self.cached_cdn_results
+
+        cfg = load_config()
+        saved_full = cfg.get("cached_cdn_full_results")
+        if isinstance(saved_full, dict) and saved_full:
+            self.cached_cdn_results = saved_full
+            return saved_full
+
+        cached_lats = cfg.get("cached_latencies", {})
+        results: Dict[str, List[Dict]] = {}
+
+        for srv in SERVICES_LIST:
+            sid = srv["id"]
+            cand_ips = CANDIDATE_IPS.get(sid, [])
+            c_info = cached_lats.get(sid)
+            cached_lat = None
+            cached_proxy = False
+            if isinstance(c_info, dict):
+                cached_lat = c_info.get("latency")
+                cached_proxy = c_info.get("via_proxy", False)
+            elif isinstance(c_info, (int, float)):
+                cached_lat = int(c_info)
+
+            items = []
+            for idx, ip in enumerate(cand_ips):
+                if idx == 0 and cached_lat is not None and cached_lat > 0:
+                    items.append({
+                        "ip": ip,
+                        "latency": int(cached_lat),
+                        "available": True,
+                        "rank": 1,
+                        "via_proxy": cached_proxy,
+                        "status_text": f"{int(cached_lat)} ms"
+                    })
+                else:
+                    items.append({
+                        "ip": ip,
+                        "latency": 9999,
+                        "available": False,
+                        "rank": 3,
+                        "status_text": "待测速"
+                    })
+            results[sid] = items
+
+        self.cached_cdn_results = results
+        return results
 
     def start_cdn_ping(self):
         if self.cdn_worker and self.cdn_worker.isRunning():
@@ -1408,7 +1553,7 @@ class MainWindow(QMainWindow):
         self.btn_start_ping.setEnabled(False)
         self.btn_start_ping.setText("测速探测中...")
 
-        # 清空当前结果并展示骨架屏卡片
+        # 展示骨架屏卡片
         while self.cdn_results_layout.count():
             item = self.cdn_results_layout.takeAt(0)
             if item.widget():
@@ -1425,8 +1570,13 @@ class MainWindow(QMainWindow):
 
     def on_cdn_ping_finished(self, results: Dict):
         self.cached_cdn_results = results
-        # 同步测速结果到健康巡检 (缓存基准节点, 避免巡检时全量重测)
-        services = list(dict.fromkeys(load_config().get("enabled_services", []) + DEFAULT_ENABLED_SERVICES))
+        cfg = load_config()
+        cfg["cached_cdn_full_results"] = results
+        cfg["last_optimal_time"] = int(time.time())
+        save_config(cfg)
+
+        # 同步测速结果到健康巡检
+        services = list(dict.fromkeys(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES)))
         health_monitor.update_services(services, results)
         self.btn_start_ping.setEnabled(True)
         self.btn_start_ping.setText("重新全量测速")
@@ -1436,7 +1586,7 @@ class MainWindow(QMainWindow):
         show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
 
     def render_cdn_results(self, results: Dict):
-        """根据当前主题 (Dark/Light) 渲染高对比度自适应测速结果列表"""
+        """根据当前主题渲染涵盖全量测速目标与候选 IP 节点的列表"""
         while self.cdn_results_layout.count():
             item = self.cdn_results_layout.takeAt(0)
             if item.widget():
@@ -1446,14 +1596,28 @@ class MainWindow(QMainWindow):
         primary_c = "#7EB9F5" if is_dark else "#0284C7"
         star_color = "#FBBF24" if is_dark else "#D97706"
         new_cached_lats = {}
+        has_any_available = False
 
-        for sid, ip_list in results.items():
-            srv = SERVICES_BY_ID.get(sid)
-            name = srv["name"] if srv else sid
+        # 遍历全量服务列表，确保即使未单独测速的服务也展示测速目标
+        for srv in SERVICES_LIST:
+            sid = srv["id"]
+            name = srv["name"]
+            ip_list = results.get(sid)
 
-            if ip_list and sid in self.service_badges:
-                best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
-                is_proxy = (sid in cdn_opt.last_relay_services)
+            if not ip_list:
+                cand_ips = CANDIDATE_IPS.get(sid, [])
+                ip_list = [{"ip": ip, "latency": 9999, "available": False, "status_text": "待测速"} for ip in cand_ips]
+
+            best_item = None
+            for it in ip_list:
+                if it.get("available") and it.get("latency", 9999) < 9999:
+                    best_item = it
+                    has_any_available = True
+                    break
+
+            if best_item and sid in self.service_badges:
+                best_lat = best_item["latency"]
+                is_proxy = (sid in cdn_opt.last_relay_services) or best_item.get("via_proxy", False)
                 self.service_badges[sid].set_latency(
                     int(best_lat),
                     is_star=True,
@@ -1488,7 +1652,7 @@ class MainWindow(QMainWindow):
             grid = FlowLayout(margin=0, h_spacing=8, v_spacing=8, min_item_width=230, max_item_width=380)
             for idx, item in enumerate(ip_list):
                 ip_item = QFrame()
-                is_best = idx == 0 and item["available"]
+                is_best = (idx == 0 and item.get("available") and item.get("latency", 9999) < 9999)
                 ip_item.setProperty("class", "CdnIpCardBest" if is_best else "CdnIpCard")
                 ip_item.setMinimumHeight(32)
 
@@ -1506,7 +1670,7 @@ class MainWindow(QMainWindow):
                 il.addWidget(lbl_ip)
                 il.addStretch()
 
-                if item["available"]:
+                if item.get("available") and item.get("latency", 9999) < 9999:
                     lat = int(item["latency"])
                     if is_dark:
                         color = "#34D399" if lat < 100 else ("#FBBF24" if lat < 250 else "#F87171")
@@ -1514,13 +1678,17 @@ class MainWindow(QMainWindow):
                         color = "#059669" if lat < 100 else ("#D97706" if lat < 250 else "#DC2626")
                     lbl_lat = QLabel(f"{lat} ms")
                     lbl_lat.setStyleSheet(f"font-family: monospace; font-size: 11px; font-weight: bold; color: {color};")
+                elif item.get("status_text") == "待测速":
+                    color = "#75879E" if is_dark else "#94A3B8"
+                    lbl_lat = QLabel("待测速")
+                    lbl_lat.setStyleSheet(f"font-family: monospace; font-size: 11px; color: {color};")
                 else:
                     color = "#F87171" if is_dark else "#DC2626"
                     lbl_lat = QLabel("超时")
                     lbl_lat.setStyleSheet(f"font-family: monospace; font-size: 11px; font-weight: bold; color: {color};")
                 il.addWidget(lbl_lat)
 
-                # 显式 polish 确保动态添加时 QSS 属性选择器 100% 刷新
+                # 显式 polish 确保动态添加时 QSS 属性选择器刷新
                 ip_item.style().unpolish(ip_item)
                 ip_item.style().polish(ip_item)
 
@@ -1529,9 +1697,22 @@ class MainWindow(QMainWindow):
             card_l.addLayout(grid)
             self.cdn_results_layout.addWidget(card)
 
+        if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
+            self.btn_apply_cdn.setEnabled(has_any_available)
+
+        if hasattr(self, "lbl_cdn_status_summary") and self.lbl_cdn_status_summary:
+            last_opt_time = load_config().get("last_optimal_time", 0)
+            if last_opt_time > 0:
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_opt_time))
+                self.lbl_cdn_status_summary.setText(f"已加载上次优选测速数据 (共 {len(SERVICES_LIST)} 项服务)")
+                self.lbl_cdn_last_time.setText(f"上次全量优化时间: {ts_str} | 点击【重新全量测速】或各卡片【独立测速】可更新")
+            else:
+                self.lbl_cdn_status_summary.setText(f"测速目标已就绪 (共 {len(SERVICES_LIST)} 项服务)")
+                self.lbl_cdn_last_time.setText("点击右上角【开始全量测速】或单项卡片【独立测速】探测实时网络延迟")
+
         if new_cached_lats:
             cfg = load_config()
-            cfg["cached_latencies"] = new_cached_lats
+            cfg["cached_latencies"] = {**cfg.get("cached_latencies", {}), **new_cached_lats}
             save_config(cfg)
 
     def start_single_cdn_ping(self, sid: str):
@@ -1562,7 +1743,7 @@ class MainWindow(QMainWindow):
             self.cdn_single_buttons[sid].setText("独立测速")
 
         if not self.cached_cdn_results:
-            self.cached_cdn_results = {}
+            self.cached_cdn_results = self.get_current_or_initial_cdn_results()
         self.cached_cdn_results[sid] = results
 
         srv_name = SERVICES_BY_ID.get(sid, {}).get("name", sid)
@@ -1586,16 +1767,16 @@ class MainWindow(QMainWindow):
                 via_proxy=is_proxy
             )
 
-        # 3. 持久化缓存延迟 (1ms 下限, 防回环/relay 端口 <1ms 被截断为 0)
+        # 3. 持久化缓存延迟与完整测速数据
         cfg = load_config()
         cached_lats = cfg.get("cached_latencies", {})
         cached_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
         cfg["cached_latencies"] = cached_lats
+        cfg["cached_cdn_full_results"] = self.cached_cdn_results
         save_config(cfg)
 
-        # 4. 若在 CDN 测速页面，局部重绘该卡片
-        if self.stack.currentIndex() == 2 and self.cached_cdn_results:
-            self.render_cdn_results(self.cached_cdn_results)
+        # 4. 局部重绘 CDN 测速页面
+        self.render_cdn_results(self.cached_cdn_results)
 
         if best_lat != 9999:
             show_toast(self, f"[{srv_name}] 节点优化完成！最低延迟: {int(best_lat)} ms (已热重载生效)", toast_type="success", duration=3000)
@@ -1630,6 +1811,7 @@ class MainWindow(QMainWindow):
         ok, msg = cdn_opt.apply_optimal(results)
         cfg = load_config()
         cfg["last_optimal_time"] = int(time.time())
+        cfg["cached_cdn_full_results"] = results
 
         new_cached_lats = {}
         for sid, ip_list in results.items():
@@ -1656,9 +1838,13 @@ class MainWindow(QMainWindow):
             nginx_mgr.reload()
 
         health_monitor.update_services(
-            list(dict.fromkeys(cfg.get("enabled_services", []) + DEFAULT_ENABLED_SERVICES)),
+            list(dict.fromkeys(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))),
             results
         )
+
+        # 若当前在 CDN 测速页面，刷新列表
+        if self.stack.currentIndex() == 2:
+            self.render_cdn_results(results)
 
         success_count = sum(1 for items in results.values() if items and items[0].get("available"))
         show_toast(
@@ -1673,18 +1859,20 @@ class MainWindow(QMainWindow):
         if ok:
             cfg = load_config()
             cfg["last_optimal_time"] = int(time.time())
+            cfg["cached_cdn_full_results"] = self.cached_cdn_results
             # 同步更新主控制台全部服务延迟微徽章与持久化
-            saved_lats = {}
+            saved_lats = cfg.get("cached_latencies", {})
             for sid, ip_list in self.cached_cdn_results.items():
                 if ip_list and sid in self.service_badges:
-                    best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
+                    best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
                     is_proxy = (sid in cdn_opt.last_relay_services)
-                    self.service_badges[sid].set_latency(
-                        max(1, int(best_lat)),
-                        is_star=True,
-                        via_proxy=is_proxy
-                    )
-                    saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+                    if best_lat != 9999:
+                        self.service_badges[sid].set_latency(
+                            max(1, int(best_lat)),
+                            is_star=True,
+                            via_proxy=is_proxy
+                        )
+                        saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
 
             cfg["cached_latencies"] = saved_lats
             save_config(cfg)
@@ -3030,8 +3218,8 @@ class MainWindow(QMainWindow):
             cert_mgr.install_cert()
 
         cfg = load_config()
-        saved_services = cfg.get("enabled_services") or []
-        services = list(dict.fromkeys(saved_services + DEFAULT_ENABLED_SERVICES))
+        saved_services = cfg.get("enabled_services")
+        services = list(saved_services) if saved_services is not None else list(DEFAULT_ENABLED_SERVICES)
         h_ok, h_msg = hosts_mgr.apply_rules(services)
         if not h_ok:
             if not self._has_prompted_hosts_perm:
@@ -3157,7 +3345,7 @@ class MainWindow(QMainWindow):
         """响应持续健康巡检与故障自愈切换"""
         update_config_key("health_heal_enabled", checked)
         if checked:
-            services = list(dict.fromkeys(load_config().get("enabled_services", []) + DEFAULT_ENABLED_SERVICES))
+            services = list(dict.fromkeys(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES)))
             health_monitor.start(services)
             show_toast(self, "CDN 持续健康巡检与故障自愈已开启", toast_type="success", duration=2000)
         else:

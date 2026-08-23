@@ -377,8 +377,8 @@ def test_render_cdn_results_ipv4_and_ipv6(qapp):
         MainWindow.render_cdn_results(dummy, mock_results)
         assert "pixiv_web" in dummy.cdn_card_widgets
         card = dummy.cdn_card_widgets["pixiv_web"]
-        assert card is not None
-        # 验证卡片内子控件数量
-        assert dummy.cdn_results_layout.count() == 1
+        from ip_pool import SERVICES_LIST
+        # 验证涵盖全量服务测速目标卡片
+        assert dummy.cdn_results_layout.count() >= len(SERVICES_LIST)
 
 
