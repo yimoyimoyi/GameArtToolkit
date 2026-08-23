@@ -18,6 +18,12 @@ import zipfile
 import subprocess
 from pathlib import Path
 
+# 强制设置环境语言与标准 I/O 编码，避免 Windows 多语言环境或非 UTF-8 控制台下报错
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+os.environ.setdefault("LANG", "zh_CN.UTF-8")
+os.environ.setdefault("LC_ALL", "zh_CN.UTF-8")
+
 BASE_DIR = Path(__file__).resolve().parent
 
 def get_app_version() -> str:
@@ -131,8 +137,68 @@ def build_all():
 
     dist_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. 生成图标与 Nginx 配置模板
-    print("\n[3/5] 编译前置准备 (图标校验与 Nginx 配置模板全量生成)...")
+    # 3. 生成图标与 Nginx 配置模板及 Windows PE 版本信息
+    print("\n[3/5] 编译前置准备 (版本信息同步、图标校验与 Nginx 配置模板全量生成)...")
+    ver_info_file = BASE_DIR / "file_version_info.txt"
+    try:
+        parts = [int(p) if p.isdigit() else 0 for p in version.split(".")]
+        while len(parts) < 4:
+            parts.append(0)
+        v_tuple = tuple(parts[:4])
+        v_str = ".".join(str(x) for x in v_tuple)
+        ver_content = f"""# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={v_tuple},
+    prodvers={v_tuple},
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '080404b0',
+          [
+            StringStruct('CompanyName', 'GameArt Project'),
+            StringStruct('FileDescription', 'GameArt Toolkit 桌面客户端'),
+            StringStruct('FileVersion', '{v_str}'),
+            StringStruct('InternalName', 'GameArtToolkit.exe'),
+            StringStruct('LegalCopyright', 'Copyright (C) 2026 GameArt Project'),
+            StringStruct('OriginalFilename', 'GameArtToolkit.exe'),
+            StringStruct('ProductName', 'GameArt Toolkit'),
+            StringStruct('ProductVersion', '{v_str}'),
+            StringStruct('Comments', 'Pixiv / Steam / Game Art Acceleration Toolkit')
+          ]
+        ),
+        StringTable(
+          '040904b0',
+          [
+            StringStruct('CompanyName', 'GameArt Project'),
+            StringStruct('FileDescription', 'GameArt Toolkit Desktop Client'),
+            StringStruct('FileVersion', '{v_str}'),
+            StringStruct('InternalName', 'GameArtToolkit.exe'),
+            StringStruct('LegalCopyright', 'Copyright (C) 2026 GameArt Project'),
+            StringStruct('OriginalFilename', 'GameArtToolkit.exe'),
+            StringStruct('ProductName', 'GameArt Toolkit'),
+            StringStruct('ProductVersion', '{v_str}')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [2052, 1200, 1033, 1200])])
+  ]
+)
+"""
+        ver_info_file.write_text(ver_content, encoding="utf-8")
+        print(f"  [Version] 已同步 PE 版本信息定义: v{v_str}")
+    except Exception as e:
+        print(f"[WARN] 同步版本信息异常: {e}")
+
     icon_file = BASE_DIR / "app" / "icon.ico"
     if not icon_file.exists():
         try:
@@ -150,7 +216,7 @@ def build_all():
         print(f"[WARN] Nginx 模板前置生成异常: {e}")
 
     # 4. 调用 PyInstaller 编译 PySide6 应用程序
-    print("\n[4/5] 调用 PyInstaller 编译 PySide6 (集成管理员清单与图标)...")
+    print("\n[4/5] 调用 PyInstaller 编译 PySide6 (集成管理员清单、PE版本与图标)...")
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
@@ -163,8 +229,17 @@ def build_all():
     if icon_file.exists():
         cmd.append(f"--icon={icon_file}")
 
+    if ver_info_file.exists():
+        cmd.append(f"--version-file={ver_info_file}")
+
     cmd.extend([
         f"--add-data={BASE_DIR / 'app'};app",
+        "--exclude-module=tkinter",
+        "--exclude-module=matplotlib",
+        "--exclude-module=scipy",
+        "--exclude-module=unittest",
+        "--exclude-module=test",
+        "--exclude-module=pydoc",
         "--clean",
         str(app_entry)
     ])

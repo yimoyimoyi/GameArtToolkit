@@ -20,6 +20,12 @@ import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Set, Tuple
 
+# 强制设置环境语言与标准 I/O 编码，避免 Windows 多语言环境或非 UTF-8 控制台下报错
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+os.environ.setdefault("LANG", "zh_CN.UTF-8")
+os.environ.setdefault("LC_ALL", "zh_CN.UTF-8")
+
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QPoint, QSize, QRectF, QPointF
 from PySide6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QAction, QMouseEvent,
@@ -858,109 +864,208 @@ class MainWindow(QMainWindow):
         search_box.addWidget(self.txt_service_search)
         layout.addLayout(search_box)
 
+    def _build_service_group_card(self, grp_id: str, grp_info: dict, cfg_services: set) -> QFrame:
+        """构建单个服务生态分类卡片 (包含头部操作栏与 FlowLayout 服务列表)"""
+        grp_card = QFrame()
+        grp_card.setProperty("class", "MDCard")
+        self.group_cards[grp_id] = grp_card
+        grp_card_layout = QVBoxLayout(grp_card)
+        grp_card_layout.setContentsMargins(20, 16, 20, 16)
+        grp_card_layout.setSpacing(12)
+
+        grp_header = QHBoxLayout()
+        grp_icon_lbl = QLabel()
+        grp_icon_lbl.setFixedSize(22, 22)
+        is_dark = ThemeManager.get_instance().is_dark
+        icon_c = "#D0BCFF" if is_dark else "#6750A4"
+        grp_icon_lbl.setPixmap(SvgIconFactory.get_pixmap(grp_info.get("icon", "zap"), icon_c, 20))
+        self.group_icon_labels[grp_id] = (grp_icon_lbl, grp_info.get("icon", "zap"))
+        grp_header.addWidget(grp_icon_lbl)
+
+        grp_title_box = QVBoxLayout()
+        grp_title = QLabel(grp_info['name'])
+        grp_title.setProperty("class", "CategoryTitle")
+        grp_title.setWordWrap(True)
+        grp_desc = QLabel(grp_info["desc"])
+        grp_desc.setProperty("class", "CategoryDesc")
+        grp_desc.setWordWrap(True)
+        grp_title_box.addWidget(grp_title)
+        grp_title_box.addWidget(grp_desc)
+        grp_header.addLayout(grp_title_box)
+        grp_header.addStretch()
+
+        btn_enable_all = QPushButton("全选")
+        btn_enable_all.setProperty("class", "MDBtnOutlined")
+        btn_enable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, True))
+
+        btn_disable_all = QPushButton("全关")
+        btn_disable_all.setProperty("class", "MDBtnOutlined")
+        btn_disable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, False))
+
+        grp_header.addWidget(btn_enable_all)
+        grp_header.addWidget(btn_disable_all)
+        grp_card_layout.addLayout(grp_header)
+
+        items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10, min_item_width=320, max_item_width=520)
+
+        grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
+        for idx, srv in enumerate(grp_services):
+            sid = srv["id"]
+            s_item = QFrame()
+            s_item.setProperty("class", "ServiceItem")
+            s_item.setMinimumHeight(56)
+            self.service_cards[sid] = s_item
+            si_layout = QHBoxLayout(s_item)
+            si_layout.setContentsMargins(14, 10, 14, 10)
+            si_layout.setSpacing(10)
+
+            # 服务专属矢量图标
+            is_checked = (sid in cfg_services)
+            srv_icon_name = srv.get("icon", "zap")
+            si_icon = QLabel()
+            si_icon.setFixedSize(24, 24)
+            si_icon.setAlignment(Qt.AlignCenter)
+            self.service_icon_labels[sid] = (si_icon, srv_icon_name)
+            self._update_service_icon(sid, is_checked)
+            si_layout.addWidget(si_icon)
+
+            si_text_box = QVBoxLayout()
+            si_text_box.setSpacing(2)
+            si_name = QLabel(srv["name"])
+            si_name.setProperty("class", "ItemTitle")
+            si_name.setWordWrap(True)
+            si_desc = QLabel(srv["desc"])
+            si_desc.setProperty("class", "ItemDesc")
+            si_desc.setWordWrap(True)
+            si_text_box.addWidget(si_name)
+            si_text_box.addWidget(si_desc)
+            si_layout.addLayout(si_text_box)
+            si_layout.addStretch()
+
+            cached_lats = load_config().get("cached_latencies", {})
+            badge = LatencyBadge()
+            badge.setCursor(Qt.PointingHandCursor)
+            badge.setToolTip("点击直接进行单项独立测速与热重载")
+            badge.mousePressEvent = lambda e, s=sid: self.start_single_cdn_ping(s)
+            if sid in cached_lats:
+                c_info = cached_lats[sid]
+                c_lat = c_info.get("latency", -1) if isinstance(c_info, dict) else int(c_info)
+                c_proxy = c_info.get("via_proxy", False) if isinstance(c_info, dict) else False
+                badge.set_latency(int(c_lat), is_star=True, via_proxy=c_proxy)
+            else:
+                badge.set_latency(-1)
+            self.service_badges[sid] = badge
+            si_layout.addWidget(badge)
+
+            sw = MDSwitch(checked=is_checked)
+            sw.toggled.connect(lambda c, s=sid: self.on_service_toggled(s, c))
+            self.service_switches[sid] = sw
+            si_layout.addWidget(sw)
+
+            items_flow.addWidget(s_item)
+
+        grp_card_layout.addLayout(items_flow)
+        return grp_card
+
+    # ------------------ PAGE 1: 加速控制台 ------------------
+    def create_dashboard_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        # 页面标题
+        title = QLabel("加速控制中心")
+        title.setObjectName("PageTitle")
+        desc = QLabel("自动托管网络代理与 Hosts 规则，加速热门海外游戏、创作与开发服务")
+        desc.setObjectName("PageDesc")
+        layout.addWidget(title)
+        layout.addWidget(desc)
+
+        # 1. 实时网络流量监控波形图 (MD3 单调三次样条平滑自绘控件)
+        self.traffic_chart = TrafficMonitorChart()
+        layout.addWidget(self.traffic_chart)
+
+        # 2. 顶部四合一状态指示卡片
+        stat_grid = QGridLayout()
+        stat_grid.setSpacing(12)
+        for c_idx in range(4):
+            stat_grid.setColumnStretch(c_idx, 1)
+
+        self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存", "server")
+        self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库", "lock")
+        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "专属规则块隔离", "file_text")
+        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换", "gamepad")
+
+        stat_grid.addWidget(self.card_stat_nginx, 0, 0)
+        stat_grid.addWidget(self.card_stat_cert, 0, 1)
+        stat_grid.addWidget(self.card_stat_hosts, 0, 2)
+        stat_grid.addWidget(self.card_stat_steam, 0, 3)
+        layout.addLayout(stat_grid)
+
+        # 3. 巨型主控卡片
+        main_control_card = QFrame()
+        main_control_card.setProperty("class", "MDCard")
+        mc_layout = QHBoxLayout(main_control_card)
+        mc_layout.setContentsMargins(24, 18, 24, 18)
+        mc_layout.setSpacing(16)
+
+        is_dark = ThemeManager.get_instance().is_dark
+        self.lbl_main_icon = QLabel()
+        self.lbl_main_icon.setFixedSize(40, 40)
+        self.lbl_main_icon.setAlignment(Qt.AlignCenter)
+        if SvgIconFactory:
+            self.lbl_main_icon.setPixmap(SvgIconFactory.get_pixmap("rocket", "#7EB9F5" if is_dark else "#0284C7", 36))
+        mc_layout.addWidget(self.lbl_main_icon)
+
+        mc_info = QVBoxLayout()
+        mc_info.setSpacing(4)
+        self.lbl_main_status = QLabel("加速服务已停止")
+        self.lbl_main_status.setProperty("class", "MainStatusTitle")
+        self.lbl_main_sub = QLabel("点击右侧按钮开启本地代理与 Hosts 规则接管")
+        self.lbl_main_sub.setProperty("class", "MainStatusSub")
+        self.lbl_main_sub.setWordWrap(True)
+        mc_info.addWidget(self.lbl_main_status)
+        mc_info.addWidget(self.lbl_main_sub)
+
+        self.chk_auto_proxy = QCheckBox("开启自动托管代理 (开机/启动自动加速与后台自动检查恢复)")
+        self.chk_auto_proxy.setChecked(load_config().get("auto_proxy", True))
+        self.chk_auto_proxy.toggled.connect(self.on_auto_proxy_toggled)
+        mc_info.addWidget(self.chk_auto_proxy)
+
+        mc_layout.addLayout(mc_info)
+        mc_layout.addStretch()
+
+        self.btn_toggle_acc = QPushButton("启动加速服务")
+        self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
+        self.btn_toggle_acc.setFixedSize(160, 48)
+        self.btn_toggle_acc.clicked.connect(self.toggle_acceleration)
+        mc_layout.addWidget(self.btn_toggle_acc)
+
+        layout.addWidget(main_control_card)
+
+        # 3.5 服务即时搜索与过滤栏
+        search_box = QHBoxLayout()
+        search_box.setSpacing(10)
+        self.txt_service_search = QLineEdit()
+        self.txt_service_search.setProperty("class", "ServiceSearchInput")
+        self.txt_service_search.setPlaceholderText("快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
+        if SvgIconFactory:
+            self.txt_service_search.addAction(SvgIconFactory.get_icon("search", "#75879E" if is_dark else "#94A3B8", 16), QLineEdit.LeadingPosition)
+        self.txt_service_search.setClearButtonEnabled(True)
+        self.txt_service_search.textChanged.connect(self.on_service_search_changed)
+        search_box.addWidget(self.txt_service_search)
+        layout.addLayout(search_box)
+
         # 4. 加速服务列表 (3 大分类分组卡片, FlowLayout 流式自适应排布)
         cfg_services = set(load_config().get("enabled_services", DEFAULT_ENABLED_SERVICES))
-
         for grp_id, grp_info in SERVICE_GROUPS.items():
-            grp_card = QFrame()
-            grp_card.setProperty("class", "MDCard")
-            self.group_cards[grp_id] = grp_card
-            grp_card_layout = QVBoxLayout(grp_card)
-            grp_card_layout.setContentsMargins(20, 16, 20, 16)
-            grp_card_layout.setSpacing(12)
-
-            grp_header = QHBoxLayout()
-            grp_icon_lbl = QLabel()
-            grp_icon_lbl.setFixedSize(22, 22)
-            is_dark = ThemeManager.get_instance().is_dark
-            icon_c = "#D0BCFF" if is_dark else "#6750A4"
-            grp_icon_lbl.setPixmap(SvgIconFactory.get_pixmap(grp_info.get("icon", "zap"), icon_c, 20))
-            self.group_icon_labels[grp_id] = (grp_icon_lbl, grp_info.get("icon", "zap"))
-            grp_header.addWidget(grp_icon_lbl)
-
-            grp_title_box = QVBoxLayout()
-            grp_title = QLabel(grp_info['name'])
-            grp_title.setProperty("class", "CategoryTitle")
-            grp_title.setWordWrap(True)
-            grp_desc = QLabel(grp_info["desc"])
-            grp_desc.setProperty("class", "CategoryDesc")
-            grp_desc.setWordWrap(True)
-            grp_title_box.addWidget(grp_title)
-            grp_title_box.addWidget(grp_desc)
-            grp_header.addLayout(grp_title_box)
-            grp_header.addStretch()
-
-            btn_enable_all = QPushButton("全选")
-            btn_enable_all.setProperty("class", "MDBtnOutlined")
-            btn_enable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, True))
-
-            btn_disable_all = QPushButton("全关")
-            btn_disable_all.setProperty("class", "MDBtnOutlined")
-            btn_disable_all.clicked.connect(lambda _, g=grp_id: self.toggle_group_services(g, False))
-
-            grp_header.addWidget(btn_enable_all)
-            grp_header.addWidget(btn_disable_all)
-            grp_card_layout.addLayout(grp_header)
-
-            items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10, min_item_width=320, max_item_width=520)
-
-            grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
-            for idx, srv in enumerate(grp_services):
-                sid = srv["id"]
-                s_item = QFrame()
-                s_item.setProperty("class", "ServiceItem")
-                s_item.setMinimumHeight(56)
-                self.service_cards[sid] = s_item
-                si_layout = QHBoxLayout(s_item)
-                si_layout.setContentsMargins(14, 10, 14, 10)
-                si_layout.setSpacing(10)
-
-                # 服务专属矢量图标
-                is_checked = (sid in cfg_services)
-                srv_icon_name = srv.get("icon", "zap")
-                si_icon = QLabel()
-                si_icon.setFixedSize(24, 24)
-                si_icon.setAlignment(Qt.AlignCenter)
-                self.service_icon_labels[sid] = (si_icon, srv_icon_name)
-                self._update_service_icon(sid, is_checked)
-                si_layout.addWidget(si_icon)
-
-                si_text_box = QVBoxLayout()
-                si_text_box.setSpacing(2)
-                si_name = QLabel(srv["name"])
-                si_name.setProperty("class", "ItemTitle")
-                si_name.setWordWrap(True)
-                si_desc = QLabel(srv["desc"])
-                si_desc.setProperty("class", "ItemDesc")
-                si_desc.setWordWrap(True)
-                si_text_box.addWidget(si_name)
-                si_text_box.addWidget(si_desc)
-                si_layout.addLayout(si_text_box)
-                si_layout.addStretch()
-
-                cached_lats = load_config().get("cached_latencies", {})
-                badge = LatencyBadge()
-                badge.setCursor(Qt.PointingHandCursor)
-                badge.setToolTip("点击直接进行单项独立测速与热重载")
-                badge.mousePressEvent = lambda e, s=sid: self.start_single_cdn_ping(s)
-                if sid in cached_lats:
-                    c_info = cached_lats[sid]
-                    c_lat = c_info.get("latency", -1) if isinstance(c_info, dict) else int(c_info)
-                    c_proxy = c_info.get("via_proxy", False) if isinstance(c_info, dict) else False
-                    badge.set_latency(int(c_lat), is_star=True, via_proxy=c_proxy)
-                else:
-                    badge.set_latency(-1)
-                self.service_badges[sid] = badge
-                si_layout.addWidget(badge)
-
-                sw = MDSwitch(checked=is_checked)
-                sw.toggled.connect(lambda c, s=sid: self.on_service_toggled(s, c))
-                self.service_switches[sid] = sw
-                si_layout.addWidget(sw)
-
-                items_flow.addWidget(s_item)
-
-            grp_card_layout.addLayout(items_flow)
+            grp_card = self._build_service_group_card(grp_id, grp_info, cfg_services)
             layout.addWidget(grp_card)
 
         layout.addStretch()
@@ -1481,10 +1586,10 @@ class MainWindow(QMainWindow):
                 via_proxy=is_proxy
             )
 
-        # 3. 持久化缓存延迟
+        # 3. 持久化缓存延迟 (1ms 下限, 防回环/relay 端口 <1ms 被截断为 0)
         cfg = load_config()
         cached_lats = cfg.get("cached_latencies", {})
-        cached_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
+        cached_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
         cfg["cached_latencies"] = cached_lats
         save_config(cfg)
 
@@ -1532,14 +1637,20 @@ class MainWindow(QMainWindow):
                 best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
                 is_proxy = (sid in cdn_opt.last_relay_services)
                 self.service_badges[sid].set_latency(
-                    int(best_lat),
+                    max(1, int(best_lat)),
                     is_star=True,
                     via_proxy=is_proxy
                 )
-                new_cached_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
+                new_cached_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
 
         cfg["cached_latencies"] = new_cached_lats
         save_config(cfg)
+
+        # GitHub 全段封锁提示: 直连多段候选全挂时提醒启用上游代理 (relay 自动绕过)
+        for block_sid in ("github_web", "github_raw", "github_release", "github_assets"):
+            block_items = results.get(block_sid)
+            if block_items and not any(it.get("available") for it in block_items):
+                print(f"[AutoCDN] {block_sid} 直连候选全挂 (GFW 逐段封锁), 启用上游代理后自动经 relay 绕过")
 
         if nginx_mgr.is_running():
             nginx_mgr.reload()
@@ -1569,11 +1680,11 @@ class MainWindow(QMainWindow):
                     best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
                     is_proxy = (sid in cdn_opt.last_relay_services)
                     self.service_badges[sid].set_latency(
-                        int(best_lat),
+                        max(1, int(best_lat)),
                         is_star=True,
                         via_proxy=is_proxy
                     )
-                    saved_lats[sid] = {"latency": int(best_lat), "via_proxy": is_proxy}
+                    saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
 
             cfg["cached_latencies"] = saved_lats
             save_config(cfg)
@@ -1587,29 +1698,8 @@ class MainWindow(QMainWindow):
             show_toast(self, f"应用失败: {msg}", toast_type="error", duration=4000)
 
     # ------------------ PAGE 4: 系统诊断与设置 ------------------
-    def create_settings_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setObjectName("MainScrollArea")
-        scroll.setWidgetResizable(True)
-
-        content = QWidget()
-        content.setObjectName("ScrollContent")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(28, 20, 20, 20)
-        layout.setSpacing(18)
-
-        title = QLabel("系统诊断与高级设置")
-        title.setObjectName("PageTitle")
-        desc = QLabel("个性化外观、IPv4/IPv6 测速偏好、Steam 启动参数、自定义 DNS 及磁盘缓存维护")
-        desc.setObjectName("PageDesc")
-        layout.addWidget(title)
-        layout.addWidget(desc)
-
-        is_dark = ThemeManager.get_instance().is_dark
-        primary_icon_c = "#D0BCFF" if is_dark else "#6750A4"
-        cfg = load_config()
-
-        # ==================== 卡片 0: 网络环境与第三方代理共存诊断 ====================
+    def _build_settings_env_card(self, primary_icon_c: str) -> QFrame:
+        """卡片 0: 网络环境与第三方代理共存诊断"""
         env_card = QFrame()
         env_card.setProperty("class", "MDCard")
         e_layout = QVBoxLayout(env_card)
@@ -1646,9 +1736,10 @@ class MainWindow(QMainWindow):
         e_layout.addWidget(self.lbl_env_sys_proxy)
         e_layout.addWidget(self.lbl_env_ports)
         e_layout.addWidget(self.lbl_env_summary)
-        layout.addWidget(env_card)
+        return env_card
 
-        # ==================== 卡片 1: 常规偏好与系统外观 ====================
+    def _build_settings_general_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 1: 常规偏好与系统外观"""
         gen_card = QFrame()
         gen_card.setProperty("class", "MDCard")
         g_layout = QVBoxLayout(gen_card)
@@ -1785,10 +1876,10 @@ class MainWindow(QMainWindow):
         self.sw_tray_notif.toggled.connect(self.on_tray_notif_toggled)
         row_notif.addWidget(self.sw_tray_notif)
         g_layout.addLayout(row_notif)
+        return gen_card
 
-        layout.addWidget(gen_card)
-
-        # ==================== 卡片 2: Hosts 托管与退出清理 ====================
+    def _build_settings_hosts_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 2: Hosts 托管与退出清理"""
         hosts_card = QFrame()
         hosts_card.setProperty("class", "MDCard")
         h_layout = QVBoxLayout(hosts_card)
@@ -1861,10 +1952,10 @@ class MainWindow(QMainWindow):
         h_btn_box.addWidget(btn_restore_hosts)
         h_btn_box.addStretch()
         h_layout.addLayout(h_btn_box)
+        return hosts_card
 
-        layout.addWidget(hosts_card)
-
-        # ==================== 卡片 3: IPv4/IPv6 协议偏好与 CDN 性能微调 ====================
+    def _build_settings_speedtest_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 3: IPv4/IPv6 协议偏好与 CDN 性能微调"""
         cdn_tune_card = QFrame()
         cdn_tune_card.setProperty("class", "MDCard")
         ct_layout = QVBoxLayout(cdn_tune_card)
@@ -1903,7 +1994,7 @@ class MainWindow(QMainWindow):
         self.cmb_ip_mode.addItem("双栈延迟优先 (谁快选谁)", "dual_stack")
         self.cmb_ip_mode.addItem("仅探测 IPv4 (彻底禁用 v6)", "ipv4_only")
         self.cmb_ip_mode.addItem("优先 IPv6 节点 (教育网/纯v6)", "prefer_ipv6")
-        
+
         cur_ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
         for idx in range(self.cmb_ip_mode.count()):
             if self.cmb_ip_mode.itemData(idx) == cur_ip_mode:
@@ -2036,10 +2127,10 @@ class MainWindow(QMainWindow):
         row_intervals.addWidget(self.cmb_health_freq)
         row_intervals.addStretch()
         ct_layout.addLayout(row_intervals)
+        return cdn_tune_card
 
-        layout.addWidget(cdn_tune_card)
-
-        # ==================== 卡片 4: 测速代理设置 ====================
+    def _build_settings_proxy_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 4: 测速代理设置"""
         proxy_card = QFrame()
         proxy_card.setProperty("class", "MDCard")
         p_layout = QVBoxLayout(proxy_card)
@@ -2106,10 +2197,10 @@ class MainWindow(QMainWindow):
         row_pxy_fields.addWidget(btn_test_proxy)
         row_pxy_fields.addStretch()
         p_layout.addLayout(row_pxy_fields)
+        return proxy_card
 
-        layout.addWidget(proxy_card)
-
-        # ==================== 卡片 5: 本地 DNS 智能分流与上游解析 ====================
+    def _build_settings_dns_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 5: 本地 DNS 智能分流与上游解析"""
         dns_card = QFrame()
         dns_card.setProperty("class", "MDCard")
         d_layout = QVBoxLayout(dns_card)
@@ -2199,10 +2290,10 @@ class MainWindow(QMainWindow):
         row_dns_fields.addWidget(self.txt_dns_secondary)
         row_dns_fields.addStretch()
         d_layout.addLayout(row_dns_fields)
+        return dns_card
 
-        layout.addWidget(dns_card)
-
-        # ==================== 卡片 6: Steam 路径与游戏高级启动参数 ====================
+    def _build_settings_steam_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 6: Steam 路径与游戏高级启动参数"""
         steam_card = QFrame()
         steam_card.setProperty("class", "MDCard")
         s_layout = QVBoxLayout(steam_card)
@@ -2296,10 +2387,10 @@ class MainWindow(QMainWindow):
         row_cust_args.addWidget(self.txt_steam_custom_args)
         row_cust_args.addWidget(btn_launch_steam_now)
         s_layout.addLayout(row_cust_args)
+        return steam_card
 
-        layout.addWidget(steam_card)
-
-        # ==================== 卡片 7: 系统根证书与本地存储管理 ====================
+    def _build_settings_maintenance_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片 7: 系统根证书与本地存储管理"""
         cert_card = QFrame()
         cert_card.setProperty("class", "MDCard")
         cc_l = QVBoxLayout(cert_card)
@@ -2406,8 +2497,38 @@ class MainWindow(QMainWindow):
         self.lbl_port_detail.setWordWrap(True)
         cc_l.addWidget(lbl_po_title)
         cc_l.addWidget(self.lbl_port_detail)
+        return cert_card
 
-        layout.addWidget(cert_card)
+    def create_settings_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        title = QLabel("系统诊断与高级设置")
+        title.setObjectName("PageTitle")
+        desc = QLabel("个性化外观、IPv4/IPv6 测速偏好、Steam 启动参数、自定义 DNS 及磁盘缓存维护")
+        desc.setObjectName("PageDesc")
+        layout.addWidget(title)
+        layout.addWidget(desc)
+
+        is_dark = ThemeManager.get_instance().is_dark
+        primary_icon_c = "#D0BCFF" if is_dark else "#6750A4"
+        cfg = load_config()
+
+        layout.addWidget(self._build_settings_env_card(primary_icon_c))
+        layout.addWidget(self._build_settings_general_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_hosts_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_speedtest_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_proxy_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_dns_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_steam_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_maintenance_card(primary_icon_c, cfg))
 
         layout.addStretch()
         scroll.setWidget(content)

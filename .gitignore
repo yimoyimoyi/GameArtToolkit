@@ -127,3 +127,5 @@ scripts/probe_candidates_retest.py
 scripts/probe_candidates_results.json
 # 已测试不可用对象存档报告
 TEST_REPORT_UNUSABLE.md
+# 测速超时诊断脚本 (本地排查用)
+scripts/diag_timeout.py

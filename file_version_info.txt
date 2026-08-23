@@ -1,7 +1,4 @@
 # UTF-8
-#
-# GameArt Toolkit - Windows PE 版本信息定义文件
-#
 VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=(1, 0, 0, 0),

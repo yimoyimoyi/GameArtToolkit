@@ -43,24 +43,43 @@ def test_config_expansion():
 
 def test_autostart_registry():
     print("\n[Test 2/5] 测试 Windows 计划任务与启动快捷方式开机自启机制...")
-    original_state = is_autostart_enabled()
-    print(f"  - 初始自启动状态: {original_state}")
+    from unittest.mock import patch, MagicMock
 
-    # 测试开启
-    ok, msg = set_autostart(True, start_minimized=True)
-    print(f"  - 设置自启结果: {ok}, {msg}")
-    assert ok, f"开启开机自启失败: {msg}"
-    assert is_autostart_enabled() is True, "系统未检测到自启项（计划任务或快捷方式）"
+    # 1. 隔离宿主环境已有计划任务，测试逻辑与快捷方式的真实文件创建/清理
+    mock_task_state = {"created": False}
 
-    # 测试关闭
-    ok, msg = set_autostart(False)
-    print(f"  - 取消自启结果: {ok}, {msg}")
-    assert ok, f"关闭开机自启失败: {msg}"
-    assert is_autostart_enabled() is False, "自启项清理失败"
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        res = MagicMock()
+        if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "schtasks":
+            if "/query" in cmd:
+                res.returncode = 0 if mock_task_state["created"] else 1
+            elif "/create" in cmd:
+                mock_task_state["created"] = True
+                res.returncode = 0
+            elif "/delete" in cmd:
+                mock_task_state["created"] = False
+                res.returncode = 0
+            else:
+                res.returncode = 0
+            return res
+        return MagicMock(returncode=0)
 
-    # 还原初始状态
-    if original_state:
-        set_autostart(True)
+    with patch("subprocess.run", side_effect=fake_subprocess_run):
+        # 初始应为 False
+        assert is_autostart_enabled() is False, "初始状态检测异常"
+
+        # 测试开启
+        ok, msg = set_autostart(True, start_minimized=True)
+        print(f"  - 设置自启结果: {ok}, {msg}")
+        assert ok, f"开启开机自启失败: {msg}"
+        assert is_autostart_enabled() is True, "系统未检测到自启项（计划任务或快捷方式）"
+
+        # 测试关闭
+        ok, msg = set_autostart(False)
+        print(f"  - 取消自启结果: {ok}, {msg}")
+        assert ok, f"关闭开机自启失败: {msg}"
+        assert is_autostart_enabled() is False, "自启项清理失败"
+
     print("  => Windows 开机自启最高特权免 UAC 管理测试通过 [PASS]")
 
 def test_hosts_diagnosis_and_restore():

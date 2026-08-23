@@ -361,10 +361,11 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_web",
         ssl_sni_mode="host",
-        probe_timeout=3.0,  # Fastly/Azure 跨洋链路高丢包, 放宽探测档位防晚高峰误判超时
+        probe_timeout=2.0,  # Fastly/Azure 跨洋链路高丢包, 适度放宽档位 (原 3.0 致单任务预算 11.8s 拖慢整体测速)
         stable_ips=["20.27.177.113", "20.200.245.247"],  # Azure 亚太稳定段, 排序稳优先
         candidate_ips=["20.27.177.113", "20.200.245.247",  # Azure 亚太优先 (稳)
-                       "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4"]  # Fastly Anycast 兜底
+                       "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4",  # Fastly Anycast 兜底
+                       "185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"]  # 跨段容灾: raw 段实测可服务 github.com (200), GFW 逐段封锁时互为兜底
     ),
     ServiceProfile(
         id="github_raw",

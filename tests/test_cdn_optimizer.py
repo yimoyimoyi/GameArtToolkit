@@ -1037,14 +1037,24 @@ class TestSortStability:
         items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", None))
         assert items[0]["ip"] == "140.82.121.4"
 
-    def test_v6_penalty_before_stability(self):
-        """v6 偏好惩罚仍在稳定度之前: prefer_ipv4 下 v6 稳定段不敌 v4 非稳定段"""
+    def test_v6_fast_wins_normal_competition(self):
+        """v6 快节点正常竞争: prefer_ipv4 下 v6 低延迟胜 v4 高延迟 (GitHub 原生 IPv6 提速)"""
         from cdn_optimizer import _service_sort_key
         items = [
             {"ip": "2606:50c0:8000::154", "rank": 0, "latency": 5.0},
             {"ip": "140.82.121.4", "rank": 0, "latency": 30.0},
         ]
-        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", {"2606:50c0:8000::154"}))
+        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", None))
+        assert items[0]["ip"] == "2606:50c0:8000::154"
+
+    def test_v4_wins_tie_latency_fallback(self):
+        """延迟平局时 v4 兜底: prefer_ipv4 下同延迟 v4 仍优先 v6"""
+        from cdn_optimizer import _service_sort_key
+        items = [
+            {"ip": "2606:50c0:8000::154", "rank": 0, "latency": 30.0},
+            {"ip": "140.82.121.4", "rank": 0, "latency": 30.0},
+        ]
+        items.sort(key=lambda x: _service_sort_key(x, "prefer_ipv4", None))
         assert items[0]["ip"] == "140.82.121.4"
 
     def test_rank_always_first(self):
@@ -1103,7 +1113,7 @@ class TestServiceProbeOverride:
     def test_profile_override_beats_config(self):
         """profile.probe_timeout 覆盖全局 cdn_timeout_seconds"""
         from cdn_optimizer import probe_timeout_for
-        assert probe_timeout_for("github_web", cfg_timeout=1.5) == pytest.approx(3.0)
+        assert probe_timeout_for("github_web", cfg_timeout=1.5) == pytest.approx(2.0)
 
     def test_missing_override_falls_back_to_config(self):
         """无服务级档位的服务回退全局配置"""
@@ -1131,9 +1141,9 @@ class TestGithubWebProfile:
         assert "140.82.121.4" in profile.candidate_ips, "Fastly 仍保留作兜底"
 
     def test_probe_timeout_override(self):
-        """github_web 服务级探测档位 3.0s (跨洋高丢包放宽)"""
+        """github_web 服务级探测档位 2.0s (适度放宽, 原 3.0 单任务预算 11.8s 拖慢整体)"""
         from ip_pool import PROFILES_BY_ID
-        assert PROFILES_BY_ID["github_web"].probe_timeout == pytest.approx(3.0)
+        assert PROFILES_BY_ID["github_web"].probe_timeout == pytest.approx(2.0)
 
     def test_stable_ips_nonempty(self):
         """github_web 声明 Azure 稳定段"""

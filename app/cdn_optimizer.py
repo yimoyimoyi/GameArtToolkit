@@ -94,15 +94,20 @@ def probe_timeout_for(srv_id: str, cfg_timeout: Optional[float] = None) -> float
 
 def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
                       stable_set: Optional[set] = None) -> Tuple:
-    """统一测速排序键: (rank, v6/v4 偏好惩罚, 稳定段惩罚, 延迟)
+    """统一测速排序键: (rank, 稳定段惩罚, 延迟, v6/v4 偏好兜底)
 
     - rank 永远第一 (可用性优先, Fastly 全灭时仍由 rank0 兜底)
     - 稳定性优先于延迟: 短命 Anycast 延迟优势不可信, 已知稳定段优先
+    - 协议偏好仅在延迟平局时兜底: IPv6 快节点正常竞争 (修复 GitHub 原生
+      IPv6 85ms 优于 IPv4 230ms 却被 prefer_ipv4 硬降权的问题)
     - ip_mode/stable_set 为 None 时跳过对应维度 (apply_optimal 防御性排序复用)
-    - 空 stable_ips 的服务退化为旧键序 (rank, v_penalty, latency), 行为不变
+    - 空 stable_ips 的服务退化为键序 (rank, latency), 行为不变
     """
     rank = item.get("rank", 3)
     lat = item.get("latency") if item.get("latency") is not None else 99999
+    stable_penalty = 0
+    if stable_set is not None:
+        stable_penalty = 0 if str(item.get("ip", "")) in stable_set else 1
     v_penalty = 0
     if ip_mode:
         is_v6 = ":" in str(item.get("ip", ""))
@@ -110,10 +115,7 @@ def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
             v_penalty = 1
         elif ip_mode == "prefer_ipv6" and not is_v6:
             v_penalty = 1
-    stable_penalty = 0
-    if stable_set is not None:
-        stable_penalty = 0 if str(item.get("ip", "")) in stable_set else 1
-    return (rank, v_penalty, stable_penalty, lat)
+    return (rank, stable_penalty, lat, v_penalty)
 
 
 def _apply_prefilter_floor(pool_ips: List[str], alive_ips: set, floor: float) -> List[str]:
@@ -237,7 +239,6 @@ def doh_resolve(domain: str, timeout: float = 3.0,
                 "Accept": "application/dns-json",
                 "User-Agent": "GameArtToolkit/2.0",
             })
-            # 禁用代理，确保以真实本地物理出口解析
             req.set_proxy("", "http")
             req.set_proxy("", "https")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -552,11 +553,12 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
         return out
 
     res = _do_probe_once()
-    # 单节点微重试: 若直连 TCP 通但 TLS/HTTP 发生单次偶发异常, 进行 1 次快速重试
-    if quick_retry and not proxy and res.get("tcp_ok") and not (res.get("tls_ok") and res.get("http_ok")):
+    # 单节点微重试: TCP 抖动 (GFW 间歇 RST) 或 TLS/HTTP 偶发异常时快速重试 1 次
+    # 注意: http_ok 为 True 的 5xx (如 Akamai 反爬 503) 不触发重试, 避免放大无效探测时长
+    if quick_retry and not proxy and not (res.get("tcp_ok") and res.get("tls_ok") and res.get("http_ok")):
         time.sleep(0.08)  # 80ms 避开偶发抖动
         res2 = _do_probe_once()
-        if res2.get("tls_ok") and res2.get("http_ok"):
+        if res2.get("tcp_ok") and res2.get("tls_ok") and res2.get("http_ok"):
             return res2
     return res
 
@@ -662,7 +664,7 @@ class CDNOptimizer:
         results.sort(key=lambda x: _service_sort_key(x, ip_mode, stable_set))
         return results
 
-    def test_all_services(self, max_workers: int = 64, total_timeout: float = 30.0,
+    def test_all_services(self, max_workers: int = 64, total_timeout: float = 45.0,
                           filter_services: Optional[List[str]] = None) -> Dict[str, List[Dict]]:
         """全量/按需两阶段漏斗探测:
         
@@ -753,22 +755,28 @@ class CDNOptimizer:
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
+        #    软性总时限: deadline 到点后不再等待新结果 (已完成结果保留, 未完成任务
+        #    由线程自然结束后回收, 对应 IP 走下方补齐兜底), 避免慢服务无限拖长整体时长
         if flat_tasks:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(flat_tasks), max_workers)) as executor:
-                future_map = {executor.submit(run_both, t): t for t in flat_tasks}
-                for future in concurrent.futures.as_completed(future_map):
-                    task = future_map[future]
-                    try:
-                        srv_id, ip, direct, proxy_res = future.result()
-                        item = _classify_result(direct, proxy_res)
-                        item["ip"] = ip
-                        item["sni_mode"] = task[3]
-                        item["proxy_used"] = proxy_ready
-                    except Exception:
-                        item = {"ip": task[1], "latency": None, "available": False, "rank": 3,
-                                "via_proxy": False, "recommend": "none", "sni_mode": task[3],
-                                "direct": None, "proxy": None, "proxy_used": proxy_ready}
-                    results_by_srv[srv_id].append(item)
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(flat_tasks), max_workers))
+            future_map = {executor.submit(run_both, t): t for t in flat_tasks}
+            deadline = (time.monotonic() + total_timeout) if (total_timeout and total_timeout > 0) else None
+            for future in concurrent.futures.as_completed(future_map):
+                if deadline is not None and time.monotonic() > deadline:
+                    break
+                task = future_map[future]
+                try:
+                    srv_id, ip, direct, proxy_res = future.result()
+                    item = _classify_result(direct, proxy_res)
+                    item["ip"] = ip
+                    item["sni_mode"] = task[3]
+                    item["proxy_used"] = proxy_ready
+                except Exception:
+                    item = {"ip": task[1], "latency": None, "available": False, "rank": 3,
+                            "via_proxy": False, "recommend": "none", "sni_mode": task[3],
+                            "direct": None, "proxy": None, "proxy_used": proxy_ready}
+                results_by_srv[srv_id].append(item)
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # 6. 补齐未完成/兜底项并按统一排序键 (rank → 协议偏好 → 稳定段 → 延迟) 保序排序
         for srv_id, items in results_by_srv.items():
@@ -1161,7 +1169,7 @@ if __name__ == "__main__":
     print("正在对全量加速服务的 Anycast 节点进行并发探测 (超时阈值 3.5s)...")
 
     t0 = time.perf_counter()
-    res = opt.test_all_services(max_workers=16, total_timeout=25.0)
+    res = opt.test_all_services(max_workers=16)
     elapsed = time.perf_counter() - t0
 
     print("\n" + "=" * 80)

@@ -1,5 +1,11 @@
 ﻿@echo off
+:: 指定控制台与语言环境编码，避免在多语言或不同 Windows 环境下报错
 chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+set LANG=zh_CN.UTF-8
+set LC_ALL=zh_CN.UTF-8
+
 title GameArt Toolkit 桌面客户端
 cd /d "%~dp0"
 
@@ -23,4 +29,4 @@ echo   请确保已安装 Python 3.10+ 并将其勾选添加到系统 PATH 环�
 echo ========================================================
 echo.
 pause
-exit /b 1
+exit /b 1
