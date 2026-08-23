@@ -42,7 +42,7 @@ def test_config_expansion():
     print("  => 配置项扩充与原子持久化测试通过 [PASS]")
 
 def test_autostart_registry():
-    print("\n[Test 2/5] 测试 Windows HKCU 注册表开机自启读写...")
+    print("\n[Test 2/5] 测试 Windows 计划任务与启动快捷方式开机自启机制...")
     original_state = is_autostart_enabled()
     print(f"  - 初始自启动状态: {original_state}")
 
@@ -50,18 +50,18 @@ def test_autostart_registry():
     ok, msg = set_autostart(True, start_minimized=True)
     print(f"  - 设置自启结果: {ok}, {msg}")
     assert ok, f"开启开机自启失败: {msg}"
-    assert is_autostart_enabled() is True, "注册表未检测到自启项"
+    assert is_autostart_enabled() is True, "系统未检测到自启项（计划任务或快捷方式）"
 
     # 测试关闭
     ok, msg = set_autostart(False)
     print(f"  - 取消自启结果: {ok}, {msg}")
     assert ok, f"关闭开机自启失败: {msg}"
-    assert is_autostart_enabled() is False, "注册表自启项清理失败"
+    assert is_autostart_enabled() is False, "自启项清理失败"
 
     # 还原初始状态
     if original_state:
         set_autostart(True)
-    print("  => Windows 注册表开机自启无特权管理测试通过 [PASS]")
+    print("  => Windows 开机自启最高特权免 UAC 管理测试通过 [PASS]")
 
 def test_hosts_diagnosis_and_restore():
     print("\n[Test 3/5] 测试 Hosts 体检修复与官方纯净模板恢复...")

@@ -158,49 +158,210 @@ def flush_dns_native() -> bool:
         except Exception:
             return False
 
-# ==================== Windows 开机自启管理 (HKCU 注册表免管理员权限) ====================
+# ==================== Windows 开机自启管理 (计划任务免 UAC 提权 + 快捷方式双轨制) ====================
 REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 DEFAULT_APP_NAME = "GameArtToolkit"
+AUTOSTART_TASK_NAME = "GameArtToolkit_AutoStart"
+AUTOSTART_SHORTCUT_NAME = "GameArt Toolkit.lnk"
+
+def _get_startup_shortcut_path() -> "Path":
+    import os
+    from pathlib import Path
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / r"Microsoft\Windows\Start Menu\Programs\Startup" / AUTOSTART_SHORTCUT_NAME
+    return Path.home() / r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup" / AUTOSTART_SHORTCUT_NAME
+
+def _is_task_scheduler_autostart_enabled() -> bool:
+    """查询 Windows 计划任务中是否存在自启项"""
+    import subprocess
+    try:
+        cmd = ["schtasks", "/query", "/tn", AUTOSTART_TASK_NAME, "/fo", "LIST"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3, **get_silent_startup_kwargs())
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def _create_task_scheduler_xml(exe_path: str, arguments: str, work_dir: str) -> str:
+    """生成符合 Windows 计划任务标准的 XML 定义 (支持电池运行、免 UAC 最高权限与指定工作目录)"""
+    import xml.sax.saxutils as saxutils
+    safe_exe = saxutils.escape(exe_path)
+    safe_args = saxutils.escape(arguments)
+    safe_work_dir = saxutils.escape(work_dir)
+
+    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>GameArt Toolkit 开机自启动任务（免 UAC 提权）</Description>
+    <Author>GameArt Project</Author>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT1S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{safe_exe}</Command>
+      <Arguments>{safe_args}</Arguments>
+      <WorkingDirectory>{safe_work_dir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+    return xml_content
 
 def is_autostart_enabled(app_name: str = DEFAULT_APP_NAME) -> bool:
-    """查询当前用户注册表是否已配置开机自启动"""
+    """查询系统是否已配置开机自启动（优先检测计划任务，兼容快捷方式与注册表）"""
     import winreg
+
+    # 1. 优先检查计划任务
+    if _is_task_scheduler_autostart_enabled():
+        return True
+
+    # 2. 检查启动文件夹快捷方式
+    shortcut = _get_startup_shortcut_path()
+    if shortcut.exists():
+        return True
+
+    # 3. 兼容检查注册表
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_READ) as key:
             val, _ = winreg.QueryValueEx(key, app_name)
             return bool(val)
-    except FileNotFoundError:
-        return False
     except Exception:
-        return False
+        pass
+
+    return False
 
 def set_autostart(enable: bool, start_minimized: bool = False, app_name: str = DEFAULT_APP_NAME) -> tuple[bool, str]:
-    """设置或取消 Windows 开机自启动 (写入 HKCU 免 UAC 弹窗)"""
+    """设置或取消 Windows 开机自启动 (优先采用计划任务免 UAC 弹窗提权，同步清理注册表残留)"""
     import sys
+    import tempfile
+    import subprocess
     import winreg
     from pathlib import Path
 
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            if enable:
-                is_frozen = getattr(sys, 'frozen', False)
-                if is_frozen:
-                    exe_path = f'"{sys.executable}"'
-                else:
-                    script_path = Path(__file__).resolve().parent / "pyside_app.py"
-                    exe_path = f'"{sys.executable}" "{script_path}"'
+    shortcut_path = _get_startup_shortcut_path()
 
-                cmd_str = f"{exe_path} --minimized" if start_minimized else exe_path
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd_str)
-                return True, "已成功开启开机自启动"
-            else:
+    if enable:
+        is_frozen = getattr(sys, 'frozen', False)
+        if is_frozen:
+            target_exe = sys.executable
+            arguments = "--minimized" if start_minimized else ""
+            work_dir = str(Path(sys.executable).parent)
+            icon_path = sys.executable
+        else:
+            # 源码环境优先使用 pythonw.exe 实现无黑框后台运行
+            py_exe = Path(sys.executable)
+            pyw_candidate = py_exe.parent / "pythonw.exe"
+            target_exe = str(pyw_candidate if pyw_candidate.exists() else py_exe)
+            script_path = str(Path(__file__).resolve().parent / "pyside_app.py")
+            arguments = f'"{script_path}"' + (" --minimized" if start_minimized else "")
+            work_dir = str(Path(__file__).resolve().parent.parent)
+            icon_file = Path(__file__).resolve().parent / "icon.ico"
+            icon_path = str(icon_file) if icon_file.exists() else target_exe
+
+        # 尝试通过 Task Scheduler 注册
+        xml_str = _create_task_scheduler_xml(target_exe, arguments, work_dir)
+        temp_xml = None
+        task_success = False
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-16", suffix=".xml", delete=False) as f:
+                f.write(xml_str)
+                temp_xml = f.name
+
+            cmd = ["schtasks", "/create", "/tn", AUTOSTART_TASK_NAME, "/xml", temp_xml, "/f"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, **get_silent_startup_kwargs())
+            if res.returncode == 0:
+                task_success = True
+        except Exception:
+            task_success = False
+        finally:
+            if temp_xml and Path(temp_xml).exists():
                 try:
-                    winreg.DeleteValue(key, app_name)
-                except FileNotFoundError:
+                    Path(temp_xml).unlink(missing_ok=True)
+                except Exception:
                     pass
-                return True, "已成功关闭开机自启动"
-    except Exception as e:
-        return False, f"配置开机自启失败: {e}"
+
+        # 同步创建启动文件夹快捷方式（确保 Windows 任务管理器启动选项卡完美显示名称与图标）
+        try:
+            shortcut_path.parent.mkdir(parents=True, exist_ok=True)
+            ps_cmd = (
+                f"$WshShell = New-Object -ComObject WScript.Shell; "
+                f"$Shortcut = $WshShell.CreateShortcut('{shortcut_path}'); "
+                f"$Shortcut.TargetPath = '{target_exe}'; "
+                f"$Shortcut.Arguments = '{arguments}'; "
+                f"$Shortcut.WorkingDirectory = '{work_dir}'; "
+                f"$Shortcut.IconLocation = '{icon_path},0'; "
+                f"$Shortcut.Description = 'GameArt Toolkit 桌面客户端'; "
+                f"$Shortcut.Save()"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                           capture_output=True, text=True, timeout=5, **get_silent_startup_kwargs())
+        except Exception:
+            pass
+
+        # 清理旧的 Run 注册表项（避免冲突或无特权被拦截）
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, app_name)
+        except Exception:
+            pass
+
+        if task_success or shortcut_path.exists():
+            return True, "已成功开启开机自启动 (最高权限免弹窗)"
+        return False, "开启开机自启动失败，请检查系统安全策略"
+
+    else:
+        # 1. 删除计划任务
+        try:
+            subprocess.run(["schtasks", "/delete", "/tn", AUTOSTART_TASK_NAME, "/f"],
+                           capture_output=True, text=True, timeout=4, **get_silent_startup_kwargs())
+        except Exception:
+            pass
+
+        # 2. 删除启动快捷方式
+        try:
+            if shortcut_path.exists():
+                shortcut_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # 3. 清理注册表项
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, app_name)
+        except Exception:
+            pass
+
+        return True, "已成功关闭开机自启动"
 
 # ==================== Windows 原生关机与控制台事件拦截 ====================
 PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
