@@ -274,13 +274,93 @@ class TestClassifyResult:
 # 3. _suspect_status
 # ==============================================================================
 class TestSuspectStatus:
-    @pytest.mark.parametrize("status", [421, 502, 503, 504])
+    @pytest.mark.parametrize("status", [400, 403, 404, 421, 502, 503, 504])
     def test_suspect_status_true(self, status):
         assert _suspect_status(status) is True
 
-    @pytest.mark.parametrize("status", [200, 500, 404, 301, None])
+    @pytest.mark.parametrize("status", [200, 500, 301, None])
     def test_suspect_status_false(self, status):
         assert _suspect_status(status) is False
+
+
+# ==============================================================================
+# 3.5 多域全验证与状态码放行 (修复 GitHub S3 403 / githubassets 404 假阳性)
+# ==============================================================================
+class TestProbeDomainConfig:
+    def test_classify_http_suspect_downgraded(self):
+        """http_suspect=True (多域验证存在可疑域) -> 直连非 rank0, 代理干净则 rank1"""
+        direct = _probe_dict(status=200)
+        direct["http_suspect"] = True
+        proxy = _probe_dict(latency=5.0)
+        item = _classify_result(direct, proxy)
+        assert item["rank"] == 1
+        assert item["via_proxy"] is True
+        assert item["recommend"] == "proxy"
+
+    def test_classify_http_suspect_alone_rank3(self):
+        """http_suspect=True 且无代理 -> rank3 不可用 (假阳性节点不再入选)"""
+        direct = _probe_dict(status=200)
+        direct["http_suspect"] = True
+        item = _classify_result(direct, None)
+        assert item["rank"] == 3
+        assert item["available"] is False
+
+    def test_subdomain_fail_soft_downgrade(self):
+        """副域验证失败 (http_subdomains_ok=False) -> 不淘汰 rank0, 排序降权到验证通过节点之后"""
+        from cdn_optimizer import _service_sort_key
+        items = [
+            {"ip": "185.199.108.133", "rank": 0, "latency": 30.0, "http_subdomains_ok": False},
+            {"ip": "140.82.113.22", "rank": 0, "latency": 50.0, "http_subdomains_ok": True},
+        ]
+        items.sort(key=lambda x: _service_sort_key(x, None, None))
+        assert items[0]["ip"] == "140.82.113.22", "副域验证通过的节点应排在验证失败节点前"
+        assert items[1]["ip"] == "185.199.108.133"
+
+    def test_classify_subdomain_field_passthrough(self):
+        """_classify_result 透传 http_subdomains_ok (软信号供排序使用, 不淘汰 rank0)"""
+        direct = _probe_dict()
+        direct["http_subdomains_ok"] = False
+        item = _classify_result(direct, None)
+        assert item["rank"] == 0, "副域失败不应淘汰 rank0"
+        assert item["http_subdomains_ok"] is False
+
+    def test_ok_statuses_passed_to_probe(self):
+        """test_group 将 profile 的 probe_domains/ok_statuses 透传 probe (github_s3 403 放行 + 5 bucket 域验证)"""
+        opt = CDNOptimizer()
+        captured = {}
+
+        def fake_probe(ip, domain="", timeout=1.5, sni_mode="host", proxy=None, **kwargs):
+            captured["kwargs"] = kwargs
+            return {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
+                    "tls_latency": None, "http_ok": False, "http_status": None,
+                    "http_suspect": False, "error": "mock"}
+
+        with patch("cdn_optimizer.CANDIDATE_IPS", {"github_s3": ["16.15.246.123"]}), \
+             patch("cdn_optimizer._resolve_dns_candidates", return_value=[]), \
+             patch("cdn_optimizer._load_proxy_config", return_value=None), \
+             patch("cdn_optimizer.is_proxy_available", return_value=False), \
+             patch("cdn_optimizer.probe_ip_endpoint_v2", side_effect=fake_probe):
+            opt.test_group("github_s3", ["16.15.246.123"], max_workers=1)
+
+        kw = captured.get("kwargs", {})
+        assert kw.get("ok_statuses") == {403}, f"应放行 S3 根路径 403: {kw}"
+        domains = kw.get("probe_domains") or []
+        assert len(domains) == 5, f"应全量验证 5 个 bucket 域: {domains}"
+        assert "github-production-user-asset-6210df.s3.amazonaws.com" in domains
+
+    def test_web_probe_domains_include_api(self):
+        """github_web 全域探测: 主域 + api.github.com (防 GFW 特判封锁 API SNI)"""
+        from ip_pool import PROFILES_BY_ID
+        profile = PROFILES_BY_ID["github_web"]
+        assert profile.probe_domains[0] == "github.com"
+        assert "api.github.com" in profile.probe_domains
+
+    def test_assets_and_release_ok_statuses(self):
+        """github_assets / github_release 放行根路径 404/403 (Fastly 无根文档虚拟主机)"""
+        from ip_pool import PROFILES_BY_ID
+        assert set(PROFILES_BY_ID["github_assets"].probe_ok_statuses) == {403, 404}
+        assert set(PROFILES_BY_ID["github_release"].probe_ok_statuses) == {403, 404}
+        assert len(PROFILES_BY_ID["github_release"].probe_domains) == 3
 
 
 # ==============================================================================

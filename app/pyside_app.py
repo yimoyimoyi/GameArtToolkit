@@ -1828,11 +1828,38 @@ class MainWindow(QMainWindow):
         cfg["cached_latencies"] = new_cached_lats
         save_config(cfg)
 
-        # GitHub 全段封锁提示: 直连多段候选全挂时提醒启用上游代理 (relay 自动绕过)
-        for block_sid in ("github_web", "github_raw", "github_release", "github_assets", "github_s3"):
+        # GitHub 全段封锁提示: 直连多段候选全挂或可用节点不足时, 弹窗提醒启用上游代理 (relay 自动绕过)
+        blocked, low_avail = [], []
+        for block_sid in ("github_web", "github_raw", "github_release", "github_assets", "github_s3", "gitlab"):
             block_items = results.get(block_sid)
-            if block_items and not any(it.get("available") for it in block_items):
+            if not block_items:
+                continue
+            if not any(it.get("available") for it in block_items):
+                blocked.append(block_sid)
                 print(f"[AutoCDN] {block_sid} 直连候选全挂 (GFW 逐段封锁), 启用上游代理后自动经 relay 绕过")
+            elif sum(1 for it in block_items if it.get("rank", 3) == 0) < 2:
+                low_avail.append(block_sid)  # rank0 不足 2 个 = 单点依赖, 随时可能全挂
+
+        if blocked or low_avail:
+            try:
+                from win_utils import auto_detect_active_proxy
+                proxy_online = is_proxy_available(auto_detect_active_proxy(timeout=0.2), timeout=0.3)
+            except Exception:
+                proxy_online = False
+            proxy_enabled = bool(load_config().get("upstream_proxy", {}).get("enabled", False))
+            warn_list = sorted(set(blocked) | set(low_avail))
+            base_msg = (f"GitHub/GitLab 服务直连全挂({', '.join(sorted(blocked))}), "
+                        if blocked else f"GitHub/GitLab 服务可用节点不足({', '.join(low_avail)}), ")
+            if proxy_online and not proxy_enabled:
+                show_toast(self, base_msg + "检测到本地代理在线, 建议在设置中开启上游代理以获得 relay 兜底",
+                           toast_type="warning", duration=4500)
+            elif proxy_enabled:
+                show_toast(self, base_msg + "已启用代理兜底, 直连段封锁期间经 relay 转发",
+                           toast_type="info", duration=3500)
+            else:
+                show_toast(self, base_msg + "建议检查网络直连状态",
+                           toast_type="warning", duration=3500)
+            print(f"[AutoCDN] Git 系服务稳定性告警: {warn_list}")
 
         if nginx_mgr.is_running():
             nginx_mgr.reload()

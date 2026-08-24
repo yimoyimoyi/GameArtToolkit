@@ -67,6 +67,17 @@ class TestServiceProfile(unittest.TestCase):
         self.assertIn("github-production-release-asset-2e65be.s3.amazonaws.com", p_s3.domains)
         self.assertTrue(all(ip.startswith("16.15.") for ip in p_s3.candidate_ips))
 
+    def test_github_probe_configs(self):
+        """GitHub 系多域探测与状态码放行 (修复 S3 403 / githubassets 404 假阳性)"""
+        p_web = get_profile_by_id("github_web")
+        self.assertIn("api.github.com", p_web.probe_domains, "github_web 应全域验证 api.github.com")
+        p_s3 = get_profile_by_id("github_s3")
+        self.assertEqual(p_s3.probe_ok_statuses, (403,), "S3 根路径 403 应显式放行")
+        self.assertIn("github-cloud.s3.amazonaws.com", p_s3.probe_domains, "S3 应全量验证 5 个 bucket 域")
+        self.assertEqual(get_profile_by_id("github_assets").probe_ok_statuses, (403, 404))
+        self.assertEqual(get_profile_by_id("github_release").probe_ok_statuses, (403, 404))
+        self.assertEqual(len(get_profile_by_id("github_release").probe_domains), 3)
+
     def test_huggingface_image_cdns(self):
         """HuggingFace 全套图片/资产 CDN 域名覆盖"""
         p = get_profile_by_id("huggingface")

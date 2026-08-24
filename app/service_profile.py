@@ -10,7 +10,7 @@ GameArt Toolkit - 统一声明式服务元数据模型与配置体系 (Service P
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 
 class ServiceMode(str, Enum):
@@ -56,6 +56,8 @@ class ServiceProfile:
     probe_timeout: Optional[float] = None    # 服务级探测档位 (秒), 覆盖全局 cdn_timeout_seconds
     stable_ips: List[str] = field(default_factory=list) # 已知稳定段 IP, 测速排序"稳优先"信号
     measure_throughput: bool = False          # 是否在测速时实测下行吞吐 (B/s), 用于大文件/git pack 排序
+    probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
+    probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -352,6 +354,10 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         probe_timeout=2.0,  # Fastly/Azure 跨洋链路高丢包, 适度放宽档位 (原 3.0 致单任务预算 11.8s 拖慢整体测速)
         measure_throughput=True,  # git clone 的 smart-HTTP pack 走 github.com, 用真实下载吞吐排序
+        # 全域探测: 主域 + API 域双验证 (GFW 可能只特判封锁 api.github.com SNI 而网页仍通)
+        # 404 放行: raw 容灾段 (.133) 对 api.github.com 根路径返回 404 (Fastly 识别虚拟主机但无根文档)
+        probe_domains=("github.com", "api.github.com"),
+        probe_ok_statuses=(404,),
         # 稳定性策略: 跨网络(Azure/Fastly/Pages) 跨段(逐段封锁互为兜底) 跨协议(IPv4/IPv6) 三层容灾
         # 实测: 140.82.113.22 / 140.82.113.21 / 140.82.114.22 证书有效且 git 端点延迟最低 (~1.4s) 置顶
         stable_ips=["140.82.113.22", "140.82.113.21", "140.82.114.22", "20.27.177.113"],  # 已知稳定段, 排序稳优先
@@ -397,6 +403,10 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_github_release",
         ssl_sni_mode="host",
         measure_throughput=True,  # 发布包/大文件, 按真实下载吞吐排序
+        # 全域探测: 3 个对象域全部验证 (根路径 404/403 为 Fastly 虚拟主机"无根文档"的正常响应)
+        probe_domains=("objects.githubusercontent.com", "github-releases.githubusercontent.com",
+                       "media.githubusercontent.com"),
+        probe_ok_statuses=(403, 404),
         candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"]
     ),
     ServiceProfile(
@@ -411,6 +421,8 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_github_assets",
         ssl_sni_mode="host",
         measure_throughput=True,  # 前端 JS/CSS 静态大文件, 按真实下载吞吐排序
+        # 404 放行: githubassets.com 根路径返回 404 (Fastly 识别虚拟主机但无根文档, 实测 .215/.153/.133 全段一致)
+        probe_ok_statuses=(403, 404),
         stable_ips=["185.199.110.215", "185.199.108.215"],  # githubassets 专属 .215 段 (github520 现行推荐)
         candidate_ips=["185.199.110.215", "185.199.108.215", "185.199.109.215", "185.199.111.215",  # .215 专属段
                        "185.199.108.154", "185.199.109.154", "185.199.110.154", "185.199.111.154",  # .154 资产段
@@ -437,6 +449,14 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_github_s3",
         ssl_sni_mode="host",
         measure_throughput=True,  # 发布包 S3 对象下载, 按真实吞吐排序
+        # 全域探测: 5 个 bucket 域全部验证 (S3 根路径 GET / 预期 403 AccessDenied, 非节点故障;
+        # 多域验证可排除"非 S3 前端 IP"与区域不匹配节点的假阳性)
+        probe_domains=("github-production-release-asset-2e65be.s3.amazonaws.com",
+                       "github-production-repository-file-5c1aeb.s3.amazonaws.com",
+                       "github-production-user-asset-6210df.s3.amazonaws.com",
+                       "github-cloud.s3.amazonaws.com",
+                       "github-com.s3.amazonaws.com"),
+        probe_ok_statuses=(403,),
         candidate_ips=["16.15.246.123", "16.15.229.220", "16.15.252.11",  # AWS us-east-1 S3 段 (github520 实测)
                        "16.15.228.151", "16.15.199.204"]
     ),

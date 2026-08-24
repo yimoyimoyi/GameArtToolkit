@@ -96,10 +96,11 @@ def probe_timeout_for(srv_id: str, cfg_timeout: Optional[float] = None) -> float
 
 def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
                       stable_set: Optional[set] = None) -> Tuple:
-    """统一测速排序键: (rank, 稳定段惩罚, 吞吐逆序, 延迟, v6/v4 偏好兜底)
+    """统一测速排序键: (rank, 稳定段惩罚, 副域验证, 吞吐逆序, 延迟, v6/v4 偏好兜底)
 
     - rank 永远第一 (可用性优先, Fastly 全灭时仍由 rank0 兜底)
     - 稳定性优先于延迟: 短命 Anycast 延迟优势不可信, 已知稳定段优先
+    - 副域全验证软降权: 多域验证失败的节点排在验证通过节点后 (不淘汰, 防 GFW 特判封锁误杀)
     - 吞吐逆序 (越高越优): 对「握手 200 但下载慢」的节点降权, 让测速结果真正代表
       大文件/git pack 的下载体验。仅在测到吞吐 (throughput 非空) 时参与比较,
       未测吞吐的项退化为旧键序 (rank, 稳定段, 延迟), 兼容历史调用方。
@@ -120,10 +121,13 @@ def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
             v_penalty = 1
         elif ip_mode == "prefer_ipv6" and not is_v6:
             v_penalty = 1
+    # 副域全验证软降权: 副域验证失败 (如 api.github.com 被 GFW 特判封锁) 排在正常节点后,
+    # 但不淘汰 (主域网页仍可用, 避免瞬时抖动/特判封锁下整服务全挂)
+    sub_penalty = 0 if item.get("http_subdomains_ok") is not False else 1
     # 吞吐逆序: 测到吞吐的项优先; 未测到的用 -0 表示"无偏好"(不压过已测项)
     thp = item.get("throughput")
     thp_penalty = (-float(thp)) if (thp is not None and thp > 0) else MEDIOCRE_THROUGHPUT_SENTINEL
-    return (rank, stable_penalty, thp_penalty, lat, v_penalty)
+    return (rank, stable_penalty, sub_penalty, thp_penalty, lat, v_penalty)
 
 
 # 吞吐排序哨兵: 小于任何实际测得的正吞吐, 使"未测吞吐"的项排在"测到吞吐"的后面,
@@ -425,8 +429,18 @@ def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeou
 
 
 def _suspect_status(status: Optional[int]) -> bool:
-    """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 或 Cloudflare 421 重路由)"""
-    return status is not None and (status == 421 or 530 <= status <= 530 or 502 <= status <= 504)
+    """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 / Cloudflare 421 重路由 / 4xx 假阳性)
+
+    400/403/404 判定为可疑: 根路径探测对正常虚拟主机应返回 2xx/3xx (或 500),
+    返回 4xx 说明 IP 不是该域的有效前端 (S3 403 / Fastly 403 等假阳性)。
+    对"根路径本应 4xx"的服务 (S3 403, githubassets 404) 由 profile.probe_ok_statuses 显式放行。
+    """
+    if status is None:
+        return False
+    if status == 421 or status == 530 or 502 <= status <= 504:
+        return True
+    # 4xx 客户端错误: 错误虚拟主机/区域不匹配/无根文档 (500 保持放行, githubassets 根路径实测曾返回 500)
+    return 400 <= status <= 404
 
 
 def fast_tcp_ping(ip: str, port: int = 443, timeout: float = 0.8,
@@ -461,9 +475,11 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          proxy: Optional[Tuple[str, int]] = None,
                          physical_ip: Optional[str] = None,
                          quick_retry: bool = True,
-                         measure_throughput: bool = False) -> Dict:
+                         measure_throughput: bool = False,
+                         probe_domains: Optional[List[str]] = None,
+                         ok_statuses: Optional[set] = None) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
-    
+
     单节点独立生命周期计时:
     - 真正分配到 Worker 线程开始执行时才启动单任务独立计时 (单任务硬预算 4.5s)
     - TCP 阶段预算 1.0s, TLS 阶段预算 2.2s, HTTP 阶段预算 1.5s
@@ -471,14 +487,24 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
     - measure_throughput: 在 HTTP 状态码通过后继续读取有限的响应体, 计算下行吞吐 (B/s)
       存入 out["throughput"]。仅对下载链路过慢/过大包 (如 git pack / 大文件 CDN) 有意义,
       用于把「握手 200 但下载慢」的节点在排序中降权。
+    - probe_domains: 多域全验证 (防 GFW 按子域特判封锁)。主域 GET (保持兼容与吞吐测量),
+      副域 HEAD (无 body, 复用同一 TLS 连接串行验证, 服务器主动关闭连接时保守判可疑)。
+      任一副域状态码可疑 → 输出 http_suspect=True, 调用方不得判 rank0。
+    - ok_statuses: 该服务显式放行的状态码集合 (如 S3 根路径 403 / githubassets 根路径 404,
+      这些 4xx 是虚拟主机"无根文档/无权限"的正常响应而非假节点特征)
     """
     def _do_probe_once() -> Dict:
         out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
                "tls_latency": None, "http_ok": False, "http_status": None, "error": "",
-               "throughput": None}
+               "http_suspect": False, "http_subdomains_ok": True, "throughput": None}
+        # http_suspect: 主域状态码可疑 (硬淘汰, 防假阳性)
+        # http_subdomains_ok: 副域多域验证是否全部通过 (软信号, 失败仅排序降权不淘汰,
+        #   防 GFW 特判封锁子域/瞬时抖动误杀整服务)
         # 档位缩放: 0.8 档更快 / 3.0 档更宽容 (默认 1.5 档 = 原始预算)
         scale = tier_scale(timeout)
         deadline = time.monotonic() + PROBE_DEFAULTS.hard_budget * scale  # 单节点硬超时预算
+        # 物理网卡 IP (IPv4 直连绑定源地址; 供主域 TCP 与副域验证共用)
+        p_ip = physical_ip if physical_ip is not None else get_physical_adapter_ip()
         sock = None
         ssock = None
         try:
@@ -494,7 +520,6 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                     t0 = time.perf_counter()
                     sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(tcp_timeout)
-                    p_ip = physical_ip if physical_ip is not None else get_physical_adapter_ip()
                     if p_ip and ":" not in ip:
                         try:
                             sock.bind((p_ip, 0))
@@ -536,10 +561,19 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                 out["error"] = f"tls error: {e}"
                 return out
 
-            # 3. HTTP 状态码探测
+            # 3. HTTP 状态码探测 (主域 GET + 副域独立 TLS 验证)
+            # 多域全验证: 副域必须用独立 TLS 握手 (SNI 与 Host 必须一致, 复用主域连接会触发
+            # Fastly/S3 的 SNI/Host 一致性校验返回 421/400, 导致误判)。防 GFW 按子域特判封锁
+            # (如只封 api.github.com 的 SNI) 与 S3 区域不匹配假节点。
             try:
                 http_timeout = max(0.6, min(deadline - time.monotonic(), PROBE_DEFAULTS.http_budget * scale))
                 ssock.settimeout(http_timeout)
+                # 探测域去重保序 (probe_domains 与主域重复时只发一次)
+                domains_to_probe = list(probe_domains) if probe_domains else []
+                if domain and domain not in domains_to_probe:
+                    domains_to_probe.insert(0, domain)
+                ok_set = set(ok_statuses) if ok_statuses else set()
+
                 req_headers = (
                     f"GET / HTTP/1.1\r\n"
                     f"Host: {domain}\r\n"
@@ -554,45 +588,126 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                         break
                     hdr += chunk
                 line = hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-                if line.startswith("HTTP/"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        out["http_status"] = int(parts[1])
-                        out["http_ok"] = True
-                        if 300 <= out["http_status"] < 400:
-                            loc = ""
-                            for h in hdr.decode("utf-8", errors="replace").split("\r\n"):
-                                if h.lower().startswith("location:"):
-                                    loc = h.split(":", 1)[1].strip()
-                                    break
-                            if loc:
-                                loc_host = loc.split("://")[-1].split("/")[0].lower() if "://" in loc else domain.lower()
-                                loc_path = "/" + loc.split("://")[-1].split("/", 1)[1] if "://" in loc and "/" in loc.split("://")[1] else "/"
-                                if loc_host == domain.lower() and loc_path == "/":
-                                    out["self_redirect"] = True
+                if line.startswith("HTTP/") and len(line.split()) >= 2 and line.split()[1].isdigit():
+                    out["http_status"] = int(line.split()[1])
+                    out["http_ok"] = True
+                    if 300 <= out["http_status"] < 400:
+                        loc = ""
+                        for h in hdr.decode("utf-8", errors="replace").split("\r\n"):
+                            if h.lower().startswith("location:"):
+                                loc = h.split(":", 1)[1].strip()
+                                break
+                        if loc:
+                            loc_host = loc.split("://")[-1].split("/")[0].lower() if "://" in loc else domain.lower()
+                            loc_path = "/" + loc.split("://")[-1].split("/", 1)[1] if "://" in loc and "/" in loc.split("://")[1] else "/"
+                            if loc_host == domain.lower() and loc_path == "/":
+                                out["self_redirect"] = True
 
-                        # 吞吐测量: 仅对干净 2xx 响应进行; 继承 hdr 中已读到的首个 body 分片
-                        if measure_throughput and 200 <= out["http_status"] < 300:
+                    # 主域状态码干净判定 (ok_statuses 显式放行或非可疑)
+                    if not ((out["http_status"] in ok_set) or not _suspect_status(out["http_status"])):
+                        out["http_suspect"] = True
+
+                    # 吞吐测量: 仅对主域干净 2xx 响应进行; 继承 hdr 中已读到的首个 body 分片
+                    if measure_throughput and 200 <= out["http_status"] < 300:
+                        try:
+                            thp_deadline = time.monotonic() + max(0.6, min(PROBE_DEFAULTS.throughput_budget * scale,
+                                                                            deadline - time.monotonic()))
+                            body = hdr.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in hdr else b""
+                            total = len(body)
+                            ssock.settimeout(min(1.0, max(0.3, thp_deadline - time.monotonic())))
+                            t0 = time.perf_counter()
+                            while (time.monotonic() < thp_deadline and total < PROBE_DEFAULTS.throughput_max_bytes):
+                                try:
+                                    chunk = ssock.recv(65536)
+                                except socket.timeout:
+                                    break
+                                if not chunk:
+                                    break
+                                total += len(chunk)
+                            dt = max(time.perf_counter() - t0, 1e-6)
+                            if total > 0:
+                                out["throughput"] = round(total / dt, 1)  # B/s
+                        except Exception:
+                            out["throughput"] = None
+
+                    # 副域独立 TLS 验证 (SNI=副域 + HEAD), 每个副域独立连接与预算
+                    # 链路模式跟随主域: 经代理 CONNECT 隧道时副域也走隧道 (GFW 封锁直连 SNI 时
+                    # 代理链路仍应通过, 避免误杀 rank1 候选); 主域已可疑则跳过省预算
+                    if not out.get("http_suspect"):
+                        for extra in domains_to_probe[1:]:
+                            if time.monotonic() >= deadline:
+                                out["http_subdomains_ok"] = False  # 预算耗尽未完成全验证 -> 软降权
+                                break
+                            extra_timeout = max(0.8, min(deadline - time.monotonic(), 1.5))
+                            extra_sock = None
+                            extra_tls = None
                             try:
-                                thp_deadline = time.monotonic() + max(0.6, min(PROBE_DEFAULTS.throughput_budget * scale,
-                                                                                deadline - time.monotonic()))
-                                body = hdr.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in hdr else b""
-                                total = len(body)
-                                ssock.settimeout(min(1.0, max(0.3, thp_deadline - time.monotonic())))
-                                t0 = time.perf_counter()
-                                while (time.monotonic() < thp_deadline and total < PROBE_DEFAULTS.throughput_max_bytes):
-                                    try:
-                                        chunk = ssock.recv(65536)
-                                    except socket.timeout:
-                                        break
+                                if proxy:
+                                    extra_sock = socket.create_connection(proxy, timeout=min(extra_timeout, 1.2))
+                                    _send_connect_and_read_200(extra_sock, ip, 443, min(extra_timeout, 1.2))
+                                else:
+                                    extra_sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                                                               socket.SOCK_STREAM)
+                                    extra_sock.settimeout(min(extra_timeout, 1.2))
+                                    if p_ip and ":" not in ip:
+                                        try:
+                                            extra_sock.bind((p_ip, 0))
+                                        except Exception:
+                                            pass
+                                    extra_sock.connect((ip, 443))
+                                ctx_extra = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                                ctx_extra.check_hostname = False
+                                ctx_extra.verify_mode = ssl.CERT_NONE
+                                try:
+                                    ctx_extra.set_alpn_protocols(["http/1.1"])
+                                except Exception:
+                                    pass
+                                if sni_mode == "host":
+                                    sni_host = extra
+                                elif sni_mode == "empty":
+                                    sni_host = None
+                                else:
+                                    sni_host = sni_mode
+                                extra_tls = ctx_extra.wrap_socket(extra_sock, server_hostname=sni_host)
+                                extra_sock = None
+                                extra_tls.settimeout(extra_timeout)
+                                extra_tls.sendall(
+                                    f"HEAD / HTTP/1.1\r\nHost: {extra}\r\n"
+                                    f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) GameArtToolkit/2.0\r\n"
+                                    f"Connection: close\r\n\r\n".encode("utf-8"))
+                                extra_hdr = b""
+                                while b"\r\n\r\n" not in extra_hdr:
+                                    chunk = extra_tls.recv(4096)
                                     if not chunk:
                                         break
-                                    total += len(chunk)
-                                dt = max(time.perf_counter() - t0, 1e-6)
-                                if total > 0:
-                                    out["throughput"] = round(total / dt, 1)  # B/s
+                                    extra_hdr += chunk
+                                extra_line = extra_hdr.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+                                extra_parts = extra_line.split()
+                                if (extra_line.startswith("HTTP/") and len(extra_parts) >= 2
+                                        and extra_parts[1].isdigit()):
+                                    extra_code = int(extra_parts[1])
+                                    # 副域状态码: ok_statuses 显式放行或非可疑 (与主域同一套判定)
+                                    if not ((extra_code in ok_set) or not _suspect_status(extra_code)):
+                                        out["http_subdomains_ok"] = False  # 副域可疑 -> 软降权不淘汰
+                                        break
+                                    # 干净副域继续验证下一个域
+                                else:
+                                    out["http_subdomains_ok"] = False  # 副域非 HTTP 响应 -> 软降权
+                                    break
                             except Exception:
-                                out["throughput"] = None
+                                # 副域 TLS/HTTP 失败 (GFW SNI RST / 区域不匹配):
+                                # 不淘汰节点 (特判封锁/瞬时抖动易误杀整服务), 记录为排序降权信号
+                                out["http_subdomains_ok"] = False
+                                break
+                            finally:
+                                for s_ in (extra_sock, extra_tls):
+                                    if s_:
+                                        try:
+                                            s_.close()
+                                        except Exception:
+                                            pass
+                else:
+                    raise ConnectionError(f"非 HTTP 响应: {line[:80] or '空'}")
             except Exception as e:
                 out["error"] = f"http error: {e}"
         except Exception as e:
@@ -633,31 +748,49 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
         """3xx 自我重定向 (Location 指向同 host 同路径) 判定为可疑节点, 排除重定向死循环假节点"""
         return bool(result and result.get("self_redirect"))
 
-    d_clean = bool(direct and direct.get("tcp_ok") and direct.get("tls_ok")
-                   and direct.get("http_ok") and not _suspect_status(direct.get("http_status"))
-                   and not _redirect_loop(direct))
-    p_clean = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
-                   and proxy.get("http_ok") and not _suspect_status(proxy.get("http_status"))
-                   and not _redirect_loop(proxy))
+    def _http_clean(result: Optional[Dict]) -> bool:
+        """HTTP 层干净判定: 收到响应 + 状态码非可疑 + 多域验证通过
+
+        - 新版探测输出含 http_suspect 字段 (已融合 profile.probe_ok_statuses 显式放行,
+          如 S3 403 / githubassets 404), 以该字段为准, 不再二次硬判状态码
+        - 无该字段的旧版/测试构造结果回退状态码硬判, 保持兼容
+        """
+        if not (result and result.get("tcp_ok") and result.get("tls_ok") and result.get("http_ok")):
+            return False
+        if result.get("http_suspect"):
+            return False
+        if "http_suspect" not in result and _suspect_status(result.get("http_status")):
+            return False
+        if _redirect_loop(result):
+            return False
+        return True
+
+    d_clean = _http_clean(direct)
+    p_clean = _http_clean(proxy)
     p_suspect = bool(proxy and proxy.get("tcp_ok") and proxy.get("tls_ok")
-                     and proxy.get("http_ok") and _suspect_status(proxy.get("http_status")))
+                     and proxy.get("http_ok")
+                     and (proxy.get("http_suspect")
+                          or ("http_suspect" not in proxy and _suspect_status(proxy.get("http_status")))))
 
     item = {"latency": None, "available": False, "rank": 3,
             "via_proxy": False, "recommend": "none", "sni_mode": "host",
             "direct": direct, "proxy": proxy, "proxy_used": bool(proxy),
-            "throughput": None}
+            "throughput": None, "http_subdomains_ok": None}
     if d_clean:
         item.update(rank=0, via_proxy=False, recommend="direct", available=True,
                     latency=direct.get("tcp_latency"))
         item["throughput"] = direct.get("throughput")
+        item["http_subdomains_ok"] = direct.get("http_subdomains_ok")
     elif p_clean:
         item.update(rank=1, via_proxy=True, recommend="proxy", available=True,
                     latency=(proxy.get("tcp_latency") or 0) + (proxy.get("tls_latency") or 0))
         item["throughput"] = proxy.get("throughput")
+        item["http_subdomains_ok"] = proxy.get("http_subdomains_ok")
     elif p_suspect:
         item.update(rank=2, via_proxy=True, recommend="proxy", available=True,
                     latency=(proxy.get("tcp_latency") or 0) + (proxy.get("tls_latency") or 0))
         item["throughput"] = proxy.get("throughput")
+        item["http_subdomains_ok"] = proxy.get("http_subdomains_ok")
     return item
 
 
@@ -704,12 +837,17 @@ class CDNOptimizer:
         # 其余服务保持旧三态探测, 避免额外拖慢整体测速)
         profile = PROFILES_BY_ID.get(group_name)
         measure_thp = bool(getattr(profile, "measure_throughput", False))
+        # 多域全验证与状态码放行: 由 profile 声明 (防 GFW 按子域特判封锁 / S3 403 假阳性)
+        probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
+        ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
                 direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
-                                              measure_throughput=measure_thp)
+                                              measure_throughput=measure_thp,
+                                              probe_domains=probe_domains, ok_statuses=ok_statuses)
                 proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
-                                                 measure_throughput=False) if proxy else None
+                                                 measure_throughput=False,
+                                                 probe_domains=probe_domains, ok_statuses=ok_statuses) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -809,20 +947,27 @@ class CDNOptimizer:
             sni_mode = SNI_MODES.get(srv_id, "host")
             # 服务级探测档位 (profile.probe_timeout 优先, 回退全局 cdn_timeout_seconds)
             task_timeout = probe_timeout_for(srv_id, timeout)
+            profile = PROFILES_BY_ID.get(srv_id)
+            measure_thp = bool(getattr(profile, "measure_throughput", False))
+            # 多域全验证与状态码放行: 由 profile 声明 (防 GFW 按子域特判封锁 / S3 403 假阳性)
+            probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
+            ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
 
             # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
-                flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout,
-                                   bool(getattr(PROFILES_BY_ID.get(srv_id), "measure_throughput", False))))
+                flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout, measure_thp,
+                                   probe_domains, ok_statuses))
 
         def run_both(task):
-            srv_id, ip, domain, sni_mode, task_timeout, measure_thp = task
+            srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains, ok_statuses = task
             direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
-                                          quick_retry=True, measure_throughput=measure_thp)
+                                          quick_retry=True, measure_throughput=measure_thp,
+                                          probe_domains=probe_domains, ok_statuses=ok_statuses)
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
-                                             quick_retry=False, measure_throughput=False) if proxy else None
+                                             quick_retry=False, measure_throughput=False,
+                                             probe_domains=probe_domains, ok_statuses=ok_statuses) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -861,6 +1006,31 @@ class CDNOptimizer:
                                   "direct": None, "proxy": None, "proxy_used": proxy_ready})
             stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
             items.sort(key=lambda x: _service_sort_key(x, ip_mode, stable_set))
+
+        # 7. 低存活率复核: 全量高并发探测对敏感目标 (GitHub 类) 易触发 GFW 高频干扰/限速,
+        #    单服务低并发复核可显著降低误杀 (消除"全量全挂/节点骤减、单测可用"的假象)。
+        #    阈值 rank0 < 3: 覆盖"节点少"服务 (全量并发下可能被误杀到只剩 2-3 个)。
+        #    复核结果直接替换该服务结果; 复核后仍低存活则保留诚实结果。
+        if target_set is None or len(target_set) > 1:
+            recheck_list = [sid for sid, items in results_by_srv.items()
+                            if items and sum(1 for it in items if it.get("rank", 3) == 0) < 3]
+            if recheck_list:
+                rlock = threading.Lock()
+
+                def _recheck(sid):
+                    try:
+                        single = self.test_service_dual(sid, max_workers=6)
+                        with rlock:
+                            results_by_srv[sid] = single
+                    except Exception:
+                        pass
+
+                recheck_threads = [threading.Thread(target=_recheck, args=(sid,), daemon=True)
+                                   for sid in recheck_list]
+                for t in recheck_threads:
+                    t.start()
+                for t in recheck_threads:
+                    t.join(timeout=90)
 
         return results_by_srv
 
@@ -1038,6 +1208,9 @@ class CDNOptimizer:
                       if not any(it.get("rank", 3) == 0 for it in items)]
             relayed = [s for s in failed if s in self.last_relay_services]
             fallback = [s for s in failed if s not in self.last_relay_services]
+            # 低存活率服务: rank0 直连节点不足 2 个 (单点依赖, GFW 逐段封锁下随时全挂)
+            low_avail = [srv_id for srv_id, items in test_results.items()
+                         if sum(1 for it in items if it.get("rank", 3) == 0) < 2]
             msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
             if relayed:
                 msg += f" {len(relayed)} 个服务直连不可用已切换本地代理转发({', '.join(sorted(relayed))})"
@@ -1048,6 +1221,11 @@ class CDNOptimizer:
                     msg += "。当前直连被阻断而本地代理可用, 但 Nginx 数据平面仍为直连, 请检查网络直连状态"
                 else:
                     msg += ", 建议检查网络后重试"
+            if low_avail:
+                proxy_now = _load_proxy_config()
+                hint = "。检测到本地代理可用, 建议开启上游代理以启用 relay 兜底" if proxy_now else \
+                       ", 可用节点过少, 建议启用本地代理后重测"
+                msg += f" ⚠️ {len(low_avail)} 个服务可用节点不足({', '.join(sorted(low_avail))}){hint}"
             return True, msg
         except Exception as e:
             return False, f"写入 upstream 配置失败: {e}"
@@ -1131,16 +1309,22 @@ class CDNHealthMonitor:
                 return True
             return False
 
-        # 轻量探针检查当前主力节点 (三态验证: TCP+TLS 通且 HTTP 非 5xx/421 才算健康)
+        # 轻量探针检查当前主力节点 (三态验证 + 多域全验证 + 状态码放行, 全部通过才算健康)
+        # 与测速判定完全一致: 假阳性节点 (S3 403 / 多域任一可疑) 不再被误判健康, 可被自愈替换
+        profile = PROFILES_BY_ID.get(srv_id)
         sni_mode = SNI_MODES.get(srv_id, "host")
         domain = srv["domains"][0] if srv["domains"] else ""
-        measure_thp = bool(getattr(PROFILES_BY_ID.get(srv_id), "measure_throughput", False))
+        measure_thp = bool(getattr(profile, "measure_throughput", False))
+        probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
+        ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
         probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain,
                                          timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode,
-                                         measure_throughput=measure_thp)
+                                         measure_throughput=measure_thp,
+                                         probe_domains=probe_domains, ok_statuses=ok_statuses)
 
         if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
-                and not _suspect_status(probe_res.get("http_status"))):
+                and not _suspect_status(probe_res.get("http_status"))
+                and not probe_res.get("http_suspect")):
             # 主力节点健康, 但对"下载吞吐敏感"的服务, 若实测发现其吞吐显著落后于
             # 候选中最佳吞吐, 仍触发重选: 让"握手 200 但下载慢"的节点被自动替换。
             # 仅在能拿到新旧两个吞吐读数时才启用, 避免抖动误判 (需明显差距)。
