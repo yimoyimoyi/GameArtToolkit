@@ -541,6 +541,32 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         enable_cache=True,
         candidate_ips=["104.19.230.21", "104.19.229.21", "104.18.22.203", "172.64.150.76"]
+    ),
+    ServiceProfile(
+        id="unpkg",
+        group="dev",
+        name="unpkg npm 包 CDN",
+        desc="npm 包直引最常用 CDN (Cloudflare, 前端依赖加载提速)",
+        domains=["unpkg.com"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_unpkg",
+        ssl_sni_mode="host",
+        enable_cache=True,  # npm 包静态资源缓存
+        candidate_ips=["104.18.0.22", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+    ServiceProfile(
+        id="cdnjs",
+        group="dev",
+        name="cdnjs 公共库 CDN",
+        desc="Cloudflare cdnjs 老牌公共前端库 CDN (与 jsDelivr 互补)",
+        domains=["cdnjs.cloudflare.com"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_cdnjs",
+        ssl_sni_mode="host",
+        enable_cache=True,
+        candidate_ips=["104.17.25.14", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
     )
 ]
 

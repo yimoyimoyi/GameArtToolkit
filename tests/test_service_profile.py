@@ -28,11 +28,11 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证服务 Profile 基准完整性 (32 项: 9 gaming + 8 acg + 15 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
-        self.assertEqual(len(PROFILES), 32)
-        self.assertEqual(len(SERVICES_LIST), 32)
-        self.assertEqual(len(SERVICES_BY_ID), 32)
-        self.assertEqual(len(CANDIDATE_IPS), 32)
+        """验证服务 Profile 基准完整性 (34 项: 9 gaming + 8 acg + 17 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
+        self.assertEqual(len(PROFILES), 34)
+        self.assertEqual(len(SERVICES_LIST), 34)
+        self.assertEqual(len(SERVICES_BY_ID), 34)
+        self.assertEqual(len(CANDIDATE_IPS), 34)
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
