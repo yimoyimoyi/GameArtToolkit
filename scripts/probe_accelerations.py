@@ -31,10 +31,11 @@ TARGET_SERVICES = [
     {"group": "二次元创作", "name": "VNDB 视觉小说库", "host": "vndb.org", "ips": ["217.182.194.133"], "path": "/"},
 
     # 开发者 & AI
-    {"group": "开发者 & AI", "name": "GitHub 主站 Web", "host": "github.com", "ips": ["20.205.243.166", "140.82.112.3"], "path": "/"},
-    {"group": "开发者 & AI", "name": "GitHub Raw 直连", "host": "raw.githubusercontent.com", "ips": ["185.199.108.133", "185.199.109.133"], "path": "/"},
-    {"group": "开发者 & AI", "name": "GitHub Releases 附件", "host": "objects.githubusercontent.com", "ips": ["185.199.108.133", "185.199.111.133"], "path": "/"},
-    {"group": "开发者 & AI", "name": "HuggingFace 模型库", "host": "huggingface.co", "ips": ["18.164.124.63", "18.164.124.71"], "path": "/"},
+    {"group": "开发者 & AI", "name": "GitHub 主站 Web", "host": "github.com", "ips": ["20.205.243.166", "20.27.177.113", "140.82.112.25", "140.82.114.21"], "path": "/"},
+    {"group": "开发者 & AI", "name": "GitHub Raw 直连", "host": "raw.githubusercontent.com", "ips": ["185.199.109.133", "185.199.108.133"], "path": "/"},
+    {"group": "开发者 & AI", "name": "GitHub Releases 附件", "host": "objects.githubusercontent.com", "ips": ["185.199.109.133", "185.199.111.133"], "path": "/"},
+    {"group": "开发者 & AI", "name": "GitHub S3 对象存储", "host": "github-production-user-asset-6210df.s3.amazonaws.com", "ips": ["16.15.246.123", "16.15.229.220"], "path": "/"},
+    {"group": "开发者 & AI", "name": "HuggingFace 模型库", "host": "huggingface.co", "ips": ["54.230.71.56", "3.175.207.31", "18.65.14.87"], "path": "/"},
     {"group": "开发者 & AI", "name": "Civitai C站 AI 模型", "host": "civitai.com", "ips": ["104.18.22.203", "104.18.23.203"], "path": "/"},
     {"group": "开发者 & AI", "name": "Docker Hub 镜像", "host": "hub.docker.com", "ips": ["44.205.64.79", "34.205.207.139"], "path": "/"},
     {"group": "开发者 & AI", "name": "GitLab 国际版", "host": "gitlab.com", "ips": ["172.65.251.78"], "path": "/"},

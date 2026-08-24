@@ -28,11 +28,11 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证服务 Profile 基准完整性 (34 项: 9 gaming + 8 acg + 17 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
-        self.assertEqual(len(PROFILES), 34)
-        self.assertEqual(len(SERVICES_LIST), 34)
-        self.assertEqual(len(SERVICES_BY_ID), 34)
-        self.assertEqual(len(CANDIDATE_IPS), 34)
+        """验证服务 Profile 基准完整性 (35 项: 9 gaming + 8 acg + 18 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
+        self.assertEqual(len(PROFILES), 35)
+        self.assertEqual(len(SERVICES_LIST), 35)
+        self.assertEqual(len(SERVICES_BY_ID), 35)
+        self.assertEqual(len(CANDIDATE_IPS), 35)
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
@@ -49,6 +49,30 @@ class TestServiceProfile(unittest.TestCase):
         self.assertIn("npm", SERVICES_BY_ID)
         self.assertIn("pypi", SERVICES_BY_ID)
         self.assertIn("crates_io", SERVICES_BY_ID)
+        self.assertIn("github_s3", SERVICES_BY_ID)  # GitHub S3 对象存储 (Release 附件/Issue 图片)
+
+    def test_github_stability_pools(self):
+        """GitHub 稳定性: 跨段/跨协议容灾候选池与 S3 对象域覆盖"""
+        p_web = get_profile_by_id("github_web")
+        self.assertIn("20.205.243.166", p_web.candidate_ips)  # Fastly 新加坡段
+        self.assertTrue(any(":" in ip for ip in p_web.candidate_ips), "github_web 缺少原生 IPv6 容灾")
+        p_raw = get_profile_by_id("github_raw")
+        self.assertIn("gist.githubusercontent.com", p_raw.domains)
+        self.assertIn("private-user-images.githubusercontent.com", p_raw.domains)
+        p_assets = get_profile_by_id("github_assets")
+        self.assertIn("github.io", p_assets.domains)  # GitHub Pages 站点 (DNS 后缀通配)
+        self.assertTrue(any(ip.endswith(".153") for ip in p_assets.candidate_ips), "github_assets 缺少 Pages .153 段")
+        p_s3 = get_profile_by_id("github_s3")
+        self.assertIn("github-production-user-asset-6210df.s3.amazonaws.com", p_s3.domains)
+        self.assertIn("github-production-release-asset-2e65be.s3.amazonaws.com", p_s3.domains)
+        self.assertTrue(all(ip.startswith("16.15.") for ip in p_s3.candidate_ips))
+
+    def test_huggingface_image_cdns(self):
+        """HuggingFace 全套图片/资产 CDN 域名覆盖"""
+        p = get_profile_by_id("huggingface")
+        for d in ["cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co", "cdn-lfs-eu-1.huggingface.co",
+                  "cdn-thumbnails.huggingface.co", "cdn-avatars.huggingface.co", "assets.huggingface.co"]:
+            self.assertIn(d, p.domains, f"huggingface 缺少图片 CDN 域名: {d}")
 
     def test_steam_akamai_workshop_domains(self):
         """steam_akamai 覆盖创意工坊图片与用户上传图域名"""

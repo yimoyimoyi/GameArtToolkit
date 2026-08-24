@@ -1829,7 +1829,7 @@ class MainWindow(QMainWindow):
         save_config(cfg)
 
         # GitHub 全段封锁提示: 直连多段候选全挂时提醒启用上游代理 (relay 自动绕过)
-        for block_sid in ("github_web", "github_raw", "github_release", "github_assets"):
+        for block_sid in ("github_web", "github_raw", "github_release", "github_assets", "github_s3"):
             block_items = results.get(block_sid)
             if block_items and not any(it.get("available") for it in block_items):
                 print(f"[AutoCDN] {block_sid} 直连候选全挂 (GFW 逐段封锁), 启用上游代理后自动经 relay 绕过")

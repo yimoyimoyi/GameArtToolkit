@@ -67,6 +67,8 @@ class ProbeDefaults:
     health_probe_timeout: float = 2.0  # 健康巡检探针超时
     relay_probe_timeout: float = 1.0   # 健康巡检 relay 端口探针超时
     retry_delay: float = 0.08      # 探测微重试间隔
+    throughput_budget: float = 1.6    # 吞吐测量阶段预算上限 (默认档, 随档位等比缩放)
+    throughput_max_bytes: int = 256 * 1024  # 吞吐测量上限 (256 KiB, 足够判定量级且不拖慢测速)
 
 
 PROBE_DEFAULTS = ProbeDefaults()
@@ -94,10 +96,13 @@ def probe_timeout_for(srv_id: str, cfg_timeout: Optional[float] = None) -> float
 
 def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
                       stable_set: Optional[set] = None) -> Tuple:
-    """统一测速排序键: (rank, 稳定段惩罚, 延迟, v6/v4 偏好兜底)
+    """统一测速排序键: (rank, 稳定段惩罚, 吞吐逆序, 延迟, v6/v4 偏好兜底)
 
     - rank 永远第一 (可用性优先, Fastly 全灭时仍由 rank0 兜底)
     - 稳定性优先于延迟: 短命 Anycast 延迟优势不可信, 已知稳定段优先
+    - 吞吐逆序 (越高越优): 对「握手 200 但下载慢」的节点降权, 让测速结果真正代表
+      大文件/git pack 的下载体验。仅在测到吞吐 (throughput 非空) 时参与比较,
+      未测吞吐的项退化为旧键序 (rank, 稳定段, 延迟), 兼容历史调用方。
     - 协议偏好仅在延迟平局时兜底: IPv6 快节点正常竞争 (修复 GitHub 原生
       IPv6 85ms 优于 IPv4 230ms 却被 prefer_ipv4 硬降权的问题)
     - ip_mode/stable_set 为 None 时跳过对应维度 (apply_optimal 防御性排序复用)
@@ -115,7 +120,32 @@ def _service_sort_key(item: Dict, ip_mode: Optional[str] = None,
             v_penalty = 1
         elif ip_mode == "prefer_ipv6" and not is_v6:
             v_penalty = 1
-    return (rank, stable_penalty, lat, v_penalty)
+    # 吞吐逆序: 测到吞吐的项优先; 未测到的用 -0 表示"无偏好"(不压过已测项)
+    thp = item.get("throughput")
+    thp_penalty = (-float(thp)) if (thp is not None and thp > 0) else MEDIOCRE_THROUGHPUT_SENTINEL
+    return (rank, stable_penalty, thp_penalty, lat, v_penalty)
+
+
+# 吞吐排序哨兵: 小于任何实际测得的正吞吐, 使"未测吞吐"的项排在"测到吞吐"的后面,
+# 但在同组未测项之间仍按延迟比较 (避免未测项彼此被 -0 且 latency 兜底失效)。
+# 取一个大负数即可满足 "未测 < 已测(正)" 的单调关系。
+MEDIOCRE_THROUGHPUT_SENTINEL = -1.0
+
+# 健康巡检吞吐自愈阈值: 当前主力节点实测吞吐 < 最优候选吞吐 x 该比例时, 触发重新选举。
+# 0.45 = 主力慢于最优 55% 才换, 避免晚高峰抖动导致频繁无谓重选。
+THROUGHPUT_HEAL_RATIO = 0.45
+
+
+def _best_throughput_among_rank0(items: List[Dict]) -> Optional[float]:
+    """取 rank0 (直连三态全通) 候选中的最大下载吞吐 (B/s); 无 rank0 或未测吞吐返回 None"""
+    best = None
+    for it in items:
+        if it.get("rank", 3) != 0:
+            continue
+        thp = it.get("throughput")
+        if thp is not None and thp > 0:
+            best = max(best, float(thp)) if best is not None else float(thp)
+    return best
 
 
 def _apply_prefilter_floor(pool_ips: List[str], alive_ips: set, floor: float) -> List[str]:
@@ -430,17 +460,22 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          sni_mode: str = "host",
                          proxy: Optional[Tuple[str, int]] = None,
                          physical_ip: Optional[str] = None,
-                         quick_retry: bool = True) -> Dict:
+                         quick_retry: bool = True,
+                         measure_throughput: bool = False) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
     
     单节点独立生命周期计时:
     - 真正分配到 Worker 线程开始执行时才启动单任务独立计时 (单任务硬预算 4.5s)
     - TCP 阶段预算 1.0s, TLS 阶段预算 2.2s, HTTP 阶段预算 1.5s
     - 首次非致命异常自动原地快速微重试 1 次, 强力抵御跨国网络偶发丢包
+    - measure_throughput: 在 HTTP 状态码通过后继续读取有限的响应体, 计算下行吞吐 (B/s)
+      存入 out["throughput"]。仅对下载链路过慢/过大包 (如 git pack / 大文件 CDN) 有意义,
+      用于把「握手 200 但下载慢」的节点在排序中降权。
     """
     def _do_probe_once() -> Dict:
         out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
-               "tls_latency": None, "http_ok": False, "http_status": None, "error": ""}
+               "tls_latency": None, "http_ok": False, "http_status": None, "error": "",
+               "throughput": None}
         # 档位缩放: 0.8 档更快 / 3.0 档更宽容 (默认 1.5 档 = 原始预算)
         scale = tier_scale(timeout)
         deadline = time.monotonic() + PROBE_DEFAULTS.hard_budget * scale  # 单节点硬超时预算
@@ -535,6 +570,29 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                                 loc_path = "/" + loc.split("://")[-1].split("/", 1)[1] if "://" in loc and "/" in loc.split("://")[1] else "/"
                                 if loc_host == domain.lower() and loc_path == "/":
                                     out["self_redirect"] = True
+
+                        # 吞吐测量: 仅对干净 2xx 响应进行; 继承 hdr 中已读到的首个 body 分片
+                        if measure_throughput and 200 <= out["http_status"] < 300:
+                            try:
+                                thp_deadline = time.monotonic() + max(0.6, min(PROBE_DEFAULTS.throughput_budget * scale,
+                                                                                deadline - time.monotonic()))
+                                body = hdr.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in hdr else b""
+                                total = len(body)
+                                ssock.settimeout(min(1.0, max(0.3, thp_deadline - time.monotonic())))
+                                t0 = time.perf_counter()
+                                while (time.monotonic() < thp_deadline and total < PROBE_DEFAULTS.throughput_max_bytes):
+                                    try:
+                                        chunk = ssock.recv(65536)
+                                    except socket.timeout:
+                                        break
+                                    if not chunk:
+                                        break
+                                    total += len(chunk)
+                                dt = max(time.perf_counter() - t0, 1e-6)
+                                if total > 0:
+                                    out["throughput"] = round(total / dt, 1)  # B/s
+                            except Exception:
+                                out["throughput"] = None
             except Exception as e:
                 out["error"] = f"http error: {e}"
         except Exception as e:
@@ -586,16 +644,20 @@ def _classify_result(direct: Dict, proxy: Dict) -> Dict:
 
     item = {"latency": None, "available": False, "rank": 3,
             "via_proxy": False, "recommend": "none", "sni_mode": "host",
-            "direct": direct, "proxy": proxy, "proxy_used": bool(proxy)}
+            "direct": direct, "proxy": proxy, "proxy_used": bool(proxy),
+            "throughput": None}
     if d_clean:
         item.update(rank=0, via_proxy=False, recommend="direct", available=True,
                     latency=direct.get("tcp_latency"))
+        item["throughput"] = direct.get("throughput")
     elif p_clean:
         item.update(rank=1, via_proxy=True, recommend="proxy", available=True,
                     latency=(proxy.get("tcp_latency") or 0) + (proxy.get("tls_latency") or 0))
+        item["throughput"] = proxy.get("throughput")
     elif p_suspect:
         item.update(rank=2, via_proxy=True, recommend="proxy", available=True,
                     latency=(proxy.get("tcp_latency") or 0) + (proxy.get("tls_latency") or 0))
+        item["throughput"] = proxy.get("throughput")
     return item
 
 
@@ -638,10 +700,16 @@ class CDNOptimizer:
             proxy = None
 
         results = []
+        # 是否实测吞吐: 取决于服务 profile.measure_throughput (大文件/git pack 服务才启用,
+        # 其余服务保持旧三态探测, 避免额外拖慢整体测速)
+        profile = PROFILES_BY_ID.get(group_name)
+        measure_thp = bool(getattr(profile, "measure_throughput", False))
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
-                direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None)
-                proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy) if proxy else None
+                direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
+                                              measure_throughput=measure_thp)
+                proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
+                                                 measure_throughput=False) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -746,12 +814,15 @@ class CDNOptimizer:
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
-                flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout))
+                flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout,
+                                   bool(getattr(PROFILES_BY_ID.get(srv_id), "measure_throughput", False))))
 
         def run_both(task):
-            srv_id, ip, domain, sni_mode, task_timeout = task
-            direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None, quick_retry=True)
-            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy, quick_retry=False) if proxy else None
+            srv_id, ip, domain, sni_mode, task_timeout, measure_thp = task
+            direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
+                                          quick_retry=True, measure_throughput=measure_thp)
+            proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
+                                             quick_retry=False, measure_throughput=False) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -830,7 +901,7 @@ class CDNOptimizer:
             "# GameArt Toolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)",
             f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "# 仅写入 rank0 (直连三态全通) 节点, 排除假节点导致 502",
-            "# max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
+            "# 3 主力 + 最多 5 备份冗余; max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
             "# ==============================================================================\n"
         ]
 
@@ -890,8 +961,10 @@ class CDNOptimizer:
             stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
             usable.sort(key=lambda x: _service_sort_key(x, None, stable_set))
             valid_ips = [it["ip"] for it in usable if it.get("ip")]
-            primary_ips = valid_ips[:2]
-            backup_ips = valid_ips[2:4]
+            # 稳定性冗余: 3 主力 + 最多 5 备份 (原 2+2 单节点被封即单点故障;
+            # GitHub/Fastly 段被 GFW 逐段封锁时, 多备份保证 nginx 自动故障转移)
+            primary_ips = valid_ips[:3]
+            backup_ips = valid_ips[3:8]
 
             lines.append(f"upstream upstream_{srv_id} {{")
             if fallback:
@@ -1061,11 +1134,27 @@ class CDNHealthMonitor:
         # 轻量探针检查当前主力节点 (三态验证: TCP+TLS 通且 HTTP 非 5xx/421 才算健康)
         sni_mode = SNI_MODES.get(srv_id, "host")
         domain = srv["domains"][0] if srv["domains"] else ""
+        measure_thp = bool(getattr(PROFILES_BY_ID.get(srv_id), "measure_throughput", False))
         probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain,
-                                         timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode)
+                                         timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode,
+                                         measure_throughput=measure_thp)
 
         if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
                 and not _suspect_status(probe_res.get("http_status"))):
+            # 主力节点健康, 但对"下载吞吐敏感"的服务, 若实测发现其吞吐显著落后于
+            # 候选中最佳吞吐, 仍触发重选: 让"握手 200 但下载慢"的节点被自动替换。
+            # 仅在能拿到新旧两个吞吐读数时才启用, 避免抖动误判 (需明显差距)。
+            if measure_thp and probe_res.get("throughput"):
+                cached_best_thp = _best_throughput_among_rank0(items)
+                if cached_best_thp is not None and probe_res["throughput"] > 0:
+                    ratio = probe_res["throughput"] / max(cached_best_thp, 1.0)
+                    # 当前主力吞吐低于最优候选 45% 时判为"慢节点", 触发重新选举
+                    if ratio < THROUGHPUT_HEAL_RATIO:
+                        new_items = self.optimizer.test_service_dual(srv_id)
+                        with self._lock:
+                            self.cached_results[srv_id] = new_items
+                            self.failure_counts[srv_id] = 0
+                        return True
             with self._lock:
                 self.failure_counts[srv_id] = 0
             return False  # 主力节点健康 (HTTP 被 RST/421/502 不再误判健康)，无需自愈

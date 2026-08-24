@@ -55,6 +55,7 @@ class ServiceProfile:
     custom_headers: Dict[str, str] = field(default_factory=dict) # 自定义 HTTP 头部
     probe_timeout: Optional[float] = None    # 服务级探测档位 (秒), 覆盖全局 cdn_timeout_seconds
     stable_ips: List[str] = field(default_factory=list) # 已知稳定段 IP, 测速排序"稳优先"信号
+    measure_throughput: bool = False          # 是否在测速时实测下行吞吐 (B/s), 用于大文件/git pack 排序
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -86,7 +87,7 @@ SERVICE_GROUPS = {
         "id": "dev",
         "name": "开发者与 AI",
         "icon": "terminal",
-        "desc": "GitHub (Web/Raw/Releases)、HuggingFace、GitLab、PyPI、npm、crates.io"
+        "desc": "GitHub (Web/Raw/Releases/S3)、HuggingFace、GitLab、PyPI、npm、crates.io"
     }
 }
 
@@ -350,10 +351,18 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_github_web",
         ssl_sni_mode="host",
         probe_timeout=2.0,  # Fastly/Azure 跨洋链路高丢包, 适度放宽档位 (原 3.0 致单任务预算 11.8s 拖慢整体测速)
-        stable_ips=["20.27.177.113", "20.200.245.247"],  # Azure 亚太稳定段, 排序稳优先
-        candidate_ips=["20.27.177.113", "20.200.245.247",  # Azure 亚太优先 (稳)
-                       "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4",  # Fastly Anycast 兜底
-                       "185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"]  # 跨段容灾: raw 段实测可服务 github.com (200), GFW 逐段封锁时互为兜底
+        measure_throughput=True,  # git clone 的 smart-HTTP pack 走 github.com, 用真实下载吞吐排序
+        # 稳定性策略: 跨网络(Azure/Fastly/Pages) 跨段(逐段封锁互为兜底) 跨协议(IPv4/IPv6) 三层容灾
+        # 实测: 140.82.113.22 / 140.82.113.21 / 140.82.114.22 证书有效且 git 端点延迟最低 (~1.4s) 置顶
+        stable_ips=["140.82.113.22", "140.82.113.21", "140.82.114.22", "20.27.177.113"],  # 已知稳定段, 排序稳优先
+        candidate_ips=["140.82.113.22", "140.82.113.21", "140.82.114.22",  # 实测证书有效+最低延迟 (git clone 最快)
+                       "20.27.177.113", "20.200.245.247",  # Azure 亚太 (次选)
+                       "20.205.243.166", "20.205.243.165", "20.205.243.168",  # Fastly 新加坡段 (github520 现行推荐)
+                       "140.82.112.25", "140.82.114.21", "140.82.112.17", "140.82.114.26", "140.82.113.22",  # Fastly Anycast 全球段 (github520 实测)
+                       "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4",  # GitHub 官方 IP 列表段
+                       "185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133",  # 跨段容灾: raw 段实测可服务 github.com (200), GFW 逐段封锁时互为兜底
+                       "2606:50c0:8000::154", "2606:50c0:8001::154",  # GitHub 原生 IPv6, 实测直连可用
+                       "2606:50c0:8002::154", "2606:50c0:8003::154"]
     ),
     ServiceProfile(
         id="github_raw",
@@ -364,13 +373,16 @@ PROFILES: List[ServiceProfile] = [
             "raw.githubusercontent.com", "user-images.githubusercontent.com", "favicons.githubusercontent.com",
             "avatars.githubusercontent.com", "avatars0.githubusercontent.com", "avatars1.githubusercontent.com",
             "avatars2.githubusercontent.com", "avatars3.githubusercontent.com", "avatars4.githubusercontent.com",
-            "avatars5.githubusercontent.com", "camo.githubusercontent.com", "desktop.githubusercontent.com"
+            "avatars5.githubusercontent.com", "camo.githubusercontent.com", "desktop.githubusercontent.com",
+            "gist.githubusercontent.com", "cloud.githubusercontent.com",  # Gist Raw 与历史图片域
+            "private-user-images.githubusercontent.com"  # 私有仓库图片 (GitHub 现行图片域)
         ],
         icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_raw",
         ssl_sni_mode="host",
-        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133",
+        stable_ips=["185.199.109.133", "185.199.108.133"],  # 实测低延迟稳定段 (github520 现行推荐 109 段)
+        candidate_ips=["185.199.109.133", "185.199.108.133", "185.199.110.133", "185.199.111.133",
                        "2606:50c0:8000::154", "2606:50c0:8001::154",  # GitHub 原生 IPv6, 实测直连可用
                        "2606:50c0:8002::154", "2606:50c0:8003::154"]
     ),
@@ -384,21 +396,49 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载
         upstream_name="upstream_github_release",
         ssl_sni_mode="host",
+        measure_throughput=True,  # 发布包/大文件, 按真实下载吞吐排序
         candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133"]
     ),
     ServiceProfile(
         id="github_assets",
         group="dev",
         name="GitHub 前端 JS/CSS 静态 CDN",
-        desc="解决 GitHub 前端 CSS/JS 静态资源与文档页加载",
-        domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev"],
+        desc="解决 GitHub 前端 CSS/JS 静态资源、文档页与 Pages 站点加载",
+        domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev",
+                 "github.io"],  # GitHub Pages 站点 (user.github.io, DNS 模式按后缀通配路由)
         icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_assets",
         ssl_sni_mode="host",
-        candidate_ips=["185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133", "185.199.108.154",
+        measure_throughput=True,  # 前端 JS/CSS 静态大文件, 按真实下载吞吐排序
+        stable_ips=["185.199.110.215", "185.199.108.215"],  # githubassets 专属 .215 段 (github520 现行推荐)
+        candidate_ips=["185.199.110.215", "185.199.108.215", "185.199.109.215", "185.199.111.215",  # .215 专属段
+                       "185.199.108.154", "185.199.109.154", "185.199.110.154", "185.199.111.154",  # .154 资产段
+                       "185.199.108.153", "185.199.109.153", "185.199.110.153", "185.199.111.153",  # .153 Pages 段
+                       "185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133",  # 跨段容灾
                        "2606:50c0:8000::215", "2606:50c0:8001::215",  # GitHub 原生 IPv6, 实测直连可用
-                       "2606:50c0:8002::215", "2606:50c0:8003::215"]
+                       "2606:50c0:8002::215", "2606:50c0:8003::215",
+                       "2606:50c0:8000::153", "2606:50c0:8001::153",  # Pages 原生 IPv6
+                       "2606:50c0:8002::153", "2606:50c0:8003::153"]
+    ),
+    ServiceProfile(
+        id="github_s3",
+        group="dev",
+        name="GitHub 大文件对象存储 S3",
+        desc="解决 Release 安装包与 Issue/Discussion 上传图片加载 (AWS S3)",
+        domains=[
+            "github-production-release-asset-2e65be.s3.amazonaws.com",  # Release 附件实际下载域
+            "github-production-repository-file-5c1aeb.s3.amazonaws.com",  # 仓库附件/上传文件
+            "github-production-user-asset-6210df.s3.amazonaws.com",  # Issue/Discussion 用户上传图片
+            "github-cloud.s3.amazonaws.com", "github-com.s3.amazonaws.com"  # 其余 S3 对象域
+        ],
+        icon="rocket",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_github_s3",
+        ssl_sni_mode="host",
+        measure_throughput=True,  # 发布包 S3 对象下载, 按真实吞吐排序
+        candidate_ips=["16.15.246.123", "16.15.229.220", "16.15.252.11",  # AWS us-east-1 S3 段 (github520 实测)
+                       "16.15.228.151", "16.15.199.204"]
     ),
     ServiceProfile(
         id="gitlab",
@@ -410,6 +450,7 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_gitlab",
         ssl_sni_mode="host",
+        measure_throughput=True,  # Git 仓库 smart-HTTP, 按真实下载吞吐排序
         candidate_ips=["104.18.37.180", "172.64.150.76", "172.65.251.78",
                        "2606:4700:90:0:f22e:fbec:5bed:a9b9"]  # Cloudflare IPv6, 实测可用
     ),
@@ -417,16 +458,30 @@ PROFILES: List[ServiceProfile] = [
         id="huggingface",
         group="dev",
         name="HuggingFace AI 平台",
-        desc="解决开源大模型权重文件与 Space 空间直连加速 (L4 极速直通)",
-        domains=["huggingface.co", "www.huggingface.co", "cdn-lfs.huggingface.co", "cdn-thumbnails.huggingface.co", "hf.co"],
+        desc="模型权重 LFS 直连 + 全套图片 CDN 加速 (缩略图/头像/资产图)",
+        domains=[
+            "huggingface.co", "www.huggingface.co", "hf.co",
+            # --- 图片与静态资产 CDN 全家桶 ---
+            "cdn-lfs.huggingface.co",          # 模型/数据集 LFS 文件 (含数据集卡片图片)
+            "cdn-lfs-us-1.huggingface.co",     # LFS 美国区域 CDN (README/卡片图片常用域)
+            "cdn-lfs-eu-1.huggingface.co",     # LFS 欧洲区域 CDN
+            "cdn-thumbnails.huggingface.co",   # 模型/数据集/Paper 缩略图 CDN
+            "cdn-avatars.huggingface.co",      # 用户与组织头像 CDN (CloudFront)
+            "assets.huggingface.co"            # 官网静态资产 (字体/图标/展示图)
+        ],
         icon="cpu",
         mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载，突破 Nginx 缓冲与体积限制
         upstream_name="upstream_huggingface",
         ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",
+        measure_throughput=True,  # 模型权重 LFS 大文件, 按真实下载吞吐排序
+        # 候选池按 2026-08 实测延迟排序 (CloudFront Anycast), 测速引擎会再次动态优选
+        stable_ips=["54.230.71.56", "3.175.207.31", "3.175.207.30"],
         candidate_ips=[
-            "18.155.68.86", "18.155.68.106", "18.155.68.125",
-            "18.64.8.43", "18.64.8.84", "108.138.246.7",
-            "54.230.71.56", "3.175.207.30", "3.175.207.31"
+            "54.230.71.56", "3.175.207.31", "3.175.207.30",  # 实测 63-80ms 低延迟段
+            "18.155.68.106", "18.155.68.86", "18.155.68.125",
+            "18.65.14.87", "18.65.14.100", "18.65.14.85", "18.65.14.125",  # HF 主站现解析段
+            "13.35.190.78", "13.35.190.60", "13.35.190.73", "13.35.190.18",  # cdn-avatars 现解析段
+            "18.64.8.84", "18.64.8.43", "108.138.246.7"
         ]
     ),
     ServiceProfile(

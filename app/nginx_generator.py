@@ -44,6 +44,8 @@ class NginxConfGenerator:
             domains_list.append("*.booth.pm")
         elif profile.id == "pixiv_fanbox" and "*.fanbox.cc" not in domains_list:
             domains_list.append("*.fanbox.cc")
+        elif profile.id == "github_assets" and "*.github.io" not in domains_list:
+            domains_list.append("*.github.io")  # GitHub Pages 任意用户站点 (本地 DNS 后缀通配路由)
         elif profile.id == "gitlab" and "*.gitlab.com" not in domains_list:
             domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
         elif profile.id == "dlsite" and "*.dlsite.com" not in domains_list:

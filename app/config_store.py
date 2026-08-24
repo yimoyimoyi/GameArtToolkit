@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
 _LEGACY_SERVICE_MAPPING = {
     "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "danbooru", "vndb"],
     "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft", "ea_app"],
-    "github": ["github_web", "github_raw", "github_release", "github_assets", "gitlab"],
+    "github": ["github_web", "github_raw", "github_release", "github_assets", "github_s3", "gitlab"],
     "huggingface": ["huggingface"],
 }
 

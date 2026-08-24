@@ -1,0 +1,337 @@
+# ==============================================================================
+# GameArt Toolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)
+# 生成时间: 2026-08-24 00:21:48 (GitHub/HuggingFace 候选池扩容后的兜底快照, 运行时自动重测覆盖)
+# 仅写入 rank0 (直连三态全通) 节点, 排除假节点导致 502
+# 3 主力 + 最多 5 备份冗余; max_fails=3 fail_timeout=30s 减缓节点熔断雪崩
+# ==============================================================================
+
+upstream upstream_steam_store {
+    # 警告: 服务 steam_store 双通道探测全部失败, 回退候选池兜底
+    server 23.1.179.144:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_steam_community {
+    # 警告: 服务 steam_community 双通道探测全部失败, 回退候选池兜底
+    server 23.1.179.144:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_steam_akamai {
+    # 警告: 服务 steam_akamai 双通道探测全部失败, 回退候选池兜底
+    server 23.1.179.144:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_ubisoft {
+    # 警告: 服务 ubisoft 双通道探测全部失败, 回退候选池兜底
+    server 23.41.142.46:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_ea_app {
+    # 警告: 服务 ea_app 双通道探测全部失败, 回退候选池兜底
+    server 23.41.142.46:443 max_fails=3 fail_timeout=30s;
+    server 23.202.34.90:443 max_fails=3 fail_timeout=30s;
+    server 23.1.179.144:443 backup max_fails=3 fail_timeout=30s;
+    server 210.140.139.151:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_battle_net {
+    # 警告: 服务 battle_net 双通道探测全部失败, 回退候选池兜底
+    server 99.83.192.184:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_gog {
+    # 警告: 服务 gog 双通道探测全部失败, 回退候选池兜底
+    server 151.101.129.241:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_xbox {
+    # 警告: 服务 xbox 双通道探测全部失败, 回退候选池兜底
+    server 20.76.201.171:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_minecraft {
+    # 警告: 服务 minecraft 双通道探测全部失败, 回退候选池兜底
+    server 150.171.110.137:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_pixiv_web {
+    # 警告: 服务 pixiv_web 双通道探测全部失败, 回退候选池兜底
+    hash $connection consistent;
+    server 210.140.139.151:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_pixiv_img {
+    # 警告: 服务 pixiv_img 双通道探测全部失败, 回退候选池兜底
+    least_conn;
+    server 210.140.139.131:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_pixiv_fanbox {
+    # 警告: 服务 pixiv_fanbox 双通道探测全部失败, 回退候选池兜底
+    server 104.20.38.219:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_booth_pm {
+    # 警告: 服务 booth_pm 双通道探测全部失败, 回退候选池兜底
+    server 104.18.37.180:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_danbooru {
+    # 警告: 服务 danbooru 双通道探测全部失败, 回退候选池兜底
+    server 104.21.49.191:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_vndb {
+    # 警告: 服务 vndb 双通道探测全部失败, 回退候选池兜底
+    server 217.182.194.133:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_fantia {
+    # 警告: 服务 fantia 双通道探测全部失败, 回退候选池兜底
+    server 35.241.8.68:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_pixivision {
+    # 警告: 服务 pixivision 双通道探测全部失败, 回退候选池兜底
+    server 172.64.145.76:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_github_web {
+    # 警告: 服务 github_web 双通道探测全部失败, 回退候选池兜底
+    server 20.27.177.113:443 max_fails=3 fail_timeout=30s;
+    server 20.200.245.247:443 max_fails=3 fail_timeout=30s;
+    server 20.205.243.166:443 max_fails=3 fail_timeout=30s;
+    server 20.205.243.165:443 backup max_fails=3 fail_timeout=30s;
+    server 20.205.243.168:443 backup max_fails=3 fail_timeout=30s;
+    server 140.82.112.25:443 backup max_fails=3 fail_timeout=30s;
+    server 140.82.114.21:443 backup max_fails=3 fail_timeout=30s;
+    server 140.82.112.17:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_github_raw {
+    # 警告: 服务 github_raw 双通道探测全部失败, 回退候选池兜底
+    server 185.199.109.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.108.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.110.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.111.133:443 backup max_fails=3 fail_timeout=30s;
+    server [2606:50c0:8000::154]:443 backup max_fails=3 fail_timeout=30s;
+    server [2606:50c0:8001::154]:443 backup max_fails=3 fail_timeout=30s;
+    server [2606:50c0:8002::154]:443 backup max_fails=3 fail_timeout=30s;
+    server [2606:50c0:8003::154]:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_github_release {
+    # 警告: 服务 github_release 双通道探测全部失败, 回退候选池兜底
+    server 185.199.109.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.108.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.110.133:443 max_fails=3 fail_timeout=30s;
+    server 185.199.111.133:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_github_assets {
+    server [2606:50c0:8000::215]:443 max_fails=3 fail_timeout=30s;
+    server 185.199.110.215:443 max_fails=3 fail_timeout=30s;
+    server 185.199.108.215:443 max_fails=3 fail_timeout=30s;
+    server 185.199.109.215:443 backup max_fails=3 fail_timeout=30s;
+    server 185.199.111.215:443 backup max_fails=3 fail_timeout=30s;
+    server 185.199.108.153:443 backup max_fails=3 fail_timeout=30s;
+    server 185.199.109.153:443 backup max_fails=3 fail_timeout=30s;
+    server 185.199.110.153:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_github_s3 {
+    # 警告: 服务 github_s3 双通道探测全部失败, 回退候选池兜底
+    server 16.15.246.123:443 max_fails=3 fail_timeout=30s;
+    server 16.15.229.220:443 max_fails=3 fail_timeout=30s;
+    server 16.15.252.11:443 max_fails=3 fail_timeout=30s;
+    server 16.15.228.151:443 backup max_fails=3 fail_timeout=30s;
+    server 16.15.199.204:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_gitlab {
+    # 警告: 服务 gitlab 双通道探测全部失败, 回退候选池兜底
+    server 104.18.37.180:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_huggingface {
+    # 警告: 服务 huggingface 双通道探测全部失败, 回退候选池兜底
+    server 54.230.71.56:443 max_fails=3 fail_timeout=30s;
+    server 3.175.207.31:443 max_fails=3 fail_timeout=30s;
+    server 3.175.207.30:443 max_fails=3 fail_timeout=30s;
+    server 18.155.68.106:443 backup max_fails=3 fail_timeout=30s;
+    server 18.155.68.86:443 backup max_fails=3 fail_timeout=30s;
+    server 18.155.68.125:443 backup max_fails=3 fail_timeout=30s;
+    server 18.65.14.87:443 backup max_fails=3 fail_timeout=30s;
+    server 18.65.14.100:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_npm {
+    # 警告: 服务 npm 双通道探测全部失败, 回退候选池兜底
+    server 104.17.135.117:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_pypi {
+    # 警告: 服务 pypi 双通道探测全部失败, 回退候选池兜底
+    server 151.101.64.223:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_crates_io {
+    # 警告: 服务 crates_io 双通道探测全部失败, 回退候选池兜底
+    server 151.101.194.137:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_jsdelivr {
+    # 警告: 服务 jsdelivr 双通道探测全部失败, 回退候选池兜底
+    server 104.18.22.203:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_nuget {
+    # 警告: 服务 nuget 双通道探测全部失败, 回退候选池兜底
+    server 23.101.10.141:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_maven_central {
+    # 警告: 服务 maven_central 双通道探测全部失败, 回退候选池兜底
+    server 104.18.19.12:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_google_fonts {
+    # 警告: 服务 google_fonts 双通道探测全部失败, 回退候选池兜底
+    server 142.250.72.228:443 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_turnstile {
+    # 警告: 服务 turnstile 双通道探测全部失败, 回退候选池兜底
+    server 104.18.94.41:443 max_fails=3 fail_timeout=30s;
+    server 104.18.22.203:443 max_fails=3 fail_timeout=30s;
+    server 172.64.150.76:443 backup max_fails=3 fail_timeout=30s;
+    server 104.16.1.34:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_hcaptcha {
+    # 警告: 服务 hcaptcha 双通道探测全部失败, 回退候选池兜底
+    server 104.19.230.21:443 max_fails=3 fail_timeout=30s;
+    server 104.19.229.21:443 max_fails=3 fail_timeout=30s;
+    server 104.18.22.203:443 backup max_fails=3 fail_timeout=30s;
+    server 172.64.150.76:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_unpkg {
+    # 警告: 服务 unpkg 双通道探测全部失败, 回退候选池兜底
+    server 104.18.0.22:443 max_fails=3 fail_timeout=30s;
+    server 104.18.22.203:443 max_fails=3 fail_timeout=30s;
+    server 172.64.150.76:443 backup max_fails=3 fail_timeout=30s;
+    server 104.16.1.34:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}
+
+upstream upstream_cdnjs {
+    # 警告: 服务 cdnjs 双通道探测全部失败, 回退候选池兜底
+    server 104.17.25.14:443 max_fails=3 fail_timeout=30s;
+    server 104.18.22.203:443 max_fails=3 fail_timeout=30s;
+    server 172.64.150.76:443 backup max_fails=3 fail_timeout=30s;
+    server 104.16.1.34:443 backup max_fails=3 fail_timeout=30s;
+    keepalive 32;
+    keepalive_timeout 120;
+    keepalive_requests 10000;
+}

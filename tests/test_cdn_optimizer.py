@@ -718,7 +718,7 @@ class TestDnsCandidateResolution:
         opt = CDNOptimizer()
         called = []
 
-        def fake_probe(ip, domain="", timeout=1.5, sni_mode="host", proxy=None):
+        def fake_probe(ip, domain="", timeout=1.5, sni_mode="host", proxy=None, **kwargs):
             called.append(ip)
             return {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
                     "tls_latency": None, "http_ok": False, "http_status": None, "error": "mock"}
@@ -1131,14 +1131,18 @@ class TestServiceProbeOverride:
 # 25. github_web 服务参数卡 (Azure 亚太稳定段优先)
 # ==============================================================================
 class TestGithubWebProfile:
-    def test_candidate_ips_azure_first(self):
-        """github_web 候选池 Azure 亚太在前, Fastly 兜底在后"""
+    def test_candidate_ips_fast_valid_first(self):
+        """github_web 候选池: 证书有效+实测最低延迟的 edge 置顶, 其余段兜底在后"""
         from ip_pool import PROFILES_BY_ID
         profile = PROFILES_BY_ID["github_web"]
         assert len(profile.candidate_ips) >= 2
-        assert profile.candidate_ips[0].startswith("20."), "Azure 亚太应排首位"
-        assert profile.candidate_ips[1].startswith("20.")
-        assert "140.82.121.4" in profile.candidate_ips, "Fastly 仍保留作兜底"
+        # 实测最优: 140.82.113.22 / .21 / 114.22 证书有效且 git 端点延迟最低 (~1.4s)
+        assert profile.candidate_ips[0] == "140.82.113.22", "实测最优 edge 应排首位"
+        assert profile.candidate_ips[1] == "140.82.113.21"
+        assert profile.candidate_ips[2] == "140.82.114.22"
+        # 其它段仍保留作跨网络容灾兜底
+        assert "20.27.177.113" in profile.candidate_ips, "Azure 亚太保留作兜底"
+        assert "140.82.121.4" in profile.candidate_ips, "Fastly Anycast 仍保留作兜底"
 
     def test_probe_timeout_override(self):
         """github_web 服务级探测档位 2.0s (适度放宽, 原 3.0 单任务预算 11.8s 拖慢整体)"""
@@ -1146,11 +1150,12 @@ class TestGithubWebProfile:
         assert PROFILES_BY_ID["github_web"].probe_timeout == pytest.approx(2.0)
 
     def test_stable_ips_nonempty(self):
-        """github_web 声明 Azure 稳定段"""
+        """github_web 声明证书有效+低延迟 edge + Azure 亚太稳定段 (跨网络容灾)"""
         from ip_pool import PROFILES_BY_ID
         stable = PROFILES_BY_ID["github_web"].stable_ips
-        assert len(stable) == 2
-        assert all(ip.startswith("20.") for ip in stable)
+        assert len(stable) == 4
+        assert stable[0] == "140.82.113.22", "实测最优 edge 应置顶稳定段"
+        assert "20.27.177.113" in stable  # Azure 亚太段保留作稳定兜底
 
 
 # ==============================================================================
