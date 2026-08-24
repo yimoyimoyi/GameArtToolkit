@@ -61,7 +61,7 @@ class NginxManager:
         try:
             proc = subprocess.run(
                 'netstat -ano | findstr "LISTENING"',
-                shell=True, capture_output=True, text=True, timeout=2
+                shell=True, capture_output=True, text=True, errors="replace", timeout=2
             )
             for line in (proc.stdout or "").splitlines():
                 parts = line.split()

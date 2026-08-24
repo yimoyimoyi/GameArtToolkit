@@ -95,7 +95,8 @@ class TestHostsDynamicAdjustment:
 
         with patch("pyside_app.nginx_mgr.is_running", return_value=True), \
              patch("pyside_app.hosts_mgr", test_hm), \
-             patch("pyside_app.cert_mgr.is_cert_installed", return_value=True):
+             patch("pyside_app.cert_mgr.is_cert_installed", return_value=True), \
+             patch.object(test_hm, "diagnose_and_repair", return_value={"issues": [], "fixes": []}):
             win = MainWindow()
 
             # 初始注入
@@ -130,6 +131,7 @@ class TestHostsDynamicAdjustment:
              patch("pyside_app.nginx_mgr.is_running", return_value=True), \
              patch("pyside_app.hosts_mgr", test_hm), \
              patch("pyside_app.cert_mgr.is_cert_installed", return_value=True), \
+             patch.object(test_hm, "diagnose_and_repair", return_value={"issues": [], "fixes": []}), \
              patch("pyside_app.health_monitor.start"):
             win = MainWindow()
             win.start_acceleration(show_toast_on_fail=False)

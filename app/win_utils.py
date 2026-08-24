@@ -67,10 +67,27 @@ def get_pids_by_name(proc_name: str) -> List[int]:
     return pids
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
-    """使用 Socket 探测端口是否被监听"""
+    """使用 Socket 探测端口是否被监听
+
+    优先快速 connect 判定; 连接超时(部分安全软件/防火墙对回环 SYN 静默丢弃)
+    时改用 bind 探测确认, 避免误判为"空闲"且白等超时。
+    """
+    import errno
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.05)
-        return s.connect_ex((host, port)) == 0
+        rc = s.connect_ex((host, port))
+        if rc == 0:
+            return True  # 能建立连接 = 端口有监听
+        if rc != errno.ETIMEDOUT:  # 立即拒绝 = 端口空闲
+            return False
+    # 回环 SYN 被静默丢弃: bind 探测确认端口真实占用状态
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return False  # bind 成功 = 端口空闲
+        except OSError:
+            return True  # bind 失败 = 端口被占用
 
 def is_admin() -> bool:
     """检查当前进程是否具有 Windows 管理员权限"""
@@ -177,7 +194,10 @@ def _is_task_scheduler_autostart_enabled() -> bool:
     import subprocess
     try:
         cmd = ["schtasks", "/query", "/tn", AUTOSTART_TASK_NAME, "/fo", "LIST"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3, **get_silent_startup_kwargs())
+        # errors="replace": 中文 Windows 子进程输出为 GBK, UTF-8 模式(PYTHONUTF8=1)
+        # 下解码失败会崩溃 subprocess 读取线程并导致 stdout 管道无人读取
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                             timeout=3, **get_silent_startup_kwargs())
         return res.returncode == 0
     except Exception:
         return False
@@ -298,7 +318,8 @@ def set_autostart(enable: bool, start_minimized: bool = False, app_name: str = D
                 temp_xml = f.name
 
             cmd = ["schtasks", "/create", "/tn", AUTOSTART_TASK_NAME, "/xml", temp_xml, "/f"]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, **get_silent_startup_kwargs())
+            res = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                 timeout=5, **get_silent_startup_kwargs())
             if res.returncode == 0:
                 task_success = True
         except Exception:
@@ -324,7 +345,8 @@ def set_autostart(enable: bool, start_minimized: bool = False, app_name: str = D
                 f"$Shortcut.Save()"
             )
             subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
-                           capture_output=True, text=True, timeout=5, **get_silent_startup_kwargs())
+                           capture_output=True, text=True, errors="replace",
+                           timeout=5, **get_silent_startup_kwargs())
         except Exception:
             pass
 
@@ -343,7 +365,8 @@ def set_autostart(enable: bool, start_minimized: bool = False, app_name: str = D
         # 1. 删除计划任务
         try:
             subprocess.run(["schtasks", "/delete", "/tn", AUTOSTART_TASK_NAME, "/f"],
-                           capture_output=True, text=True, timeout=4, **get_silent_startup_kwargs())
+                           capture_output=True, text=True, errors="replace",
+                           timeout=4, **get_silent_startup_kwargs())
         except Exception:
             pass
 

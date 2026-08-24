@@ -142,7 +142,12 @@ class NativeFramelessHelper:
 
     def _init_window(self):
         """设置窗口样式与 DWM 属性"""
-        hwnd = int(self.window.winId())
+        try:
+            hwnd = int(self.window.winId())
+        except RuntimeError:
+            # 窗口已被销毁(测试环境中窗口从不进入事件循环即被清理时常见):
+            # 延迟回调应安全跳过, 避免访问已删除的 C++ 对象
+            return
 
         # 保留必要样式位以支持 DWM 系统阴影与原生动画
         user32 = ctypes.windll.user32

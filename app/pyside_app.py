@@ -61,7 +61,7 @@ from frameless_helper import NativeFramelessHelper
 from md_widgets import (
     MDSwitch, TrafficMonitorChart, LatencyBadge, TitleBar,
     show_toast, InlineEditableLabel, SkeletonCard, AnimatedStackedWidget, FlowLayout,
-    NoWheelComboBox
+    NoWheelComboBox, safe_theme_handler
 )
 from material_theme import MATERIAL_DARK_QSS, MATERIAL_LIGHT_QSS, MATERIAL_PINK_QSS, ThemeManager
 from svg_icons import SvgIconFactory
@@ -460,7 +460,7 @@ class MainWindow(QMainWindow):
             current_theme = cfg.get("theme", "dark")
 
         # 订阅主题变化总线，移除对 btn_theme.clicked 的重复绑定
-        ThemeManager.get_instance().theme_changed.connect(self.on_theme_changed)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_handler(self, "on_theme_changed"))
         ThemeManager.get_instance().set_theme(current_theme, QApplication.instance())
         if self.frameless_helper:
             self.frameless_helper.set_immersive_dark_mode(current_theme == "dark")
@@ -3370,7 +3370,8 @@ class MainWindow(QMainWindow):
         success_count = 0
         for cmd in cmds:
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3, **get_silent_startup_kwargs())
+                proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                      timeout=3, **get_silent_startup_kwargs())
                 if proc.returncode == 0:
                     success_count += 1
             except Exception:

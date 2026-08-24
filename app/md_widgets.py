@@ -13,6 +13,7 @@ GameArt Toolkit - Material Design 3 自绘控件库
 
 import time
 import math
+import weakref
 from typing import List, Optional, Callable
 from PySide6.QtCore import (
     Qt, QRect, QRectF, QPoint, QPointF, QSize, Property, QPropertyAnimation,
@@ -51,6 +52,41 @@ except ImportError:
         def get_color(self, k):
             return QColor("#000000")
     ThemeManager = _DummyThemeManager
+
+
+def safe_theme_refresh(widget) -> Callable:
+    """构造主题切换刷新回调(weakref 弱引用, 组件销毁后安全跳过)
+
+    PySide6 对 Python 回调连接不随 QObject 自动断开, 无 weakref 包裹时
+    会永久持有已销毁对象并在后续 set_theme 触发时崩溃。
+    """
+    ref = weakref.ref(widget)
+
+    def _cb(_theme):
+        obj = ref()
+        if obj is not None:
+            try:
+                obj.update()
+            except RuntimeError:
+                pass  # C++ 对象已销毁
+
+    return _cb
+
+
+def safe_theme_handler(widget, handler_name: str) -> Callable:
+    """构造主题切换处理回调(weakref 弱引用, 组件销毁后安全跳过)"""
+    ref = weakref.ref(widget)
+
+    def _cb(*args, **kwargs):
+        obj = ref()
+        if obj is not None:
+            try:
+                getattr(obj, handler_name)(*args, **kwargs)
+            except RuntimeError:
+                pass  # C++ 对象已销毁
+
+    return _cb
+
 
 class FlowLayout(QLayout):
     """
@@ -325,7 +361,7 @@ class TitleBar(QFrame):
         self.btn_theme.setToolTip("切换黑白主题 (Alt+T)")
         self.btn_theme.clicked.connect(self._on_theme_toggle)
         
-        ThemeManager.get_instance().theme_changed.connect(self._on_theme_changed)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_handler(self, "_on_theme_changed"))
 
         self.btn_min = QPushButton()
         self.btn_min.setObjectName("BtnTitleMin")
@@ -709,7 +745,10 @@ class ToastManager(QObject):
 
         if parent and parent != self._watched_parent:
             if self._watched_parent:
-                self._watched_parent.removeEventFilter(self)
+                try:
+                    self._watched_parent.removeEventFilter(self)
+                except RuntimeError:
+                    pass  # 旧父窗口已销毁, 事件过滤器随其释放
             parent.installEventFilter(self)
             self._watched_parent = parent
 
@@ -727,6 +766,19 @@ class ToastManager(QObject):
 
     def _reposition_toasts(self, parent: QWidget):
         if not parent:
+            return
+        # 清理已销毁的 toast: 父窗口销毁时子 toast 一并销毁, closed 信号不会触发,
+        # 列表会残留失效引用, 需在遍历前剔除 (否则访问已删除的 C++ 对象崩溃)
+        alive = []
+        for t in self.active_toasts:
+            try:
+                t.width()  # 触发 C++ 对象有效性检查
+                alive.append(t)
+            except RuntimeError:
+                pass
+        if len(alive) != len(self.active_toasts):
+            self.active_toasts = alive
+        if not alive:
             return
         pw = parent.width()
         ph = parent.height()
@@ -797,7 +849,7 @@ class InlineEditableLabel(QWidget):
         self.badge_label.mousePressEvent = self._on_badge_clicked
         self.edit_input.returnPressed.connect(self._commit_edit)
         self.edit_input.installEventFilter(self)
-        ThemeManager.get_instance().theme_changed.connect(self._on_theme_changed)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_handler(self, "_on_theme_changed"))
 
     def _on_theme_changed(self, theme: str = ""):
         try:
@@ -950,7 +1002,7 @@ class MDSwitch(QAbstractButton):
         self._hover_anim.setEasingCurve(QEasingCurve.OutCubic)
 
         self.toggled.connect(self._on_toggled)
-        ThemeManager.get_instance().theme_changed.connect(self.update)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
 
     def _get_thumb_position(self) -> float:
         return self._thumb_position
@@ -1110,7 +1162,7 @@ class TrafficMonitorChart(QWidget):
         self._ema_max = 100.0
 
         self.setFixedHeight(140)
-        ThemeManager.get_instance().theme_changed.connect(self.update)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
         self.setMinimumWidth(320)
 
     def add_sample(self, down_kb: float, up_kb: float, req_delta: int = 0, hit_delta: int = 0):
@@ -1326,7 +1378,7 @@ class LatencyBadge(QWidget):
         self.via_proxy = False
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
-        ThemeManager.get_instance().theme_changed.connect(lambda _: self.update())
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
 
     def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False):
         self.latency_ms = ms
@@ -1419,7 +1471,7 @@ class SkeletonCard(QFrame):
         self._offset = 0.0
 
         self.timer = QTimer(self)
-        ThemeManager.get_instance().theme_changed.connect(self.update)
+        ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
         self.timer.timeout.connect(self._step_animation)
         self.timer.start(30)
 
