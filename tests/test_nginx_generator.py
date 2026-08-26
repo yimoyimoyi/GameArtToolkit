@@ -55,6 +55,19 @@ class TestNginxGenerator(unittest.TestCase):
         ok, msg = mgr.test_config()
         self.assertTrue(ok, f"Nginx 语法验证失败: {msg}")
 
+    def test_chinese_path_nginx_validation(self):
+        """测试在包含中文字符的路径下执行 Nginx 配置预检与拉起兼容性"""
+        import shutil
+        import tempfile
+        # 创建包含中文路径的临时测试目录
+        with tempfile.TemporaryDirectory(prefix="测试中文路径_") as tmp_dir:
+            chinese_nginx_dir = Path(tmp_dir) / "nginx_加速器"
+            shutil.copytree(NGINX_DIR, chinese_nginx_dir)
+            
+            mgr = NginxManager(chinese_nginx_dir)
+            ok, msg = mgr.test_config()
+            self.assertTrue(ok, f"中文路径下 Nginx 配置预检失败: {msg}")
+
 
 if __name__ == "__main__":
     unittest.main()

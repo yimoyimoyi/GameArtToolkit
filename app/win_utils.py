@@ -6,7 +6,7 @@ GameArt Toolkit - Windows 原生 API 工具集 (进程与端口探测)
 import socket
 import ctypes
 from ctypes import wintypes
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 TH32CS_SNAPPROCESS = 0x00000002
 
@@ -631,5 +631,146 @@ def auto_detect_active_proxy(timeout: float = 0.2) -> Optional[Tuple[str, int]]:
         if is_port_in_use(port, host):
             return (host, port)
     return None
+
+
+def get_port_process_info(port: int) -> List[Dict[str, Any]]:
+    """
+    查询指定端口的占用详情 (支持 TCP / UDP 监听与连接)，获取占用进程的 PID、名称、绝对路径
+    优先使用 psutil，自动兜底使用 Windows 原生 netstat + tasklist
+    """
+    results: List[Dict[str, Any]] = []
+    seen_pids = set()
+
+    # 1. 尝试使用 psutil 高速获取
+    try:
+        import psutil
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port:
+                pid = conn.pid
+                if pid and pid not in seen_pids and pid > 0:
+                    seen_pids.add(pid)
+                    proc_name = "未知进程"
+                    exe_path = ""
+                    status = conn.status or "LISTEN"
+                    try:
+                        p = psutil.Process(pid)
+                        proc_name = p.name()
+                        exe_path = p.exe()
+                    except Exception:
+                        pass
+                    results.append({
+                        "port": port,
+                        "pid": pid,
+                        "name": proc_name,
+                        "exe": exe_path,
+                        "status": status,
+                        "proto": "TCP" if conn.type == socket.SOCK_STREAM else "UDP"
+                    })
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # 2. 兜底方案：使用 Windows 原生 netstat -ano
+    try:
+        import subprocess
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        cmd = f"netstat -ano -p tcp"
+        out = subprocess.check_output(cmd, startupinfo=si, text=True, errors="ignore")
+        
+        # 解析 netstat 输出
+        target_str = f":{port}"
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("TCP") and not line.startswith("UDP"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                local_addr = parts[1]
+                if local_addr.endswith(target_str):
+                    try:
+                        pid = int(parts[-1])
+                        if pid > 0 and pid not in seen_pids:
+                            seen_pids.add(pid)
+                            proc_name = "未知进程"
+                            exe_path = ""
+                            # 使用 tasklist 或 wmic 查名称
+                            try:
+                                t_out = subprocess.check_output(
+                                    f'tasklist /fi "PID eq {pid}" /fo csv /nh',
+                                    startupinfo=si, text=True, errors="ignore"
+                                )
+                                if t_out and '"' in t_out:
+                                    proc_name = t_out.split('","')[0].replace('"', '').strip()
+                            except Exception:
+                                pass
+                            results.append({
+                                "port": port,
+                                "pid": pid,
+                                "name": proc_name,
+                                "exe": exe_path,
+                                "status": parts[3] if len(parts) >= 5 else "LISTEN",
+                                "proto": parts[0]
+                            })
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+
+    return results
+
+
+def get_critical_ports_status(ports: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """批量获取核心端口 (默认 80, 443, 53) 的占用诊断状态"""
+    if ports is None:
+        ports = [80, 443, 53]
+
+    statuses = []
+    for port in ports:
+        in_use = is_port_in_use(port)
+        proc_info = get_port_process_info(port) if in_use else []
+        statuses.append({
+            "port": port,
+            "in_use": in_use,
+            "processes": proc_info
+        })
+    return statuses
+
+
+def kill_process_by_pid_safe(pid: int) -> Tuple[bool, str]:
+    """安全终止指定 PID 进程，返回 (是否成功, 说明文字)"""
+    import os
+    if pid <= 0:
+        return False, "无效的进程 PID"
+    if pid == os.getpid():
+        return False, "无法终止当前客户端自身进程"
+
+    try:
+        # 1. 尝试快速终止
+        fast_terminate_pid(pid)
+        # 等待 150ms 确认
+        time.sleep(0.15)
+        if not is_process_running(pid):
+            return True, f"已成功释放进程 (PID: {pid})"
+    except Exception as e:
+        pass
+
+    # 2. 尝试使用 taskkill /F /T
+    try:
+        import subprocess
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], startupinfo=si, capture_output=True)
+        time.sleep(0.15)
+        if not is_process_running(pid):
+            return True, f"已成功结束进程 (PID: {pid})"
+        else:
+            return False, f"结束进程失败，可能需要管理员权限或系统核心保护 (PID: {pid})"
+    except Exception as e:
+        return False, f"操作异常: {e}"
+
 
 

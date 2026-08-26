@@ -382,3 +382,56 @@ def test_render_cdn_results_ipv4_and_ipv6(qapp):
         assert dummy.cdn_results_layout.count() >= len(SERVICES_LIST)
 
 
+def test_theme_qss_symmetry_and_completeness():
+    """验证深色、浅色与粉色三套主题 QSS 规则完整性与 100% 对称性"""
+    import re
+
+    def parse_selectors(qss: str) -> set:
+        qss_clean = re.sub(r'/\*.*?\*/', '', qss, flags=re.DOTALL)
+        blocks = re.findall(r'([^{]+)\{([^}]+)\}', qss_clean)
+        return {b[0].strip() for b in blocks}
+
+    dark_sel = parse_selectors(MATERIAL_DARK_QSS)
+    light_sel = parse_selectors(MATERIAL_LIGHT_QSS)
+    pink_sel = parse_selectors(MATERIAL_PINK_QSS)
+
+    # 1. 验证规则数量与对称性
+    assert len(pink_sel) >= 100
+    assert dark_sel == light_sel, f"Dark 与 Light 选择器不对称: {dark_sel ^ light_sel}"
+    assert dark_sel == pink_sel, f"Dark 与 Pink 选择器不对称: {dark_sel ^ pink_sel}"
+    assert light_sel == pink_sel, f"Light 与 Pink 选择器不对称: {light_sel ^ pink_sel}"
+
+    # 2. 验证关键组件样式均在粉色模式中存在
+    key_selectors = [
+        'QFrame[class="MDCard"]',
+        'QFrame[class="MDCardHover"]:hover',
+        'QFrame[class="ServiceItem"]',
+        'QFrame[class="StatCard"]',
+        'QFrame[class="AccountCard"]',
+        'QFrame[class="AccountCardActive"]',
+        'QLineEdit[class="ServiceSearchInput"]',
+        'QPushButton[class="MDBtnTiny"]',
+        'QLineEdit[class="InlineEditInput"]',
+        'QLabel[class="InlineBadge"]',
+        'QFrame[class="ToastFrame"]',
+        'QFrame[class="EmptyStateCard"]',
+        'QPushButton[class="MDBtnPrimary"]',
+        'QPushButton[class="MDBtnStop"]',
+        'QPushButton[class="MDBtnTonal"]',
+        'QPushButton[class="MDBtnOutlined"], QPushButton[class="MDBtnOutline"]',
+        'QComboBox',
+        'QProgressBar',
+        'QRadioButton',
+        'QCheckBox',
+        'QMenu',
+        'QLabel[class="MainStatusTitle"]',
+        'QLabel[class="ItemTitle"]',
+        'QLabel[class="CdnIpText"]',
+        'QFrame[class="CdnIpCard"]',
+        'QFrame[class="CdnIpCardBest"]'
+    ]
+    for sel in key_selectors:
+        assert sel in pink_sel, f"粉色模式缺失关键选择器: {sel}"
+
+
+

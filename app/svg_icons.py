@@ -242,6 +242,71 @@ SVG_TEMPLATES = {
         <path d="M1.5 3.8v5.4c0 .55.45 1 1 1H7.8" stroke="{color}" stroke-width="1.0" stroke-linecap="round"/>
     </svg>""",
 
+    "compass": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon>
+    </svg>""",
+
+    "external_link": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+        <polyline points="15 3 21 3 21 9"></polyline>
+        <line x1="10" y1="14" x2="21" y2="3"></line>
+    </svg>""",
+
+    "search": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+    </svg>""",
+
+    "trash": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="3 6 5 6 21 6"></polyline>
+        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+    </svg>""",
+
+    "upload": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="17 8 12 3 7 8"></polyline>
+        <line x1="12" y1="3" x2="12" y2="15"></line>
+    </svg>""",
+
+    "crosshair": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="22" y1="12" x2="18" y2="12"></line>
+        <line x1="6" y1="12" x2="2" y2="12"></line>
+        <line x1="12" y1="6" x2="12" y2="2"></line>
+        <line x1="12" y1="22" x2="12" y2="18"></line>
+    </svg>""",
+
+    "copy": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="13" height="13" x="9" y="9" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+    </svg>""",
+
+    "network": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="16" y="16" width="6" height="6" rx="1"></rect>
+        <rect x="2" y="16" width="6" height="6" rx="1"></rect>
+        <rect x="9" y="2" width="6" height="6" rx="1"></rect>
+        <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"></path>
+        <path d="M12 12V8"></path>
+    </svg>""",
+
+    "grid": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="7" height="7" x="3" y="3" rx="1"></rect>
+        <rect width="7" height="7" x="14" y="3" rx="1"></rect>
+        <rect width="7" height="7" x="14" y="14" rx="1"></rect>
+        <rect width="7" height="7" x="3" y="14" rx="1"></rect>
+    </svg>""",
+
+    "briefcase": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="20" height="14" x="2" y="7" rx="2" ry="2"></rect>
+        <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+    </svg>""",
+
+    "arrow_left": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m12 19-7-7 7-7"></path>
+        <path d="M19 12H5"></path>
+    </svg>""",
+
     "window_close": """<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12" fill="none">
         <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="{color}" stroke-width="1.2" stroke-linecap="round"/>
     </svg>"""

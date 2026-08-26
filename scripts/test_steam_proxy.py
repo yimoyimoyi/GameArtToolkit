@@ -17,6 +17,19 @@ from service_profile import get_profile_by_id
 
 TEST_CASES = [
     {
+        "name": "Steam Web API (api.steampowered.com)",
+        "service_id": "steam_community",
+        "host": "api.steampowered.com",
+        "path": "/IParentalService/GetParentalSettings/v1",
+        # Host 必须保持 api.steampowered.com 命中 API 网关 vhost: 网关特征响应 401 (无 token),
+        # 若被归一化到 steamcommunity.com 主域则 API 路径被上游 302 重定向到社区首页 (探测必 FAIL)
+        "ok_statuses": (200, 400, 401, 403),
+        "custom_headers": {
+            "Host": "api.steampowered.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+    },
+    {
         "name": "Steam 社区首页 (steamcommunity.com)",
         "service_id": "steam_community",
         "host": "steamcommunity.com",
@@ -161,13 +174,16 @@ def run_all_steam_probes():
         print(f"    - 握手 SNI: {sni}", flush=True)
         print(f"    - 候选 IP 数: {len(candidate_ips)}", flush=True)
 
+        # 默认判定集合 (向后兼容旧用例); API 用例通过 ok_statuses 显式收紧,
+        # 302 在 API 场景表示 vhost 路由错误 (被重定向到社区首页), 必判 FAIL
+        ok_statuses = case.get("ok_statuses", (200, 301, 302, 400, 404))
         success_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidate_ips)) as executor:
             future_to_ip = {executor.submit(probe_single_endpoint, case, ip, sni): ip for ip in candidate_ips}
             for future in concurrent.futures.as_completed(future_to_ip):
                 ip = future_to_ip[future]
                 res = future.result()
-                status_desc = "PASS" if (res["http_status"] in (200, 301, 302, 400, 404)) else "FAIL"
+                status_desc = "PASS" if (res["http_status"] in ok_statuses) else "FAIL"
                 if status_desc == "PASS":
                     success_count += 1
                     server_info = f" [Server: {res['server_header']}]" if res["server_header"] else ""

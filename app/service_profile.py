@@ -58,6 +58,7 @@ class ServiceProfile:
     measure_throughput: bool = False          # 是否在测速时实测下行吞吐 (B/s), 用于大文件/git pack 排序
     probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
     probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
+    proxy_connect_by_domain: bool = False     # 代理通道探测时 CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT 规则直连、CDN geo 限制中国 IP 的场景)
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -77,13 +78,13 @@ SERVICE_GROUPS = {
         "id": "gaming",
         "name": "游戏生态",
         "icon": "gamepad",
-        "desc": "Steam 全生态、Battle.net、GOG、Xbox、Minecraft、Ubisoft、EA App"
+        "desc": "Steam 全生态、Battle.net、GOG、Xbox、Minecraft、Ubisoft"
     },
     "acg": {
         "id": "acg",
         "name": "二次元与创作者",
         "icon": "palette",
-        "desc": "Pixiv全生态、Fanbox、BOOTH、Danbooru、VNDB、Fantia、MyAnimeList"
+        "desc": "Pixiv全生态、Fanbox、BOOTH、VNDB、Fantia、Pixivision"
     },
     "dev": {
         "id": "dev",
@@ -124,6 +125,9 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_steam_community",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 实测最佳伪 SNI 绕过 GFW 且 Akamai 响应 200 OK
         candidate_ips=["23.1.179.144", "23.46.229.9", "104.91.87.202", "96.7.99.225"],
+        # Host 分流 (由 nginx_generator 特判渲染 map 实现): api.steampowered.com 保持原 Host
+        # 命中 API 网关 vhost (硬编码主域会导致 API 路径被上游 302 到社区首页),
+        # steamcommunity.com 及子域才归一化到主域防 118
         custom_headers={"Host": "steamcommunity.com"}
     ),
     ServiceProfile(
@@ -139,6 +143,9 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_steam_akamai",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 统一伪 SNI
         enable_cache=True,  # 开启本地磁盘缓存，防击穿并消除频次冲击
+        # 403/404 放行: Akamai 对 steamstatic 根路径返回 403 (无根文档, 实测确定性响应,
+        # 真实图片路径 /user/xxx.jpg 正常 200), 与 githubassets 404 同类的"根路径探测误杀"
+        probe_ok_statuses=(403, 404),
         candidate_ips=["23.1.179.144", "23.46.229.9", "23.32.91.49", "184.27.185.73"]
     ),
     ServiceProfile(
@@ -153,18 +160,8 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         candidate_ips=["23.41.142.46", "104.91.87.202"]
     ),
-    ServiceProfile(
-        id="ea_app",
-        group="gaming",
-        name="EA App / Origin",
-        desc="解决 EA 登录凭据验证超时、商城加载失败",
-        domains=["api.origin.com", "signin.ea.com", "api1.origin.com"],
-        icon="rocket",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_ea_app",
-        ssl_sni_mode="host",
-        candidate_ips=["23.1.179.144", "184.27.185.73", "23.202.34.90", "23.41.142.46"]
-    ),
+    # ea_app 已移除 (2026-08): Akamai 对 api.origin.com SNI 确定性返回 TLS HANDSHAKE_FAILURE
+    # (服务端主动拒绝, 友好网络下实测同样全挂 = 明确封锁/服务端停用), 加速不可行
     ServiceProfile(
         id="battle_net",
         group="gaming",
@@ -240,6 +237,9 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="empty",  # 空 SNI 直通
         candidate_ips=["210.140.139.151", "210.140.139.153", "210.140.139.154", "210.140.139.157", "210.140.139.161", "210.140.139.162"]
     ),
+    # embed.pixiv.net 已实测并放弃 (2026-08): Cloudflare geo 限制中国 IP (直连 403/RST),
+    # 仅代理可用 -> 按"仅代理可用的服务不加入"原则移除 (影响面小, 代理本身即可解决)。
+    # proxy_connect_by_domain 字段保留: 通用能力, 未来同类场景可直接启用
     ServiceProfile(
         id="pixiv_img",
         group="acg",
@@ -282,20 +282,13 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_booth_pm",
         ssl_sni_mode="host",
+        # 403 放行: Cloudflare 防护对无 cookie 探测请求返回 403 (实测确定性响应, 与真实解析 IP 一致;
+        # 真实浏览器经 CF 校验后正常访问)。注意: CF 防护站点反代受限, 放行仅避免全挂误报
+        probe_ok_statuses=(403,),
         candidate_ips=["104.18.37.180", "172.64.150.76", "104.18.22.203"]
     ),
-    ServiceProfile(
-        id="danbooru",
-        group="acg",
-        name="Danbooru 动漫图库",
-        desc="解决动漫插画检索图库缩略图与大图加载缓慢",
-        domains=["danbooru.donmai.us", "cdn.donmai.us"],
-        icon="image",
-        mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_danbooru",
-        ssl_sni_mode="host",
-        candidate_ips=["104.21.49.191", "172.67.168.170"]
-    ),
+    # danbooru 已移除 (2026-08): 主站源站 4 个 DNS 轮换 IP 全部 TCP 超时 (线路级不可达),
+    # 图片 CDN 走 Cloudflare 但返回 403 防护; 友好网络下实测同样全挂 = 明确封锁, 加速不可行
     ServiceProfile(
         id="vndb",
         group="acg",
@@ -538,6 +531,9 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_crates_io",
         ssl_sni_mode="host",
+        # 404 放行: crates.io 根路径 GET / 返回 404 (cargo 客户端从不访问根路径,
+        # 真实路径 index.crates.io/config.json 实测稳定 200)。候选池与当前 DNS 解析一致
+        probe_ok_statuses=(404,),
         candidate_ips=["151.101.194.137", "151.101.2.137", "151.101.66.137", "151.101.130.137", "3.170.229.4", "146.75.46.137"]
     ),
     ServiceProfile(
@@ -563,7 +559,8 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_nuget",
         ssl_sni_mode="host",
-        candidate_ips=["23.101.10.141", "23.101.10.113", "23.101.8.183"]
+        candidate_ips=["23.101.10.141", "23.101.10.113", "23.101.8.183",
+                       "172.183.192.203"]  # www.nuget.org 当前实测解析 (Azure 新段, 200)
     ),
     ServiceProfile(
         id="maven_central",
@@ -588,7 +585,12 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_google_fonts",
         ssl_sni_mode="host",
         enable_cache=True,  # 字体与 CSS 静态资源, 缓存消除重复回源
-        candidate_ips=["142.250.72.228", "120.253.253.161", "120.253.255.33"]
+        # 404 放行: Google 字体 API 根路径返回 404 (无根文档, /css?family= 真实路径实测 200);
+        # 国内电信缓存段 (120.253.x, 当前 DNS 实际解析) 绕过 GFW 封锁, 是唯一可行路径
+        probe_ok_statuses=(404,),
+        candidate_ips=["142.250.72.228",  # Google 官方段 (海外, 通常被 GFW 封锁, 保留兜底)
+                       "120.253.253.161", "120.253.255.33",  # 电信缓存段 (原候选)
+                       "120.253.255.161", "120.253.253.34"]  # 电信缓存段 (2026-08 实测解析, css 200)
     ),
     ServiceProfile(
         id="turnstile",
@@ -672,3 +674,186 @@ def get_profile_by_domain(domain: str) -> Optional[ServiceProfile]:
     return None
 
 TOTAL_SERVICES_COUNT: int = len(PROFILES)
+
+
+# ==============================================================================
+# 官方生态主站快捷导航数据注册表
+# ==============================================================================
+NAVIGATOR_SERVICES = [
+    # 二次元与创作者
+    {
+        "id": "pixiv",
+        "group": "acg",
+        "name": "Pixiv 插画主站",
+        "desc": "日本知名二次元插画、漫画、小说交流与投稿平台",
+        "url": "https://www.pixiv.net",
+        "domain": "pixiv.net",
+        "icon": "palette",
+        "tags": ["插画", "画师", "二次元", "P站", "Pixiv"]
+    },
+    {
+        "id": "fanbox",
+        "group": "acg",
+        "name": "Pixiv FANBOX",
+        "desc": "Pixiv 旗下创作者赞助与粉丝专属俱乐部",
+        "url": "https://www.fanbox.cc",
+        "domain": "fanbox.cc",
+        "icon": "palette",
+        "tags": ["赞助", "创作者", "插画", "画师", "FANBOX"]
+    },
+    {
+        "id": "booth",
+        "group": "acg",
+        "name": "BOOTH 同人商城",
+        "desc": "二次元同人志、3D模型、Cosplay与手作市集",
+        "url": "https://booth.pm",
+        "domain": "booth.pm",
+        "icon": "shopping_bag",
+        "tags": ["同人", "商城", "3D模型", "周边", "BOOTH"]
+    },
+    {
+        "id": "pixivision",
+        "group": "acg",
+        "name": "Pixivision 官方杂志",
+        "desc": "Pixiv 官方二次元文化、特辑与插画精选杂志",
+        "url": "https://www.pixivision.net",
+        "domain": "pixivision.net",
+        "icon": "book",
+        "tags": ["特辑", "画师专访", "资讯", "Pixivision"]
+    },
+    {
+        "id": "danbooru",
+        "group": "acg",
+        "name": "Danbooru 动漫图库",
+        "desc": "全球知名二次元动漫标签化图库与插画检索站",
+        "url": "https://danbooru.donmai.us",
+        "domain": "danbooru.donmai.us",
+        "icon": "image",
+        "tags": ["图库", "动漫", "壁纸", "标签检索", "Danbooru"]
+    },
+    {
+        "id": "vndb",
+        "group": "acg",
+        "name": "VNDB 视觉小说资料库",
+        "desc": "全球权威的 Galgame / 视觉小说综合百科资料库",
+        "url": "https://vndb.org",
+        "domain": "vndb.org",
+        "icon": "book",
+        "tags": ["Galgame", "视觉小说", "评分", "百科", "VNDB"]
+    },
+    {
+        "id": "fantia",
+        "group": "acg",
+        "name": "Fantia 创作者俱乐部",
+        "desc": "日本知名同人插画、声优与 Cosplay 创作者赞助平台",
+        "url": "https://fantia.jp",
+        "domain": "fantia.jp",
+        "icon": "star",
+        "tags": ["创作者", "赞助", "同人", "Cosplay", "Fantia"]
+    },
+
+    # 游戏生态
+    {
+        "id": "steam_store",
+        "group": "gaming",
+        "name": "Steam 游戏商店",
+        "desc": "Valve 旗下全球最大的 PC 游戏分发与购买平台",
+        "url": "https://store.steampowered.com",
+        "domain": "store.steampowered.com",
+        "icon": "shopping_bag",
+        "tags": ["游戏", "Steam", "商店", "特惠", "Steam商店"]
+    },
+    {
+        "id": "steam_community",
+        "group": "gaming",
+        "name": "Steam 玩家社区",
+        "desc": "Steam 玩家个人资料、动态、创意工坊与讨论区",
+        "url": "https://steamcommunity.com",
+        "domain": "steamcommunity.com",
+        "icon": "gamepad",
+        "tags": ["社区", "创意工坊", "好友", "动态", "Steam社区"]
+    },
+    {
+        "id": "ubisoft",
+        "group": "gaming",
+        "name": "Ubisoft 育碧官方商城",
+        "desc": "刺客信条、彩虹六号等育碧旗下游戏官方商城",
+        "url": "https://store.ubi.com",
+        "domain": "store.ubi.com",
+        "icon": "rocket",
+        "tags": ["育碧", "Ubisoft", "Uplay", "商城"]
+    },
+    {
+        "id": "battle_net",
+        "group": "gaming",
+        "name": "Battle.net 战网国际服",
+        "desc": "暴雪娱乐旗下魔兽世界、守望先锋、暗黑破坏神战网",
+        "url": "https://shop.battle.net",
+        "domain": "battle.net",
+        "icon": "rocket",
+        "tags": ["战网", "暴雪", "国际服", "魔兽", "Battle.net"]
+    },
+    {
+        "id": "gog",
+        "group": "gaming",
+        "name": "GOG 游戏商城",
+        "desc": "CD Projekt 旗下无 DRM 保护的精选 PC 游戏商城",
+        "url": "https://www.gog.com",
+        "domain": "gog.com",
+        "icon": "shopping_bag",
+        "tags": ["GOG", "DRM-Free", "波兰蠢驴", "经典游戏"]
+    },
+    {
+        "id": "xbox",
+        "group": "gaming",
+        "name": "Xbox 微软游戏官网",
+        "desc": "Xbox Game Pass (XGP) 与微软游戏生态主页",
+        "url": "https://www.xbox.com",
+        "domain": "xbox.com",
+        "icon": "gamepad",
+        "tags": ["Xbox", "XGP", "微软", "游戏主机"]
+    },
+    {
+        "id": "minecraft",
+        "group": "gaming",
+        "name": "Minecraft 官方网站",
+        "desc": "我的世界官方主页、皮肤下载与 Mojang 账户管理",
+        "url": "https://www.minecraft.net",
+        "domain": "minecraft.net",
+        "icon": "gamepad",
+        "tags": ["Minecraft", "我的世界", "Mojang", "沙盒"]
+    },
+
+    # 开发者与 AI
+    {
+        "id": "github",
+        "group": "dev",
+        "name": "GitHub 代码托管",
+        "desc": "全球最大的开源代码托管与开发者协作平台",
+        "url": "https://github.com",
+        "domain": "github.com",
+        "icon": "terminal",
+        "tags": ["GitHub", "开源", "Git", "开发者", "代码"]
+    },
+    {
+        "id": "gitlab",
+        "group": "dev",
+        "name": "GitLab 国际版",
+        "desc": "企业级 DevOps 与全生命周期 Git 项目管理平台",
+        "url": "https://gitlab.com",
+        "domain": "gitlab.com",
+        "icon": "terminal",
+        "tags": ["GitLab", "DevOps", "CI/CD", "代码托管"]
+    },
+    {
+        "id": "huggingface",
+        "group": "dev",
+        "name": "HuggingFace AI 开源社区",
+        "desc": "全球顶级开源 AI 大模型、数据集与 Spaces 应用社区",
+        "url": "https://huggingface.co",
+        "domain": "huggingface.co",
+        "icon": "cpu",
+        "tags": ["AI", "大模型", "Transformers", "机器学习", "HuggingFace"]
+    }
+]
+

@@ -362,6 +362,17 @@ class TestProbeDomainConfig:
         assert set(PROFILES_BY_ID["github_release"].probe_ok_statuses) == {403, 404}
         assert len(PROFILES_BY_ID["github_release"].probe_domains) == 3
 
+    def test_steam_akamai_booth_ok_statuses(self):
+        """steam_akamai (Akamai 无根文档 403) 与 booth_pm (CF 防护 403) 放行根路径 403/404"""
+        from ip_pool import PROFILES_BY_ID
+        assert set(PROFILES_BY_ID["steam_akamai"].probe_ok_statuses) == {403, 404}
+        assert PROFILES_BY_ID["booth_pm"].probe_ok_statuses == (403,)
+
+    def test_crates_io_ok_statuses(self):
+        """crates_io 放行根路径 404 (cargo 客户端从不访问根路径, 真实路径 config.json 稳定 200)"""
+        from ip_pool import PROFILES_BY_ID
+        assert PROFILES_BY_ID["crates_io"].probe_ok_statuses == (404,)
+
 
 # ==============================================================================
 # 4. probe_ip_endpoint_v2 经本地 mock CONNECT 代理隧道
@@ -1030,6 +1041,13 @@ class TestDohDualChannel:
              patch("cdn_optimizer.doh_resolve", return_value=["151.101.64.223"]):
             ips = _resolve_dns_candidates("pypi.org", timeout=0.2)
         assert ips == ["151.101.64.223"]
+
+    def test_udp_resolve_filters_polluted_prefixes(self):
+        """UDP 解析补充的 IP 必须过滤 GFW 污染段 (实测曾混入 162.125.x Dropbox 段返回假 200)"""
+        from cdn_optimizer import _udp_resolve_a, POLLUTED_IP_PREFIXES
+        ips = _udp_resolve_a("steamcommunity.com", timeout=1.5)
+        for ip in ips:
+            assert not ip.startswith(POLLUTED_IP_PREFIXES), f"污染段 IP 混入候选: {ip}"
 # ==============================================================================
 # 20. 统一测速参数中心 (ProbeDefaults / 档位换算)
 # ==============================================================================

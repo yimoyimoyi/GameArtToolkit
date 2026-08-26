@@ -335,7 +335,10 @@ def _udp_resolve_a(domain: str, timeout: float = 0.8) -> List[str]:
                 off += 10
                 if rtype == 1 and rdlen == 4:
                     raw_ip = socket.inet_ntoa(data[off:off + 4])
-                    if is_valid_public_cdn_ip(raw_ip):
+                    # 与 DoH 通道一致: 过滤 GFW 污染注入段 (Facebook/Twitter/Dropbox 等大厂 IP),
+                    # 防止污染 IP 混入候选池 (实测曾混入 162.125.x / 199.59.x 并返回假 200)
+                    if (is_valid_public_cdn_ip(raw_ip)
+                            and not raw_ip.startswith(POLLUTED_IP_PREFIXES)):
                         results.append(raw_ip)
                 off += rdlen
             if results:
@@ -477,7 +480,8 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          quick_retry: bool = True,
                          measure_throughput: bool = False,
                          probe_domains: Optional[List[str]] = None,
-                         ok_statuses: Optional[set] = None) -> Dict:
+                         ok_statuses: Optional[set] = None,
+                         proxy_connect_domain: bool = False) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
 
     单节点独立生命周期计时:
@@ -514,7 +518,10 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                 if proxy:
                     t0 = time.perf_counter()
                     sock = socket.create_connection(proxy, timeout=tcp_timeout)
-                    _send_connect_and_read_200(sock, ip, 443, tcp_timeout)
+                    # proxy_connect_domain: CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT
+                    # 直连规则与 CDN geo 限制中国 IP 的场景; 与 relay 转发路径 (CONNECT 域名) 一致)
+                    connect_target = domain if proxy_connect_domain else ip
+                    _send_connect_and_read_200(sock, connect_target, 443, tcp_timeout)
                     out["tcp_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
                 else:
                     t0 = time.perf_counter()
@@ -644,7 +651,8 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                             try:
                                 if proxy:
                                     extra_sock = socket.create_connection(proxy, timeout=min(extra_timeout, 1.2))
-                                    _send_connect_and_read_200(extra_sock, ip, 443, min(extra_timeout, 1.2))
+                                    extra_target = extra if proxy_connect_domain else ip
+                                    _send_connect_and_read_200(extra_sock, extra_target, 443, min(extra_timeout, 1.2))
                                 else:
                                     extra_sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET,
                                                                socket.SOCK_STREAM)
@@ -840,6 +848,8 @@ class CDNOptimizer:
         # 多域全验证与状态码放行: 由 profile 声明 (防 GFW 按子域特判封锁 / S3 403 假阳性)
         probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
         ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
+        # 代理通道 CONNECT 域名 (适配 Clash IP 段 DIRECT 规则 / CDN geo 限制)
+        proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
                 direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
@@ -847,7 +857,8 @@ class CDNOptimizer:
                                               probe_domains=probe_domains, ok_statuses=ok_statuses)
                 proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
                                                  measure_throughput=False,
-                                                 probe_domains=probe_domains, ok_statuses=ok_statuses) if proxy else None
+                                                 probe_domains=probe_domains, ok_statuses=ok_statuses,
+                                                 proxy_connect_domain=proxy_connect_domain) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -952,22 +963,25 @@ class CDNOptimizer:
             # 多域全验证与状态码放行: 由 profile 声明 (防 GFW 按子域特判封锁 / S3 403 假阳性)
             probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
             ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
+            # 代理通道 CONNECT 域名 (适配 Clash IP 段 DIRECT 规则 / CDN geo 限制)
+            proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
 
             # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout, measure_thp,
-                                   probe_domains, ok_statuses))
+                                   probe_domains, ok_statuses, proxy_connect_domain))
 
         def run_both(task):
-            srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains, ok_statuses = task
+            srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains, ok_statuses, proxy_connect_domain = task
             direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
                                           quick_retry=True, measure_throughput=measure_thp,
                                           probe_domains=probe_domains, ok_statuses=ok_statuses)
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
                                              quick_retry=False, measure_throughput=False,
-                                             probe_domains=probe_domains, ok_statuses=ok_statuses) if proxy else None
+                                             probe_domains=probe_domains, ok_statuses=ok_statuses,
+                                             proxy_connect_domain=proxy_connect_domain) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -1317,10 +1331,12 @@ class CDNHealthMonitor:
         measure_thp = bool(getattr(profile, "measure_throughput", False))
         probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
         ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
+        proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
         probe_res = probe_ip_endpoint_v2(best_item["ip"], domain=domain,
                                          timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode,
                                          measure_throughput=measure_thp,
-                                         probe_domains=probe_domains, ok_statuses=ok_statuses)
+                                         probe_domains=probe_domains, ok_statuses=ok_statuses,
+                                         proxy_connect_domain=proxy_connect_domain)
 
         if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
                 and not _suspect_status(probe_res.get("http_status"))

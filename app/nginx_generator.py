@@ -71,7 +71,14 @@ class NginxConfGenerator:
         else:
             sni_str = f'"{profile.ssl_sni_mode}"'
 
-        host_header = profile.custom_headers.get("Host", "$host")
+        if profile.id == "steam_community":
+            # Host 分流: api.steampowered.com 必须保持原 Host 才能命中 API 网关 vhost
+            # (Host 被改写为 steamcommunity.com 时 API 路径会被上游 302 重定向到社区首页),
+            # 其余域名 (steamcommunity.com 及子域) 归一化到主域防 118
+            # 对应文件顶部 map $host $steam_upstream_host
+            host_header = "$steam_upstream_host"
+        else:
+            host_header = profile.custom_headers.get("Host", "$host")
 
         # ----------------------------------------------------------------------
         # 1. Pixiv 主站特殊处理 (包含 /ajax/ CORS 与 /ws/ WebSocket)
@@ -342,6 +349,16 @@ server {{
             "# GameArt Toolkit - 游戏生态全平台加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
+        # Steam 社区 Host 分流 map: api.steampowered.com 保持原 Host 路由 API 网关,
+        # 其余域名 (steamcommunity.com 及子域) 归一化到主域防 118 (由 steam_community 渲染引用)
+        if any(p.id == "steam_community" for p in gaming_profiles):
+            gaming_blocks.append(
+                "map $host $steam_upstream_host {\n"
+                "    hostnames;\n"
+                "    api.steampowered.com api.steampowered.com;\n"
+                "    default steamcommunity.com;\n"
+                "}\n"
+            )
         for p in gaming_profiles:
             gaming_blocks.append(cls.render_server_block(p))
         gaming_content = "\n".join(gaming_blocks)

@@ -62,9 +62,10 @@ DEFAULT_CONFIG = {
 }
 
 # 旧版粗粒度服务 ID 到细粒度 ID 的映射转换字典 (自动兼容历史配置)
+# 注: ea_app / danbooru 已从服务列表移除 (明确封锁), 不再出现在映射中
 _LEGACY_SERVICE_MAPPING = {
-    "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "danbooru", "vndb"],
-    "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft", "ea_app"],
+    "pixiv": ["pixiv_web", "pixiv_img", "pixiv_fanbox", "booth_pm", "vndb"],
+    "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft"],
     "github": ["github_web", "github_raw", "github_release", "github_assets", "github_s3", "gitlab"],
     "huggingface": ["huggingface"],
 }

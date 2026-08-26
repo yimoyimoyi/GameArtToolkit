@@ -26,10 +26,10 @@ os.environ["PYTHONUTF8"] = "1"
 os.environ.setdefault("LANG", "zh_CN.UTF-8")
 os.environ.setdefault("LC_ALL", "zh_CN.UTF-8")
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QPoint, QSize, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QPoint, QSize, QRectF, QPointF, QUrl
 from PySide6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QFont, QAction, QMouseEvent,
-    QLinearGradient, QPen, QBrush, QPainterPath
+    QLinearGradient, QPen, QBrush, QPainterPath, QDesktopServices, QDragEnterEvent, QDropEvent
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -54,9 +54,13 @@ from win_utils import (
     is_process_running, is_port_in_use, is_admin, elevate_relaunch,
     is_autostart_enabled, set_autostart, register_shutdown_handler,
     fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window,
-    is_windows_dark_mode
+    is_windows_dark_mode, get_port_process_info, get_critical_ports_status, kill_process_by_pid_safe
 )
 from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT, CANDIDATE_IPS
+from service_profile import NAVIGATOR_SERVICES
+from reverse_search import (
+    SEARCH_ENGINES, ImageSearchWorker, get_image_from_clipboard, save_image_to_temp
+)
 from frameless_helper import NativeFramelessHelper
 from md_widgets import (
     MDSwitch, TrafficMonitorChart, LatencyBadge, TitleBar,
@@ -389,7 +393,239 @@ class SteamAccountCard(QFrame):
     def _on_alias_changed(self, new_alias: str):
         steam_mgr.set_account_alias(self.steamid, new_alias)
         show_toast(self.parent_window, f"账号备注已更新为: {new_alias or '未设置'}", toast_type="success", duration=2000)
-        self.parent_window.refresh_tray_steam_menu()
+
+
+class DropImageWidget(QFrame):
+    """支持拖拽图片、粘贴与点击选择的轻量图片放置与预览区域"""
+    image_selected = Signal(str)
+
+    def __init__(self, parent_window=None):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.setAcceptDrops(True)
+        self.current_image_path: Optional[str] = None
+        self.setProperty("class", "DropZoneCard")
+        self.setMinimumHeight(120)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("拖拽图片到此区域，或点击从剪贴板粘贴 / 选择文件")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setAlignment(Qt.AlignCenter)
+        self.lbl_icon.setFixedSize(36, 36)
+
+        self.lbl_text = QLabel("拖拽图片到此区域，或点击粘贴剪贴板 / 选择文件")
+        self.lbl_text.setProperty("class", "ItemTitle")
+        self.lbl_text.setAlignment(Qt.AlignCenter)
+
+        self.lbl_subtext = QLabel("支持 JPG, PNG, WEBP, GIF, BMP (毫秒级拉起，零性能常驻)")
+        self.lbl_subtext.setProperty("class", "ItemDesc")
+        self.lbl_subtext.setAlignment(Qt.AlignCenter)
+
+        layout.addWidget(self.lbl_icon, 0, Qt.AlignCenter)
+        layout.addWidget(self.lbl_text)
+        layout.addWidget(self.lbl_subtext)
+
+        self.refresh_icon()
+
+    def refresh_icon(self):
+        tm = ThemeManager.get_instance()
+        color = tm.get_palette().get("primary", "#7EB9F5")
+        if SvgIconFactory and not self.current_image_path:
+            self.lbl_icon.setPixmap(SvgIconFactory.get_pixmap("image", color, 28))
+
+    def set_image(self, path: str):
+        if not path or not os.path.exists(path):
+            return
+        self.current_image_path = path
+        filename = os.path.basename(path)
+        file_size_kb = os.path.getsize(path) / 1024
+        self.lbl_text.setText(f"已选定图片: {filename} ({file_size_kb:.1f} KB)")
+        self.lbl_subtext.setText("点击右侧【立即以图搜图】即可在默认浏览器打开解析结果")
+        pix = QPixmap(path)
+        if not pix.isNull():
+            scaled_pix = pix.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_icon.setPixmap(scaled_pix)
+        self.image_selected.emit(path)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]:
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                ext = Path(file_path).suffix.lower()
+                if ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]:
+                    self.set_image(file_path)
+                    event.acceptProposedAction()
+                    return
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            img = get_image_from_clipboard()
+            if img:
+                tmp_p = save_image_to_temp(img)
+                self.set_image(tmp_p)
+                if self.parent_window:
+                    show_toast(self.parent_window, "已自动从剪贴板读取并加载图片！", toast_type="success", duration=2000)
+                return
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择要检索的图片", "",
+                "图片文件 (*.jpg *.jpeg *.png *.webp *.bmp *.gif);;所有文件 (*.*)"
+            )
+            if path:
+                self.set_image(path)
+
+
+class NavigatorCard(QFrame):
+    """加速对象官方主站直达卡片"""
+    def __init__(self, data: dict, parent_window: 'MainWindow'):
+        super().__init__(parent_window)
+        self.data = data
+        self.parent_window = parent_window
+        self.url = data.get("url", "")
+        self.setProperty("class", "ServiceCard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"双击或点击右侧按钮直接在浏览器中打开 {data.get('name', '')}")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        # 1. 矢量图标
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setFixedSize(36, 36)
+        self.lbl_icon.setAlignment(Qt.AlignCenter)
+        self.lbl_icon.setProperty("class", "ServiceIconBox")
+        icon_name = data.get("icon", "globe")
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
+        primary_c = palette.get("primary", "#7EB9F5")
+        if SvgIconFactory:
+            self.lbl_icon.setPixmap(SvgIconFactory.get_pixmap(icon_name, primary_c, 20))
+        layout.addWidget(self.lbl_icon)
+
+        # 2. 中间信息区
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+
+        row_title = QHBoxLayout()
+        row_title.setSpacing(8)
+        lbl_name = QLabel(data.get("name", ""))
+        lbl_name.setProperty("class", "ItemTitle")
+        lbl_name.setWordWrap(True)
+        row_title.addWidget(lbl_name)
+
+        lbl_domain = QLabel(data.get("domain", ""))
+        lbl_domain.setProperty("class", "LatencyBadgeIdle")
+        row_title.addWidget(lbl_domain)
+        row_title.addStretch()
+        text_box.addLayout(row_title)
+
+        lbl_desc = QLabel(data.get("desc", ""))
+        lbl_desc.setProperty("class", "ItemDesc")
+        lbl_desc.setWordWrap(True)
+        text_box.addWidget(lbl_desc)
+
+        layout.addLayout(text_box, stretch=1)
+
+        # 3. 右侧直达按钮
+        btn_open = QPushButton("访问官网")
+        btn_open.setProperty("class", "MDBtnTonal")
+        if SvgIconFactory:
+            btn_open.setIcon(SvgIconFactory.get_icon("external_link", primary_c, 14))
+            btn_open.setIconSize(QSize(14, 14))
+        btn_open.clicked.connect(self.open_url)
+        layout.addWidget(btn_open)
+
+    def open_url(self):
+        if self.url:
+            QDesktopServices.openUrl(QUrl(self.url))
+            if self.parent_window:
+                show_toast(self.parent_window, f"已在浏览器中打开: {self.data.get('name', '')}", toast_type="info", duration=2000)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self.open_url()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+
+class ToolHubCard(QFrame):
+    """工具箱功能入口大卡片"""
+    clicked = Signal()
+
+    def __init__(self, title: str, tag: str, desc: str, icon_name: str, parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "MDCard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"点击进入 {title}")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(18)
+
+        # 1. 矢量图标容器 (46x46 圆角微底色盒子)
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setFixedSize(46, 46)
+        self.lbl_icon.setAlignment(Qt.AlignCenter)
+        self.lbl_icon.setProperty("class", "ServiceIconBox")
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
+        primary_c = palette.get("primary", "#7EB9F5")
+        if SvgIconFactory:
+            self.lbl_icon.setPixmap(SvgIconFactory.get_pixmap(icon_name, primary_c, 24))
+        layout.addWidget(self.lbl_icon)
+
+        # 2. 中间说明文案
+        text_box = QVBoxLayout()
+        text_box.setSpacing(4)
+
+        row_title = QHBoxLayout()
+        row_title.setSpacing(10)
+        lbl_t = QLabel(title)
+        lbl_t.setProperty("class", "SectionHeaderTitle")
+        lbl_t.setStyleSheet("font-size: 15px; font-weight: bold;")
+        row_title.addWidget(lbl_t)
+
+        lbl_tag = QLabel(f" {tag} ")
+        lbl_tag.setProperty("class", "LatencyBadgeIdle")
+        row_title.addWidget(lbl_tag)
+        row_title.addStretch()
+        text_box.addLayout(row_title)
+
+        lbl_d = QLabel(desc)
+        lbl_d.setProperty("class", "ItemDesc")
+        lbl_d.setWordWrap(True)
+        text_box.addWidget(lbl_d)
+
+        layout.addLayout(text_box, stretch=1)
+
+        # 3. 右侧进入按钮
+        btn_enter = QPushButton("进入工具 →")
+        btn_enter.setProperty("class", "MDBtnPrimary")
+        btn_enter.clicked.connect(self.clicked.emit)
+        layout.addWidget(btn_enter)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -443,6 +679,23 @@ class MainWindow(QMainWindow):
         self.cdn_status_banner: Optional[QFrame] = None
         self.lbl_cdn_status_summary: Optional[QLabel] = None
         self.lbl_cdn_last_time: Optional[QLabel] = None
+
+        # 实用工具箱主栈
+        self.toolbox_stack: Optional[AnimatedStackedWidget] = None
+
+        # 以图搜图与快捷导航引用
+        self.search_worker: Optional[ImageSearchWorker] = None
+        self.drop_image_widget: Optional[DropImageWidget] = None
+        self.cmb_search_engine: Optional[NoWheelComboBox] = None
+        self.nav_card_widgets: List[Tuple[QFrame, Dict[str, Any]]] = []
+        self.nav_group_cards: Dict[str, QFrame] = {}
+
+        # 端口操作引用
+        self.critical_port_labels: Dict[int, QLabel] = {}
+        self.critical_port_btn_release: Dict[int, QPushButton] = {}
+        self.port_results_layout: Optional[QVBoxLayout] = None
+        self.txt_custom_port: Optional[QLineEdit] = None
+        self.lbl_custom_port_summary: Optional[QLabel] = None
 
         # 1. 注册 Win32 原生无边框辅助器
         self.frameless_helper = NativeFramelessHelper(self)
@@ -625,6 +878,9 @@ class MainWindow(QMainWindow):
             for sid, btn in getattr(self, "cdn_single_buttons", {}).items():
                 btn.setIcon(SvgIconFactory.get_icon("zap", primary_icon_color, 12))
 
+            if getattr(self, "drop_image_widget", None):
+                self.drop_image_widget.refresh_icon()
+
         
     def refresh_inline_styles(self):
         # 让下次 probe 自动使用新颜色
@@ -727,11 +983,13 @@ class MainWindow(QMainWindow):
         self.nav_group.setExclusive(True)
 
         self.btn_nav_dashboard = self.create_nav_btn("加速控制台", 0, "rocket")
-        self.btn_nav_steam = self.create_nav_btn("Steam 账号管家", 1, "gamepad")
-        self.btn_nav_cdn = self.create_nav_btn("CDN 测速", 2, "zap")
-        self.btn_nav_settings = self.create_nav_btn("系统诊断与设置", 3, "settings")
+        self.btn_nav_toolbox = self.create_nav_btn("实用工具箱", 1, "grid")
+        self.btn_nav_steam = self.create_nav_btn("Steam 账号管家", 2, "gamepad")
+        self.btn_nav_cdn = self.create_nav_btn("CDN 测速", 3, "zap")
+        self.btn_nav_settings = self.create_nav_btn("系统诊断与设置", 4, "settings")
 
         sidebar_layout.addWidget(self.btn_nav_dashboard)
+        sidebar_layout.addWidget(self.btn_nav_toolbox)
         sidebar_layout.addWidget(self.btn_nav_steam)
         sidebar_layout.addWidget(self.btn_nav_cdn)
         sidebar_layout.addWidget(self.btn_nav_settings)
@@ -756,11 +1014,13 @@ class MainWindow(QMainWindow):
 
         self.stack = AnimatedStackedWidget()
         self.page_dashboard = self.create_dashboard_page()
+        self.page_toolbox = self.create_toolbox_page()
         self.page_steam = self.create_steam_page()
         self.page_cdn = self.create_cdn_page()
         self.page_settings = self.create_settings_page()
 
         self.stack.addWidget(self.page_dashboard)
+        self.stack.addWidget(self.page_toolbox)
         self.stack.addWidget(self.page_steam)
         self.stack.addWidget(self.page_cdn)
         self.stack.addWidget(self.page_settings)
@@ -787,8 +1047,10 @@ class MainWindow(QMainWindow):
 
     def on_nav_clicked(self, index: int):
         self.stack.setCurrentIndex(index)
-        if index == 1:
+        if index == 2:
             self.load_steam_accounts_ui()
+        elif index == 4:
+            self.refresh_ports_diagnostics_ui()
 
     # ------------------ PAGE 1: 加速控制台 ------------------
     def create_dashboard_page(self) -> QWidget:
@@ -1193,10 +1455,10 @@ class MainWindow(QMainWindow):
         # 别名映射辅助快速检索 (如 'gh' 匹配 github, 'px' 匹配 pixiv)
         alias_map = {
             "gh": ["github"], "px": ["pixiv"], "st": ["steam"], "hf": ["huggingface"],
-            "db": ["danbooru"], "gl": ["gitlab"], "fb": ["fanbox"], "bt": ["booth"],
-            "vn": ["vndb"], "ubi": ["ubisoft"], "origin": ["ea_app"],
-            "ea": ["ea_app"], "art": ["pixiv", "fanbox", "booth", "danbooru"],
-            "game": ["steam", "ea_app", "ubisoft"], "dev": ["github", "gitlab", "huggingface"]
+            "gl": ["gitlab"], "fb": ["fanbox"], "bt": ["booth"],
+            "vn": ["vndb"], "ubi": ["ubisoft"],
+            "art": ["pixiv", "fanbox", "booth"],
+            "game": ["steam", "ubisoft"], "dev": ["github", "gitlab", "huggingface"]
         }
         expanded_keywords = [kw]
         if kw in alias_map:
@@ -1282,7 +1544,597 @@ class MainWindow(QMainWindow):
             elif h_ok:
                 show_toast(self, f"已开启 [{srv_name}] 加速并注入 Hosts 规则", toast_type="success", duration=1800)
 
-    # ------------------ PAGE 2: Steam 账号管家 ------------------
+    # ------------------ PAGE 2: 实用工具箱 (Toolbox Hub & Sub-pages) ------------------
+    def create_toolbox_page(self) -> QWidget:
+        self.toolbox_stack = AnimatedStackedWidget()
+
+        # Index 0: 工具箱大厅 (Hub)
+        self.toolbox_hub_view = self._build_toolbox_hub_view()
+        # Index 1: 以图搜图工作台 (Search)
+        self.toolbox_search_view = self._build_toolbox_search_view()
+        # Index 2: 端口管理与释放 (Ports)
+        self.toolbox_ports_view = self._build_toolbox_ports_view()
+        # Index 3: 加速生态主站导航 (Navigator)
+        self.toolbox_nav_view = self._build_toolbox_nav_view()
+
+        self.toolbox_stack.addWidget(self.toolbox_hub_view)
+        self.toolbox_stack.addWidget(self.toolbox_search_view)
+        self.toolbox_stack.addWidget(self.toolbox_ports_view)
+        self.toolbox_stack.addWidget(self.toolbox_nav_view)
+
+        return self.toolbox_stack
+
+    def _build_toolbox_hub_view(self) -> QWidget:
+        """工具箱大厅：展示三大功能卡片入口"""
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        # 页面标题
+        header_box = QVBoxLayout()
+        header_box.setSpacing(4)
+        title = QLabel("实用工具箱")
+        title.setObjectName("PageTitle")
+        desc = QLabel("聚合以图搜图、端口管理与加速生态快捷导航，即点即用，极低资源占用")
+        desc.setObjectName("PageDesc")
+        header_box.addWidget(title)
+        header_box.addWidget(desc)
+        layout.addLayout(header_box)
+
+        # 1. 以图搜图卡片
+        card_search = ToolHubCard(
+            title="以图搜图工作台 (Reverse Image Search)",
+            tag="二次元 / 画师检索",
+            desc="支持系统剪贴板图片快速抓取与本地文件拖拽，内置 SauceNAO、Ascii2d、Google Lens、IQDB 多引擎，秒级定位 Pixiv PID、推特画师与高清原图。",
+            icon_name="image",
+            parent=self
+        )
+        card_search.clicked.connect(lambda: self.toolbox_stack.setCurrentIndex(1))
+        layout.addWidget(card_search)
+
+        # 2. 端口管理与释放卡片
+        card_ports = ToolHubCard(
+            title="端口占用诊断与进程释放 (Port Manager)",
+            tag="系统排障 / 冲突自愈",
+            desc="支持任意端口 (1-65535) 精准搜索与连接进程强杀，提供 80 / 443 / 53 加速核心端口状态一键体检与冲突释放。",
+            icon_name="network",
+            parent=self
+        )
+        card_ports.clicked.connect(self._enter_toolbox_ports_action)
+        layout.addWidget(card_ports)
+
+        # 3. 生态主站快捷导航卡片
+        card_nav = ToolHubCard(
+            title="加速生态官方主站直达 (Service Navigator)",
+            tag="官方入口 / 极速直达",
+            desc="聚合 Pixiv、FANBOX、BOOTH、Steam 商店/社区、育碧、战网、GOG、GitHub、HuggingFace 等官方入口，支持关键词实时筛选与一键打开。",
+            icon_name="compass",
+            parent=self
+        )
+        card_nav.clicked.connect(lambda: self.toolbox_stack.setCurrentIndex(3))
+        layout.addWidget(card_nav)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _enter_toolbox_ports_action(self):
+        self.toolbox_stack.setCurrentIndex(2)
+        self.refresh_ports_diagnostics_ui()
+
+    def _create_toolbox_subpage_header(self, title_text: str, back_target_idx: int = 0) -> QHBoxLayout:
+        """生成统一规范的子页面返回导航头"""
+        h_layout = QHBoxLayout()
+        h_layout.setSpacing(12)
+
+        btn_back = QPushButton(" 返回工具箱")
+        btn_back.setProperty("class", "MDBtnTonal")
+        tm = ThemeManager.get_instance()
+        primary_c = tm.get_palette().get("primary", "#7EB9F5")
+        if SvgIconFactory:
+            btn_back.setIcon(SvgIconFactory.get_icon("arrow_left", primary_c, 14))
+            btn_back.setIconSize(QSize(14, 14))
+        btn_back.clicked.connect(lambda: self.toolbox_stack.setCurrentIndex(back_target_idx))
+        h_layout.addWidget(btn_back)
+
+        lbl_sub_title = QLabel(title_text)
+        lbl_sub_title.setObjectName("PageTitle")
+        lbl_sub_title.setStyleSheet("font-size: 18px;")
+        h_layout.addWidget(lbl_sub_title)
+        h_layout.addStretch()
+        return h_layout
+
+    def _build_toolbox_search_view(self) -> QWidget:
+        """子页面 1: 以图搜图工作台"""
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        # 返回头
+        layout.addLayout(self._create_toolbox_subpage_header("以图搜图工作台 (Reverse Image Search)"))
+
+        is_dark = ThemeManager.get_instance().is_dark
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
+
+        search_box_card = QFrame()
+        search_box_card.setProperty("class", "MDCard")
+        s_layout = QVBoxLayout(search_box_card)
+        s_layout.setContentsMargins(20, 16, 20, 16)
+        s_layout.setSpacing(14)
+
+        # 图片拖拽与选择区域
+        self.drop_image_widget = DropImageWidget(self)
+        self.drop_image_widget.image_selected.connect(self._on_image_selected_for_search)
+        s_layout.addWidget(self.drop_image_widget)
+
+        # 搜图引擎选择与控制栏
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+
+        lbl_engine = QLabel("搜图引擎:")
+        lbl_engine.setProperty("class", "ItemTitle")
+        ctrl_row.addWidget(lbl_engine)
+
+        self.cmb_search_engine = NoWheelComboBox()
+        for eid, edata in SEARCH_ENGINES.items():
+            self.cmb_search_engine.addItem(edata["name"], eid)
+        ctrl_row.addWidget(self.cmb_search_engine)
+
+        btn_paste = QPushButton("粘贴剪贴板图片")
+        btn_paste.setProperty("class", "MDBtnTonal")
+        if SvgIconFactory:
+            btn_paste.setIcon(SvgIconFactory.get_icon("copy", primary_c, 14))
+            btn_paste.setIconSize(QSize(14, 14))
+        btn_paste.clicked.connect(self._paste_image_from_clipboard_action)
+        ctrl_row.addWidget(btn_paste)
+
+        btn_browse = QPushButton("选择本地图片")
+        btn_browse.setProperty("class", "MDBtnTonal")
+        if SvgIconFactory:
+            btn_browse.setIcon(SvgIconFactory.get_icon("upload", primary_c, 14))
+            btn_browse.setIconSize(QSize(14, 14))
+        btn_browse.clicked.connect(self._browse_image_file_action)
+        ctrl_row.addWidget(btn_browse)
+
+        ctrl_row.addStretch()
+
+        self.btn_do_search = QPushButton("立即以图搜图")
+        self.btn_do_search.setProperty("class", "MDBtnPrimary")
+        if SvgIconFactory:
+            self.btn_do_search.setIcon(SvgIconFactory.get_icon("search", "#FFFFFF", 14))
+            self.btn_do_search.setIconSize(QSize(14, 14))
+        self.btn_do_search.clicked.connect(self.start_reverse_image_search)
+        ctrl_row.addWidget(self.btn_do_search)
+
+        s_layout.addLayout(ctrl_row)
+        layout.addWidget(search_box_card)
+
+        # 使用指南与说明卡片
+        tip_card = QFrame()
+        tip_card.setProperty("class", "MDCard")
+        t_layout = QVBoxLayout(tip_card)
+        t_layout.setContentsMargins(20, 16, 20, 16)
+        t_layout.setSpacing(6)
+
+        lbl_t_title = QLabel("使用提示与搜图引擎推荐")
+        lbl_t_title.setProperty("class", "ItemTitle")
+        t_layout.addWidget(lbl_t_title)
+
+        tips = [
+            "• SauceNAO：二次元插画主力，识别率极高，可直接精准定位 Pixiv PID、画师 UID 与 Fanbox 出处。",
+            "• Ascii2d：推特插画神器，特别适合查找 Twitter 同人画师发布的作品推文与原图。",
+            "• IQDB：二次元动漫壁纸检索站，适合检索动漫截图与各大图库收录图。",
+            "• Google Lens：通用智能识图，适合全网广域搜索与物品/人物识别。"
+        ]
+        for tip in tips:
+            lbl_tip = QLabel(tip)
+            lbl_tip.setProperty("class", "ItemDesc")
+            lbl_tip.setWordWrap(True)
+            t_layout.addWidget(lbl_tip)
+
+        layout.addWidget(tip_card)
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _build_toolbox_ports_view(self) -> QWidget:
+        """子页面 2: 端口管理与进程释放"""
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        # 返回头
+        layout.addLayout(self._create_toolbox_subpage_header("端口占用诊断与进程释放 (Port Manager)"))
+
+        is_dark = ThemeManager.get_instance().is_dark
+        primary_c = "#7EB9F5" if is_dark else "#0284C7"
+
+        # 核心端口卡片
+        crit_card = QFrame()
+        crit_card.setProperty("class", "MDCard")
+        c_layout = QVBoxLayout(crit_card)
+        c_layout.setContentsMargins(20, 16, 20, 16)
+        c_layout.setSpacing(12)
+
+        c_header = QHBoxLayout()
+        lbl_c_title = QLabel("加速核心端口状态 (80 / 443 / 53)")
+        lbl_c_title.setProperty("class", "SectionHeaderTitle")
+        c_header.addWidget(lbl_c_title)
+        c_header.addStretch()
+
+        btn_refresh_ports = QPushButton("重新体检")
+        btn_refresh_ports.setProperty("class", "MDBtnTonal")
+        btn_refresh_ports.clicked.connect(self.refresh_ports_diagnostics_ui)
+        c_header.addWidget(btn_refresh_ports)
+        c_layout.addLayout(c_header)
+
+        crit_box = QVBoxLayout()
+        crit_box.setSpacing(8)
+
+        for port, port_name in [(80, "80 (HTTP / 本地反代)"), (443, "443 (HTTPS / 本地反代)"), (53, "53 (DNS / 本地分流)")]:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            lbl_name = QLabel(port_name)
+            lbl_name.setProperty("class", "ItemDesc")
+            lbl_name.setFixedWidth(180)
+            row.addWidget(lbl_name)
+
+            lbl_status = QLabel("检测中...")
+            lbl_status.setProperty("class", "ItemDesc")
+            row.addWidget(lbl_status, stretch=1)
+            self.critical_port_labels[port] = lbl_status
+
+            btn_rel = QPushButton("释放端口")
+            btn_rel.setProperty("class", "MDBtnDanger")
+            btn_rel.setVisible(False)
+            btn_rel.clicked.connect(lambda p=port: self.release_critical_port_action(p))
+            row.addWidget(btn_rel)
+            self.critical_port_btn_release[port] = btn_rel
+
+            crit_box.addLayout(row)
+
+        c_layout.addLayout(crit_box)
+        layout.addWidget(crit_card)
+
+        # 指定端口搜索与精准释放卡片
+        search_port_card = QFrame()
+        search_port_card.setProperty("class", "MDCard")
+        sp_layout = QVBoxLayout(search_port_card)
+        sp_layout.setContentsMargins(20, 16, 20, 16)
+        sp_layout.setSpacing(12)
+
+        lbl_sp_title = QLabel("指定端口精准查询与释放")
+        lbl_sp_title.setProperty("class", "SectionHeaderTitle")
+        sp_layout.addWidget(lbl_sp_title)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(10)
+
+        self.txt_custom_port = QLineEdit()
+        self.txt_custom_port.setPlaceholderText("输入要查询的端口号 (1-65535，如 8080, 7890, 3000)...")
+        self.txt_custom_port.setProperty("class", "SearchInput")
+        self.txt_custom_port.returnPressed.connect(self.search_custom_port_action)
+        search_row.addWidget(self.txt_custom_port, stretch=1)
+
+        btn_search_p = QPushButton("查询占用")
+        btn_search_p.setProperty("class", "MDBtnPrimary")
+        if SvgIconFactory:
+            btn_search_p.setIcon(SvgIconFactory.get_icon("search", "#FFFFFF", 14))
+            btn_search_p.setIconSize(QSize(14, 14))
+        btn_search_p.clicked.connect(self.search_custom_port_action)
+        search_row.addWidget(btn_search_p)
+        sp_layout.addLayout(search_row)
+
+        # 搜索结果容器
+        self.port_results_layout = QVBoxLayout()
+        self.port_results_layout.setSpacing(6)
+        self.lbl_custom_port_summary = QLabel("输入任意端口号并点击【查询占用】，可毫秒级查看占用该端口的 PID 与程序路径。")
+        self.lbl_custom_port_summary.setProperty("class", "ItemDesc")
+        self.port_results_layout.addWidget(self.lbl_custom_port_summary)
+        sp_layout.addLayout(self.port_results_layout)
+
+        layout.addWidget(search_port_card)
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def refresh_ports_diagnostics_ui(self):
+        """刷新核心端口占用诊断状态"""
+        statuses = get_critical_ports_status([80, 443, 53])
+        for item in statuses:
+            port = item["port"]
+            lbl = self.critical_port_labels.get(port)
+            btn = self.critical_port_btn_release.get(port)
+            if not lbl:
+                continue
+
+            procs = item.get("processes", [])
+            if not item["in_use"] or not procs:
+                lbl.setText("● 空闲可用 (无冲突)")
+                lbl.setStyleSheet("color: #10B981; font-weight: 500;")
+                if btn:
+                    btn.setVisible(False)
+            else:
+                p_names = ", ".join([f"{p.get('name', '未知')} (PID: {p.get('pid', '')})" for p in procs])
+                my_nginx_pid = nginx_mgr.get_pid()
+                is_my_nginx = any(p.get("pid") == my_nginx_pid for p in procs) if my_nginx_pid > 0 else False
+                if is_my_nginx:
+                    lbl.setText(f"● 正常监听 (GameArt Toolkit 本地 Nginx, PID: {my_nginx_pid})")
+                    lbl.setStyleSheet("color: #38BDF8; font-weight: 500;")
+                    if btn:
+                        btn.setVisible(False)
+                else:
+                    lbl.setText(f"▲ 被占用: {p_names}")
+                    lbl.setStyleSheet("color: #EF4444; font-weight: bold;")
+                    if btn:
+                        btn.setVisible(True)
+
+    def release_critical_port_action(self, port: int):
+        """释放加速核心端口"""
+        procs = get_port_process_info(port)
+        if not procs:
+            show_toast(self, f"端口 {port} 当前未被占用", toast_type="info", duration=2000)
+            self.refresh_ports_diagnostics_ui()
+            return
+
+        success_count = 0
+        for p in procs:
+            pid = p.get("pid", 0)
+            if pid > 0:
+                ok, msg = kill_process_by_pid_safe(pid)
+                if ok:
+                    success_count += 1
+
+        if success_count > 0:
+            show_toast(self, f"已成功结束占用 {port} 端口的冲突进程！", toast_type="success", duration=2500)
+        else:
+            show_toast(self, f"结束进程失败，可能需要管理员权限或为系统受保护进程", toast_type="error", duration=3000)
+        self.refresh_ports_diagnostics_ui()
+
+    def search_custom_port_action(self):
+        """查询指定端口号的占用情况并展示"""
+        if not self.txt_custom_port:
+            return
+        text = self.txt_custom_port.text().strip()
+        if not text or not text.isdigit():
+            show_toast(self, "请输入合法的端口号数字 (1-65535)", toast_type="warning", duration=2500)
+            return
+
+        port = int(text)
+        if port < 1 or port > 65535:
+            show_toast(self, "端口号超出范围 (1-65535)", toast_type="warning", duration=2500)
+            return
+
+        # 清除旧结果控件
+        if self.port_results_layout:
+            while self.port_results_layout.count() > 0:
+                child = self.port_results_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+        procs = get_port_process_info(port)
+        if not procs:
+            lbl_res = QLabel(f"✓ 端口 {port} 当前处于空闲状态，未被任何进程占用。")
+            lbl_res.setStyleSheet("color: #10B981; font-weight: 500; padding: 6px 0;")
+            self.port_results_layout.addWidget(lbl_res)
+            show_toast(self, f"端口 {port} 空闲可用", toast_type="success", duration=2000)
+            return
+
+        lbl_header = QLabel(f"发现 {len(procs)} 个连接/进程占用端口 {port}:")
+        lbl_header.setProperty("class", "ItemTitle")
+        self.port_results_layout.addWidget(lbl_header)
+
+        for p in procs:
+            card = QFrame()
+            card.setProperty("class", "ServiceCard")
+            c_layout = QHBoxLayout(card)
+            c_layout.setContentsMargins(12, 8, 12, 8)
+            c_layout.setSpacing(10)
+
+            info_box = QVBoxLayout()
+            info_box.setSpacing(2)
+            lbl_p_name = QLabel(f"进程: {p.get('name', '未知')}  (PID: {p.get('pid', '')})  |  协议: {p.get('proto', 'TCP')}  状态: {p.get('status', 'LISTEN')}")
+            lbl_p_name.setProperty("class", "ItemTitle")
+            lbl_p_name.setWordWrap(True)
+            info_box.addWidget(lbl_p_name)
+
+            exe_path = p.get("exe", "")
+            lbl_p_exe = QLabel(f"程序路径: {exe_path if exe_path else '系统受保护或无权限读取'}")
+            lbl_p_exe.setProperty("class", "ItemDesc")
+            lbl_p_exe.setWordWrap(True)
+            info_box.addWidget(lbl_p_exe)
+
+            c_layout.addLayout(info_box, stretch=1)
+
+            btn_kill = QPushButton("结束进程")
+            btn_kill.setProperty("class", "MDBtnDanger")
+            pid = p.get("pid", 0)
+            btn_kill.clicked.connect(lambda pid=pid, port=port: self.release_port_pid_action(pid, port))
+            c_layout.addWidget(btn_kill)
+
+            self.port_results_layout.addWidget(card)
+
+    def release_port_pid_action(self, pid: int, port: int):
+        """精准结束指定 PID 进程"""
+        ok, msg = kill_process_by_pid_safe(pid)
+        if ok:
+            show_toast(self, f"已成功结束进程 (PID: {pid})！", toast_type="success", duration=2500)
+        else:
+            show_toast(self, msg, toast_type="error", duration=3000)
+        self.search_custom_port_action()
+        self.refresh_ports_diagnostics_ui()
+
+    def _build_toolbox_nav_view(self) -> QWidget:
+        """子页面 3: 加速生态官方主站导航"""
+        scroll = QScrollArea()
+        scroll.setObjectName("MainScrollArea")
+        scroll.setWidgetResizable(True)
+
+        content = QWidget()
+        content.setObjectName("ScrollContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 20, 20)
+        layout.setSpacing(18)
+
+        # 顶部返回与搜索栏
+        nav_header_row = QHBoxLayout()
+        btn_back = QPushButton(" 返回工具箱")
+        btn_back.setProperty("class", "MDBtnTonal")
+        tm = ThemeManager.get_instance()
+        primary_c = tm.get_palette().get("primary", "#7EB9F5")
+        if SvgIconFactory:
+            btn_back.setIcon(SvgIconFactory.get_icon("arrow_left", primary_c, 14))
+            btn_back.setIconSize(QSize(14, 14))
+        btn_back.clicked.connect(lambda: self.toolbox_stack.setCurrentIndex(0))
+        nav_header_row.addWidget(btn_back)
+
+        lbl_nav_sec = QLabel("官方主站直达")
+        lbl_nav_sec.setObjectName("PageTitle")
+        lbl_nav_sec.setStyleSheet("font-size: 18px;")
+        nav_header_row.addWidget(lbl_nav_sec)
+        nav_header_row.addStretch()
+
+        self.txt_nav_search = QLineEdit()
+        self.txt_nav_search.setPlaceholderText("搜索生态主站 (名称/域名/关键词)...")
+        self.txt_nav_search.setFixedWidth(260)
+        self.txt_nav_search.setProperty("class", "SearchInput")
+        self.txt_nav_search.textChanged.connect(self._filter_navigator_cards)
+        nav_header_row.addWidget(self.txt_nav_search)
+        layout.addLayout(nav_header_row)
+
+        self.nav_card_widgets.clear()
+        self.nav_group_cards.clear()
+
+        # 分组渲染
+        for group_id, group_info in SERVICE_GROUPS.items():
+            g_items = [s for s in NAVIGATOR_SERVICES if s.get("group") == group_id]
+            if not g_items:
+                continue
+
+            grp_card = QFrame()
+            grp_card.setProperty("class", "MDCard")
+            g_card_layout = QVBoxLayout(grp_card)
+            g_card_layout.setContentsMargins(18, 14, 18, 14)
+            g_card_layout.setSpacing(10)
+
+            # 分组标题
+            gh_row = QHBoxLayout()
+            gh_icon = QLabel()
+            gh_icon.setPixmap(SvgIconFactory.get_pixmap(group_info.get("icon", "zap"), primary_c, 18))
+            lbl_gh_title = QLabel(f"{group_info.get('name', '')} ({len(g_items)})")
+            lbl_gh_title.setProperty("class", "GroupTitle")
+            gh_row.addWidget(gh_icon)
+            gh_row.addWidget(lbl_gh_title)
+            gh_row.addStretch()
+            g_card_layout.addLayout(gh_row)
+
+            # 该分组下的服务卡片列表
+            cards_grid = QVBoxLayout()
+            cards_grid.setSpacing(8)
+
+            for sdata in g_items:
+                card = NavigatorCard(sdata, self)
+                cards_grid.addWidget(card)
+                self.nav_card_widgets.append((card, sdata))
+
+            g_card_layout.addLayout(cards_grid)
+            layout.addWidget(grp_card)
+            self.nav_group_cards[group_id] = grp_card
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _filter_navigator_cards(self, query: str):
+        q = query.strip().lower()
+        visible_counts_by_group = {gid: 0 for gid in self.nav_group_cards}
+
+        for card, data in self.nav_card_widgets:
+            if not q:
+                card.setVisible(True)
+                gid = data.get("group")
+                if gid in visible_counts_by_group:
+                    visible_counts_by_group[gid] += 1
+                continue
+
+            matched = (
+                q in data.get("name", "").lower()
+                or q in data.get("domain", "").lower()
+                or q in data.get("desc", "").lower()
+                or any(q in tag.lower() for tag in data.get("tags", []))
+            )
+            card.setVisible(matched)
+            if matched:
+                gid = data.get("group")
+                if gid in visible_counts_by_group:
+                    visible_counts_by_group[gid] += 1
+
+        for gid, grp_card in self.nav_group_cards.items():
+            grp_card.setVisible(visible_counts_by_group.get(gid, 0) > 0)
+
+    def _on_image_selected_for_search(self, path: str):
+        pass
+
+    def _paste_image_from_clipboard_action(self):
+        img = get_image_from_clipboard()
+        if img:
+            tmp_p = save_image_to_temp(img)
+            if self.drop_image_widget:
+                self.drop_image_widget.set_image(tmp_p)
+            show_toast(self, "已从剪贴板读取并加载图片！", toast_type="success", duration=2000)
+        else:
+            show_toast(self, "剪贴板中未检测到图片数据，请先复制/截取图片", toast_type="warning", duration=2500)
+
+    def _browse_image_file_action(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要检索的图片", "",
+            "图片文件 (*.jpg *.jpeg *.png *.webp *.bmp *.gif);;所有文件 (*.*)"
+        )
+        if path and self.drop_image_widget:
+            self.drop_image_widget.set_image(path)
+
+    def start_reverse_image_search(self):
+        path = getattr(self.drop_image_widget, "current_image_path", None)
+        if not path or not os.path.exists(path):
+            img = get_image_from_clipboard()
+            if img:
+                path = save_image_to_temp(img)
+                if self.drop_image_widget:
+                    self.drop_image_widget.set_image(path)
+            else:
+                show_toast(self, "请先拖入图片或点击从剪贴板粘贴图片", toast_type="warning", duration=2500)
+                return
+
+        engine_id = self.cmb_search_engine.currentData() if self.cmb_search_engine else "saucenao"
+        engine_name = SEARCH_ENGINES.get(engine_id, {}).get("name", "以图搜图")
+        show_toast(self, f"正在通过 {engine_name} 发起检索...", toast_type="info", duration=2000)
+
+        self.search_worker = ImageSearchWorker(engine_id, path)
+        self.search_worker.finished_signal.connect(self.on_search_finished)
+        self.search_worker.start()
+
+    def on_search_finished(self, ok: bool, msg: str):
+        show_toast(self, msg, toast_type="success" if ok else "error", duration=3500)
+
+    # ------------------ PAGE 3: Steam 账号管家 ------------------
     def create_steam_page(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setObjectName("MainScrollArea")
@@ -1936,6 +2788,12 @@ class MainWindow(QMainWindow):
         btn_refresh_env.setProperty("class", "MDBtnTonal")
         btn_refresh_env.clicked.connect(self.refresh_env_diagnostics_ui)
         e_title_box.addWidget(btn_refresh_env)
+
+        btn_open_ports = QPushButton("端口排障工具 →")
+        btn_open_ports.setProperty("class", "MDBtnOutlined")
+        btn_open_ports.clicked.connect(self._goto_toolbox_ports_action)
+        e_title_box.addWidget(btn_open_ports)
+
         e_layout.addLayout(e_title_box)
 
         self.lbl_env_sys_proxy = QLabel("系统代理: 检测中...")
@@ -1952,6 +2810,13 @@ class MainWindow(QMainWindow):
         e_layout.addWidget(self.lbl_env_ports)
         e_layout.addWidget(self.lbl_env_summary)
         return env_card
+
+    def _goto_toolbox_ports_action(self):
+        """从设置页一键直达工具箱端口排查子页面"""
+        if hasattr(self, 'btn_nav_toolbox') and self.btn_nav_toolbox:
+            self.btn_nav_toolbox.setChecked(True)
+        self.on_nav_clicked(1)
+        self._enter_toolbox_ports_action()
 
     def _build_settings_general_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
         """卡片 1: 常规偏好与系统外观"""

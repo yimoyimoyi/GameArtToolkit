@@ -28,11 +28,18 @@ class TestServiceProfile(unittest.TestCase):
     """验证 Service Profile 单源配置模型与兼容性"""
 
     def test_profiles_count(self):
-        """验证服务 Profile 基准完整性 (35 项: 9 gaming + 8 acg + 18 dev; fandom/wikipedia/google_translate/dlsite/patreon/epic_games/yandere/myanimelist 已移除)"""
-        self.assertEqual(len(PROFILES), 35)
-        self.assertEqual(len(SERVICES_LIST), 35)
-        self.assertEqual(len(SERVICES_BY_ID), 35)
-        self.assertEqual(len(CANDIDATE_IPS), 35)
+        """验证服务 Profile 基准完整性 (33 项: 8 gaming + 7 acg + 18 dev;
+        ea_app/danbooru 已移除 (明确封锁); embed_pixiv 已移除 (仅代理可用, 按原则不加入);
+        能直连的服务 (steam_download/riot_games/humble_bundle/packagist) 不加入加速列表 (加速器只解决被封锁/不可达))"""
+        self.assertEqual(len(PROFILES), 33)
+        self.assertEqual(len(SERVICES_LIST), 33)
+        self.assertEqual(len(SERVICES_BY_ID), 33)
+        self.assertEqual(len(CANDIDATE_IPS), 33)
+        self.assertNotIn("embed_pixiv", SERVICES_BY_ID)     # 仅代理可用, 不加入
+        self.assertNotIn("steam_download", SERVICES_BY_ID)  # 直连可用, 无需加速
+        self.assertNotIn("riot_games", SERVICES_BY_ID)      # 直连可用, 无需加速
+        self.assertNotIn("humble_bundle", SERVICES_BY_ID)   # 直连可用, 无需加速
+        self.assertNotIn("packagist", SERVICES_BY_ID)       # 直连可用, 无需加速
         self.assertNotIn("fandom", SERVICES_BY_ID)
         self.assertNotIn("wikipedia", SERVICES_BY_ID)
         self.assertNotIn("google_translate", SERVICES_BY_ID)
@@ -41,6 +48,8 @@ class TestServiceProfile(unittest.TestCase):
         self.assertNotIn("yandere", SERVICES_BY_ID)
         self.assertNotIn("myanimelist", SERVICES_BY_ID)  # Akamai 反爬 503 间歇, 反代失效已移除
         self.assertNotIn("epic_games", SERVICES_BY_ID)
+        self.assertNotIn("ea_app", SERVICES_BY_ID)  # Akamai 拒绝 TLS 握手 (HANDSHAKE_FAILURE), 明确封锁已移除
+        self.assertNotIn("danbooru", SERVICES_BY_ID)  # 源站 DNS 池全部直连超时, 明确封锁已移除
         self.assertIn("battle_net", SERVICES_BY_ID)
         self.assertIn("gog", SERVICES_BY_ID)
         self.assertIn("xbox", SERVICES_BY_ID)
@@ -91,6 +100,14 @@ class TestServiceProfile(unittest.TestCase):
         for d in ["steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",
                   "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"]:
             self.assertIn(d, p.domains, f"steam_akamai 缺少创意工坊域名: {d}")
+
+    def test_google_fonts_and_nuget_pool(self):
+        """google_fonts 放行根路径 404 (字体 API 无根文档) + 补充电信缓存段; nuget 补充 Azure 新段"""
+        p_fonts = get_profile_by_id("google_fonts")
+        self.assertEqual(p_fonts.probe_ok_statuses, (404,), "google_fonts 应放行根路径 404")
+        self.assertIn("120.253.255.161", p_fonts.candidate_ips, "google_fonts 缺当前解析的电信缓存段")
+        p_nuget = get_profile_by_id("nuget")
+        self.assertIn("172.183.192.203", p_nuget.candidate_ips, "nuget 缺 Azure 新段")
 
     def test_profile_lookup(self):
         """测试服务根据 ID 与域名的动态查找与通配匹配"""

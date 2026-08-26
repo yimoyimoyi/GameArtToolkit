@@ -4,6 +4,7 @@ GameArt Toolkit - Nginx 进程与端口生命周期管理引擎 (配置预检与
 """
 
 import sys
+import re
 import time
 import shutil
 import subprocess
@@ -92,14 +93,27 @@ class NginxManager:
             # 2. 自动确保证书与私钥在本地按需自生成就绪 (零分发与自愈)
             CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir).ensure_certificates()
 
-            # 3. 仅当 upstream-dynamic.conf 缺失时生成兜底配置 (避免覆盖已优选的节点)
+            # 3. upstream-dynamic.conf 缺失, 或 site 引用的 upstream 未定义时自动补全
+            #    (新增 ServiceProfile 后 site 配置会引用新 upstream, 若未重新测速则 nginx 无法启动;
+            #    增量合并保留既有已优选节点, 仅补充缺失服务块)
+            from cdn_optimizer import CDNOptimizer
             upstream_conf = self.nginx_dir / "conf" / "upstream-dynamic.conf"
-            if not upstream_conf.exists():
-                from cdn_optimizer import CDNOptimizer
-                CDNOptimizer(upstream_conf).apply_optimal({})
+            missing_refs = []
+            if upstream_conf.exists():
+                try:
+                    text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
+                    defined = set(re.findall(r"upstream (upstream_[a-z0-9_]+)", text))
+                    refs = CDNOptimizer(upstream_conf)._scan_site_upstream_refs()
+                    missing_refs = sorted(refs - defined)
+                except Exception:
+                    pass
+            if not upstream_conf.exists() or missing_refs:
+                ok_apply, _ = CDNOptimizer(upstream_conf).apply_optimal({})
+                if not ok_apply:
+                    return False, f"自动补全 upstream 配置失败 (缺失: {missing_refs or '文件缺失'})"
 
-            # 3. 执行 Nginx 语法预检
-            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-c", "conf/nginx.conf", "-t"]
+            # 3. 执行 Nginx 语法预检 (不传 -p 以避免 Windows 下中文路径 ANSI 转换 1113 错误，以 cwd 为 prefix)
+            cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf", "-t"]
             proc = subprocess.run(
                 cmd, cwd=str(self.nginx_dir), capture_output=True,
                 text=True, errors="ignore", timeout=4, **get_silent_startup_kwargs()
@@ -148,7 +162,7 @@ class NginxManager:
             for sub in ["logs", "temp", "cache"]:
                 (self.nginx_dir / sub).mkdir(parents=True, exist_ok=True)
 
-            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-c", "conf/nginx.conf"]
+            cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf"]
             subprocess.Popen(
                 cmd, cwd=str(self.nginx_dir), shell=False,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -176,7 +190,7 @@ class NginxManager:
         # 1. 优先优雅停止
         try:
             subprocess.run(
-                [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "stop"],
+                [str(self.nginx_exe), "-s", "stop"],
                 cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                 **get_silent_startup_kwargs()
             )
@@ -200,7 +214,7 @@ class NginxManager:
         if self.is_running():
             try:
                 subprocess.run(
-                    [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "quit"],
+                    [str(self.nginx_exe), "-s", "quit"],
                     cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                     **get_silent_startup_kwargs()
                 )
@@ -231,7 +245,7 @@ class NginxManager:
             return False, test_msg
 
         try:
-            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "reload"]
+            cmd = [str(self.nginx_exe), "-s", "reload"]
             proc = subprocess.run(
                 cmd, cwd=str(self.nginx_dir), capture_output=True,
                 text=True, errors="ignore", timeout=3, **get_silent_startup_kwargs()

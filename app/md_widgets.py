@@ -614,7 +614,8 @@ class ToastNotification(QFrame):
         layout.addWidget(self.close_btn)
 
         # 设置微光晕边框样式
-        is_dark = ThemeManager.get_instance().is_dark
+        tm = ThemeManager.get_instance()
+        is_dark = tm.is_dark
         toast_bg = "#182032" if is_dark else "#FFFFFF"
         self.setStyleSheet(f"""
             QFrame[class="ToastFrame"] {{
@@ -635,7 +636,9 @@ class ToastNotification(QFrame):
         self.anim_opacity.setEasingCurve(QEasingCurve.OutCubic)
 
     def _get_style_params(self):
-        is_dark = ThemeManager.get_instance().is_dark
+        tm = ThemeManager.get_instance()
+        is_dark = tm.is_dark
+        is_pink = tm.is_pink
         if self.toast_type == "success":
             return "check", "#34D399" if is_dark else "#10B981", "#059669", "rgba(16, 185, 129, 0.15)"
         elif self.toast_type == "warning":
@@ -643,7 +646,10 @@ class ToastNotification(QFrame):
         elif self.toast_type == "error":
             return "error", "#F87171" if is_dark else "#EF4444", "#DC2626", "rgba(239, 68, 68, 0.15)"
         else:
-            return "info", "#7EB9F5" if is_dark else "#0284C7", "#1D3B66" if is_dark else "#BAE6FD", "rgba(126, 185, 245, 0.15)"
+            primary_c = "#7EB9F5" if is_dark else ("#E11D48" if is_pink else "#0284C7")
+            container_c = "#1D3B66" if is_dark else ("#FFE4E6" if is_pink else "#BAE6FD")
+            bg_alpha = "rgba(126, 185, 245, 0.15)" if is_dark else ("rgba(225, 29, 72, 0.15)" if is_pink else "rgba(126, 185, 245, 0.15)")
+            return "info", primary_c, container_c, bg_alpha
 
     def show_animated(self, target_pos: QPoint):
         self.move(target_pos.x(), target_pos.y() + 15)
