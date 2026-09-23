@@ -80,6 +80,19 @@ class NginxConfGenerator:
         else:
             host_header = profile.custom_headers.get("Host", "$host")
 
+        # ECH 隧道分支: 上游指向本地回环上的明文 HTTP 入口, 真正的 TLS 与 ECH
+        # 握手由隧道自己发起。此时必须完全不输出 proxy_ssl_* —— 否则形成
+        # TLS-in-TLS, 隧道无法在中间注入 ECH 扩展。
+        ech = getattr(profile, "ech_enabled", False)
+        scheme = "http" if ech else "https"
+        ssl_lines = [] if ech else [
+            f"        proxy_ssl_name {sni_str};",
+            "        proxy_ssl_server_name on;",
+            "        proxy_ssl_verify off;",
+            "        proxy_ssl_session_reuse on;",
+        ]
+        title = f"{profile.name} (经本地 ECH 隧道直连 Cloudflare)" if ech else profile.name
+
         # ----------------------------------------------------------------------
         # 1. Pixiv 主站特殊处理 (包含 /ajax/ CORS 与 /ws/ WebSocket)
         # ----------------------------------------------------------------------
@@ -96,7 +109,7 @@ class NginxConfGenerator:
         # 3. 标准通用 Server 块渲染
         # ----------------------------------------------------------------------
         lines = [
-            f"# {profile.name}",
+            f"# {title}",
             "server {",
             "    listen 80;",
             "    listen 443 ssl;",
@@ -112,7 +125,7 @@ class NginxConfGenerator:
 
         lines.extend([
             "    location / {",
-            f"        proxy_pass https://{profile.upstream_name};",
+            f"        proxy_pass {scheme}://{profile.upstream_name};",
             "        proxy_http_version 1.1;",
             "        proxy_set_header Upgrade $http_upgrade;",
             "        proxy_set_header Connection $connection_upgrade;",
@@ -120,10 +133,7 @@ class NginxConfGenerator:
             "        proxy_set_header User-Agent $http_user_agent;",
             "        proxy_set_header Accept-Encoding $http_accept_encoding;",
             "        proxy_set_header Accept-Language $http_accept_language;",
-            f"        proxy_ssl_name {sni_str};",
-            "        proxy_ssl_server_name on;",
-            "        proxy_ssl_verify off;",
-            "        proxy_ssl_session_reuse on;",
+            *ssl_lines,
         ])
 
         # 本地静态资源/图片磁盘缓存挂载
@@ -138,6 +148,11 @@ class NginxConfGenerator:
                 "        proxy_cache_lock on;",
                 "        add_header X-Cache-Status $upstream_cache_status;",
             ])
+
+        # Steam 商店与社区防网关 Portal 劫持重定向 (阻断深澜 srun 等局域网认证页面渗透到客户端)
+        if profile.id in ("steam_store", "steam_community"):
+            lines.append("        # 防网关 Portal 劫持重定向，阻断局域网登录地址下发给客户端")
+            lines.append("        proxy_redirect ~*^https?://(?:172\\.|192\\.168\\.|10\\.|.*srun.*|.*portal.*)(.*)$ /;")
 
         # Steam 社区重定向防死循环自适应
         if profile.id == "steam_community":
@@ -177,10 +192,29 @@ class NginxConfGenerator:
 
     @classmethod
     def _render_pixiv_web_server(cls, profile: ServiceProfile) -> str:
-        """渲染 Pixiv 主站专用规则 (包含 /ajax/ CORS 与 /ws/ WebSocket)"""
+        """渲染 Pixiv 主站专用规则 (包含 /ajax/ CORS 与 /ws/ WebSocket)
+
+        ECH 分支: 当 profile.ech_enabled 为真时, 上游指向本地回环上的明文 HTTP
+        入口 (ECH 隧道), 真正的 TLS 与 ECH 握手由隧道自己发起。此时必须完全
+        不输出 proxy_ssl_* —— 否则形成 TLS-in-TLS, 隧道无法在中间注入 ECH 扩展。
+        """
         main_domains = [d for d in profile.domains if d != "lc-event.pixiv.net"]
         domains_str = " ".join(main_domains)
-        return f"""# {profile.name} (采用空 SNI 策略，绕过 GFW SNI 阻断)
+
+        ech = getattr(profile, "ech_enabled", False)
+        scheme = "http" if ech else "https"
+        if ech:
+            banner = f"# {profile.name} (经本地 ECH 隧道直连 Cloudflare)"
+            ssl_opts = ""
+        else:
+            banner = f"# {profile.name} (采用空 SNI 策略，绕过 GFW SNI 阻断)"
+            ssl_opts = """        proxy_ssl_name "";
+        proxy_ssl_server_name on;
+        proxy_ssl_verify off;
+        proxy_ssl_session_reuse on;
+"""
+
+        return f"""{banner}
 server {{
     listen 80;
     listen 443 ssl;
@@ -190,7 +224,7 @@ server {{
     client_max_body_size 50M;
 
     location / {{
-        proxy_pass https://{profile.upstream_name};
+        proxy_pass {scheme}://{profile.upstream_name};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -198,17 +232,13 @@ server {{
         proxy_set_header User-Agent $http_user_agent;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-        proxy_ssl_name "";
-        proxy_ssl_server_name on;
-        proxy_ssl_verify off;
-        proxy_ssl_session_reuse on;
-        proxy_next_upstream error timeout http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{ssl_opts}        proxy_next_upstream error timeout http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}
 
     location /ajax/ {{
-        proxy_pass https://{profile.upstream_name};
+        proxy_pass {scheme}://{profile.upstream_name};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -217,11 +247,7 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-        proxy_ssl_name "";
-        proxy_ssl_server_name on;
-        proxy_ssl_verify off;
-        proxy_ssl_session_reuse on;
-        proxy_hide_header Access-Control-Allow-Origin;
+{ssl_opts}        proxy_hide_header Access-Control-Allow-Origin;
         add_header Access-Control-Allow-Origin $http_origin always;
         proxy_next_upstream error timeout http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
         proxy_read_timeout 60s;
@@ -229,7 +255,7 @@ server {{
     }}
 
     location /ws/ {{
-        proxy_pass https://{profile.upstream_name};
+        proxy_pass {scheme}://{profile.upstream_name};
         proxy_http_version 1.1;
         proxy_set_header Connection "upgrade";
         proxy_set_header Upgrade $http_upgrade;
@@ -238,11 +264,7 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-        proxy_ssl_name "";
-        proxy_ssl_server_name on;
-        proxy_ssl_verify off;
-        proxy_ssl_session_reuse on;
-        proxy_hide_header Access-Control-Allow-Origin;
+{ssl_opts}        proxy_hide_header Access-Control-Allow-Origin;
         add_header Access-Control-Allow-Origin $http_origin always;
         proxy_read_timeout 7200s;
         proxy_send_timeout 7200s;
@@ -257,7 +279,7 @@ server {{
     server_name lc-event.pixiv.net;
 
     location / {{
-        proxy_pass https://{profile.upstream_name};
+        proxy_pass {scheme}://{profile.upstream_name};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -265,11 +287,7 @@ server {{
         proxy_set_header User-Agent $http_user_agent;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-        proxy_ssl_name "";
-        proxy_ssl_server_name on;
-        proxy_ssl_verify off;
-        proxy_ssl_session_reuse on;
-        proxy_next_upstream error timeout http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{ssl_opts}        proxy_next_upstream error timeout http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}

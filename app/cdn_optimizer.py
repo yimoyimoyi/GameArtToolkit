@@ -30,6 +30,7 @@ from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID, PROFILES_BY_ID
 from config_store import load_config
 from win_utils import is_port_in_use, get_physical_adapter_ip, auto_detect_active_proxy
+from ech_tunnel import ech_tunnel
 
 UPSTREAM_CONF_PATH = NGINX_DIR / "conf" / "upstream-dynamic.conf"
 
@@ -197,13 +198,16 @@ _DNS_SERVERS = ["223.5.5.5", "119.29.29.29"]
 # 国外 1.1.1.1 / 8.8.8.8 直连实测被阻断, 不作为默认端点。
 DOH_ENDPOINTS = ["https://doh.pub/dns-query", "https://dns.alidns.com/resolve"]
 
-# 严禁进入 Upstream 的保留/虚拟 IP 段 (含 Clash / Sing-box Fake-IP: 198.18.0.0/15)
+# 严禁进入 Upstream 的保留/虚拟 IP 段 (含 Clash / Sing-box Fake-IP: 198.18.0.0/15 与高校/企业非标私网)
 BLOCKED_IP_NETWORKS = [
     ipaddress.ip_network("198.18.0.0/15"),  # Clash Fake-IP 虚拟池 (198.18.0.0 - 198.19.255.255)
     ipaddress.ip_network("127.0.0.0/8"),     # Loopback 回环
-    ipaddress.ip_network("10.0.0.0/8"),      # 私有内网
-    ipaddress.ip_network("172.16.0.0/12"),   # 私有内网
-    ipaddress.ip_network("192.168.0.0/16"),  # 私有内网
+    ipaddress.ip_network("10.0.0.0/8"),      # 私有内网 (RFC 1918)
+    ipaddress.ip_network("172.16.0.0/12"),   # 私有内网 (RFC 1918: 172.16.0.0 - 172.31.255.255)
+    ipaddress.ip_network("172.100.0.0/16"),  # 高校深澜 srun 等网关广泛滥用的 172.100.x.x
+    ipaddress.ip_network("172.200.0.0/16"),  # 高校/企业网关滥用的 172.200.x.x
+    ipaddress.ip_network("192.168.0.0/16"),  # 私有内网 (RFC 1918)
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT 运营商级 NAT 保留段 (RFC 6598)
     ipaddress.ip_network("169.254.0.0/16"),  # 链路本地
     ipaddress.ip_network("224.0.0.0/4"),     # 组播
     ipaddress.ip_network("240.0.0.0/4"),     # 保留段
@@ -231,6 +235,37 @@ def is_valid_public_cdn_ip(ip_str: str) -> bool:
                 return False
         return True
     except ValueError:
+        return False
+
+
+def is_internet_available(target: str = "www.baidu.com", timeout: float = 1.0) -> bool:
+    """检测外网公网连通性 (带毫秒级快速探测与多端点容灾, 准确感知校园网未认证/掉线)
+
+    策略:
+    1. 优先尝试向国内高可用公网 DNS (223.5.5.5 / 119.29.29.29:53) 或目标域 (80 端口) 发起 TCP 握手
+    2. 若 Socket 探测失败，则回退执行系统原生 ICMP Ping 单包探测 (与校园网登录脚本判定一致)
+    """
+    targets = [(target, 80), ("223.5.5.5", 53), ("119.29.29.29", 53)]
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((host, port))
+            s.close()
+            return True
+        except Exception:
+            pass
+
+    # ICMP Ping 兜底
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        res = subprocess.run(
+            ["ping", "-n", "1", "-w", str(int(timeout * 1000)), target],
+            capture_output=True,
+            creationflags=flags
+        )
+        return res.returncode == 0
+    except Exception:
         return False
 
 
@@ -610,6 +645,14 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                             if loc_host == domain.lower() and loc_path == "/":
                                 out["self_redirect"] = True
 
+                            # 校园网 Portal / 深澜 srun 网关劫持防御:
+                            # 若重定向指向 portal/srun/auth/login 关键字, 或目标属于非标内网 IP, 严厉硬淘汰
+                            loc_lower = loc.lower()
+                            loc_target_ip = loc_host.split(":")[0]
+                            if (any(k in loc_lower for k in ("srun", "portal", "172.100.", "172.200.", "10.0.", "192.168."))
+                                    or (loc_target_ip.replace(".", "").isdigit() and not is_valid_public_cdn_ip(loc_target_ip))):
+                                out["http_suspect"] = True
+
                     # 主域状态码干净判定 (ok_statuses 显式放行或非可疑)
                     if not ((out["http_status"] in ok_set) or not _suspect_status(out["http_status"])):
                         out["http_suspect"] = True
@@ -807,6 +850,10 @@ class CDNOptimizer:
         self.conf_path = Path(conf_path)
         # 最近一次生成的 relay 代理转发服务集合 (供自愈探针分流与 UI 展示)
         self.last_relay_services: set = set()
+        # 最近一次走 ECH 隧道直连的服务集合
+        self.last_ech_services: set = set()
+        # 标记了 ech_enabled 但隧道未就绪、已退回常规分支的服务
+        self.last_ech_degraded: set = set()
 
     def test_service_dual(self, srv_id: str, max_workers: Optional[int] = None) -> List[Dict]:
         """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)"""
@@ -1089,8 +1136,10 @@ class CDNOptimizer:
             "# ==============================================================================\n"
         ]
 
-        # 每次生成重置 relay 服务集合 (由本轮决策重新填充)
+        # 每次生成重置 relay / ECH 服务集合 (由本轮决策重新填充)
         self.last_relay_services = set()
+        self.last_ech_services = set()
+        self.last_ech_degraded = set()
 
         # 读取现有配置用于增量合并: 未参与本次测速的服务保留其已有 upstream 块,
         # 避免单服务自愈/局部重测顺带把其余服务重置回候选池
@@ -1099,6 +1148,37 @@ class CDNOptimizer:
         # 确保全量服务均生成 upstream 块 (若某服务未测速，则自动取 CANDIDATE_IPS 默认兜底)
         for srv_id in CANDIDATE_IPS:
             ip_items = test_results.get(srv_id)
+
+            # --------------------------------------------------------------
+            # ECH 隧道分支 (优先级: rank0 直连 > ECH > relay):
+            # 标记 ech_enabled 且探测未给出直连可用节点时, 改由本地 ECH 隧道承担。
+            # 隧道在回环上提供明文 HTTP 入口, 自行发起带 ECH 的 TLS 连接。
+            #
+            # 为什么这里的判据不能是探测结果: ECH 的加密 SNI 必须在 ClientHello
+            # 构造时注入, 而探测发的是普通握手 —— 空 SNI 会被 Cloudflare 拒绝,
+            # 明文 SNI 会被按关键字阻断, 两者都注定失败, rank0 恒为空。
+            # 真正的可用性判据是隧道自身的健康状态。
+            #
+            # 为什么置于增量合并之前: ECH 服务的上游是本地隧道端口, 与探测结果
+            # 无关, 必须每轮重新评估 —— 否则隧道状态变化会被旧块掩盖
+            # (实测: 该分支原本在合并之后, 未测速的服务直接沿用旧块, ECH 永不生效)。
+            # --------------------------------------------------------------
+            if getattr(PROFILES_BY_ID.get(srv_id), "ech_enabled", False):
+                has_direct = any(it.get("rank", 3) == 0 for it in (ip_items or []))
+                if not has_direct:
+                    if ech_tunnel.is_healthy():
+                        lines.append(f"upstream upstream_{srv_id} {{")
+                        lines.append(f"    # 经本地 ECH 隧道直连 Cloudflare (port={ech_tunnel.port})")
+                        lines.append(f"    server 127.0.0.1:{ech_tunnel.port} max_fails=3 fail_timeout=30s;")
+                        lines.append("    keepalive 32;")
+                        lines.append("    keepalive_timeout 120;")
+                        lines.append("    keepalive_requests 10000;")
+                        lines.append("}\n")
+                        self.last_ech_services.add(srv_id)
+                        continue
+                    # 隧道未就绪: 不静默兜底, 记下来供上层告警, 再走常规分支
+                    self.last_ech_degraded.add(srv_id)
+
             if not ip_items:
                 old_block = existing_blocks.get(f"upstream_{srv_id}")
                 if old_block:
@@ -1220,12 +1300,23 @@ class CDNOptimizer:
 
             failed = [srv_id for srv_id, items in test_results.items()
                       if not any(it.get("rank", 3) == 0 for it in items)]
+            # ECH 服务不参与 rank 判定: 探测层复现不了 ECH 路径 (空 SNI 被 CF 拒绝、
+            # 明文 SNI 被阻断), 其 rank0 必然为空, 但服务实际由隧道直连 —— 不排除
+            # 就会误报"双通道探测全部失败已回退候选池", 掩盖真实状态。
+            ech_ok = self.last_ech_services
+            failed = [s for s in failed if s not in ech_ok]
             relayed = [s for s in failed if s in self.last_relay_services]
             fallback = [s for s in failed if s not in self.last_relay_services]
             # 低存活率服务: rank0 直连节点不足 2 个 (单点依赖, GFW 逐段封锁下随时全挂)
             low_avail = [srv_id for srv_id, items in test_results.items()
-                         if sum(1 for it in items if it.get("rank", 3) == 0) < 2]
+                         if srv_id not in ech_ok
+                         and sum(1 for it in items if it.get("rank", 3) == 0) < 2]
             msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
+            if ech_ok:
+                msg += f" {len(ech_ok)} 个服务经 ECH 隧道直连({', '.join(sorted(ech_ok))})"
+            if self.last_ech_degraded:
+                msg += (f" ⚠️ {len(self.last_ech_degraded)} 个服务标记了 ECH 但隧道未就绪, "
+                        f"已回退常规分支({', '.join(sorted(self.last_ech_degraded))})")
             if relayed:
                 msg += f" {len(relayed)} 个服务直连不可用已切换本地代理转发({', '.join(sorted(relayed))})"
             if fallback:

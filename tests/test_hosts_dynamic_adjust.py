@@ -93,7 +93,14 @@ class TestHostsDynamicAdjustment:
         test_hosts.write_text("127.0.0.1 localhost\r\n", encoding="utf-8")
         test_hm = HostsManager(hosts_file=test_hosts, backup_dir=tmp_path / "bak")
 
-        with patch("pyside_app.nginx_mgr.is_running", return_value=True), \
+        # 必须隔离配置读写: on_service_toggled 会调用 save_config 写真实 config.json,
+        # 不隔离会把用户的 enabled_services 覆写成测试数据 (实测被改成仅剩 steam_store,
+        # 且首次运行后又被后续运行读到, 造成时通时断的偶发失败)。
+        base_cfg = {"enabled_services": ["pixiv_web", "steam_store"], "auto_proxy": False}
+
+        with patch("pyside_app.load_config", side_effect=lambda: dict(base_cfg)), \
+             patch("pyside_app.save_config"), \
+             patch("pyside_app.nginx_mgr.is_running", return_value=True), \
              patch("pyside_app.hosts_mgr", test_hm), \
              patch("pyside_app.cert_mgr.is_cert_installed", return_value=True), \
              patch.object(test_hm, "diagnose_and_repair", return_value={"issues": [], "fixes": []}):
@@ -126,7 +133,11 @@ class TestHostsDynamicAdjustment:
         # 模拟配置中仅启用了 steam_store (pixiv_web 被用户关闭)
         user_cfg = {"enabled_services": ["steam_store"], "auto_proxy": False}
 
-        with patch("pyside_app.load_config", return_value=user_cfg), \
+        # save_config 必须一并隔离: start_acceleration 会把生效的服务列表写回配置,
+        # 只 mock 读不 mock 写, 这个 user_cfg 就会被写进用户的真实 config.json
+        # (实测把 enabled_services 从 33 项覆写成 ["steam_store"])。
+        with patch("pyside_app.load_config", return_value=dict(user_cfg)), \
+             patch("pyside_app.save_config"), \
              patch("pyside_app.nginx_mgr.start", return_value=(True, "OK")), \
              patch("pyside_app.nginx_mgr.is_running", return_value=True), \
              patch("pyside_app.hosts_mgr", test_hm), \

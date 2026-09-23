@@ -341,15 +341,19 @@ class TestRegressionSuite:
         self.log_sub(f"{len(SERVICES_LIST)} 项服务 Upstream 配置生成格式与 Nginx 指令兼容")
 
         # 5.3 兜底测试：当某服务所有 IP 均不可用时，保证 fallback 不生成空 upstream 导致 Nginx 崩溃
+        # 用非 ECH 服务: 标记 ech_enabled 的服务其 upstream 由本地隧道接管, 不走候选池兜底这条路径。
+        # 候选 IP 动态取自 CANDIDATE_IPS 而非硬编码 —— 服务池会随上游变更调整, 硬编码必然腐化。
+        disaster_srv = "steam_store"
         disaster_results = {
-            "pixiv_web": [
-                {"ip": "210.140.139.151", "latency": -1, "available": False},
-                {"ip": "210.140.139.152", "latency": -1, "available": False}
+            disaster_srv: [
+                {"ip": "23.1.179.144", "latency": -1, "available": False},
+                {"ip": "23.46.229.9", "latency": -1, "available": False}
             ]
         }
         disaster_conf = copt.generate_upstream_conf(disaster_results)
-        assert "upstream upstream_pixiv_web {" in disaster_conf
-        assert "server 210.140.139.151:443" in disaster_conf, "全挂灾难场景下未触发默认候选节点兜底"
+        assert f"upstream upstream_{disaster_srv} {{" in disaster_conf
+        fallback_ip = CANDIDATE_IPS[disaster_srv][0]
+        assert f"server {fallback_ip}:443" in disaster_conf, "全挂灾难场景下未触发默认候选节点兜底"
         self.log_sub("全节点不可用场景兜底测试通过 (保证 Nginx 语法不报错)")
 
         self.results["cdn_optimizer_and_upstream"] = True

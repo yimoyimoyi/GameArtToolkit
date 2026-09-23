@@ -1382,15 +1382,25 @@ class LatencyBadge(QWidget):
         self.latency_ms = -1
         self.is_star = False
         self.via_proxy = False
+        self.ech = False
+        self.ech_ok = True
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
         ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
 
-    def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False):
+    def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False,
+                    ech: bool = False, ech_ok: bool = True):
+        """ech=True 时展示 ECH 隧道状态: 该链路走加密 SNI 直连, 不依赖候选节点探测。
+        ech_ok=False 表示隧道未就绪 (此时已回退常规直连)。"""
         self.latency_ms = ms
         self.is_star = is_star
         self.via_proxy = via_proxy
-        if is_star or via_proxy:
+        self.ech = ech
+        self.ech_ok = ech_ok
+        if ech:
+            self.setMinimumWidth(96)
+            self.setMaximumWidth(112)
+        elif is_star or via_proxy:
             self.setMinimumWidth(98)
             self.setMaximumWidth(115)
         else:
@@ -1407,7 +1417,23 @@ class LatencyBadge(QWidget):
 
         palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
-        if self.latency_ms < 0:
+        if self.ech and self.ech_ok:
+            # ECH 隧道: 走的是加密 SNI 的直连通道, 与"某节点的延迟"不是同一维度,
+            # 且探测层复现不了该路径。用独立的靛蓝色系与"ECH 直连"文案,
+            # 避免被误读成超时/失败 —— 那与实际可用的事实相反。
+            bg_color = QColor("rgba(129, 140, 248, 0.16)") if is_dark else QColor("#EEF2FF")
+            border_color = QColor("#6366F1") if is_dark else QColor("#A5B4FC")
+            text_color = QColor("#C7D2FE") if is_dark else QColor("#4338CA")
+            dot_color = QColor("#818CF8")
+            txt = "ECH 直连"
+        elif self.ech:
+            # 隧道未就绪: 服务实际已回退常规直连, 必须显式提示而非谎报为可用
+            bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
+            border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
+            text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
+            dot_color = QColor("#EF4444")
+            txt = "ECH 未就绪"
+        elif self.latency_ms < 0:
             bg_color = QColor(palette.get("container", "#182032"))
             border_color = QColor(palette.get("outline", "#273752"))
             text_color = QColor(palette.get("text_muted", "#75879E"))

@@ -59,6 +59,7 @@ class ServiceProfile:
     probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
     probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
     proxy_connect_by_domain: bool = False     # 代理通道探测时 CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT 规则直连、CDN geo 限制中国 IP 的场景)
+    ech_enabled: bool = False                 # 经本地 ECH 隧道直连 (要求目标托管在 Cloudflare; 见 docs/ech-tunnel-proposal.md)
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -234,8 +235,14 @@ PROFILES: List[ServiceProfile] = [
         icon="palette",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_web",
-        ssl_sni_mode="empty",  # 空 SNI 直通
-        candidate_ips=["210.140.139.151", "210.140.139.153", "210.140.139.154", "210.140.139.157", "210.140.139.161", "210.140.139.162"]
+        # ECH 隧道直连: Pixiv 主站 2026-09 迁至 Cloudflare 后, 原 210.140.139.x
+        # 段 (cdn-origin 回源地址) 的 443 端口虽仍开放, 但已不再服务
+        # www/accounts/app-api 等 vhost, 一律回默认 403 —— 这正是长期 403 的根因。
+        # 而 CF 边缘按 SNI 路由, 明文 SNI 被按关键字阻断, 空 SNI 又会被 CF 拒绝,
+        # 只有 ECH 的加密 SNI 能同时通过两者。
+        ech_enabled=True,
+        ssl_sni_mode="empty",  # 保留: 非 ECH 路径 (relay 代理转发) 仍按空 SNI 直通
+        candidate_ips=["104.18.42.239", "172.64.145.17", "104.18.10.118", "104.18.11.118"]
     ),
     # embed.pixiv.net 已实测并放弃 (2026-08): Cloudflare geo 限制中国 IP (直连 403/RST),
     # 仅代理可用 -> 按"仅代理可用的服务不加入"原则移除 (影响面小, 代理本身即可解决)。
@@ -281,9 +288,12 @@ PROFILES: List[ServiceProfile] = [
         icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_booth_pm",
+        # ECH 隧道直连: 实测明文 SNI 直连稳定返回 403 (Cloudflare 防护对无 cookie 请求
+        # 的确定性响应), 而经 ECH 隧道访问返回正常 302 → https://booth.pm/ja。
+        # 两者差别在于 CF 观察到的连接特征不同, ECH 路径可正常加载。
+        ech_enabled=True,
         ssl_sni_mode="host",
-        # 403 放行: Cloudflare 防护对无 cookie 探测请求返回 403 (实测确定性响应, 与真实解析 IP 一致;
-        # 真实浏览器经 CF 校验后正常访问)。注意: CF 防护站点反代受限, 放行仅避免全挂误报
+        # 保留 403 放行: 探测走的是普通握手(非 ECH), 仍会拿到 403 —— 放行避免全挂误报
         probe_ok_statuses=(403,),
         candidate_ips=["104.18.37.180", "172.64.150.76", "104.18.22.203"]
     ),

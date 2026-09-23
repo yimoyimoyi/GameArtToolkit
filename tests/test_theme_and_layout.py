@@ -350,6 +350,11 @@ def test_render_cdn_results_ipv4_and_ipv6(qapp):
 
     # 模拟 MainWindow 实例的必要属性
     class DummyWindow:
+        # render_cdn_results 对 ECH 服务会走 _set_badge / _render_ech_service_card
+        # 这两个实例方法, 替身需一并提供 (此处直接复用真实实现)
+        _set_badge = MainWindow._set_badge
+        _render_ech_service_card = MainWindow._render_ech_service_card
+
         def __init__(self):
             self.cdn_results_layout = results_layout
             self.service_badges = {}
@@ -360,10 +365,13 @@ def test_render_cdn_results_ipv4_and_ipv6(qapp):
 
     dummy = DummyWindow()
 
-    # 测试数据包含常规 IPv4 与完整 39 字符超长 IPv6
+    # 测试数据包含常规 IPv4 与完整 39 字符超长 IPv6。
+    # 刻意用非 ECH 服务: 走 ECH 隧道的服务其卡片渲染的是隧道状态而非候选 IP
+    # 列表, 用它无法覆盖本测试要验证的地址展示。
+    test_sid = "steam_store"
     mock_results = {
-        "pixiv_web": [
-            {"ip": "210.140.131.222", "latency": 45.2, "available": True},
+        test_sid: [
+            {"ip": "23.1.179.144", "latency": 45.2, "available": True},
             {"ip": "2606:4700:3033:0000:0000:6815:1234:5678", "latency": 88.6, "available": True},
             {"ip": "2404:6800:4004:081a:0000:0000:0000:200e", "latency": 0, "available": False},
         ]
@@ -375,8 +383,8 @@ def test_render_cdn_results_ipv4_and_ipv6(qapp):
         tm.set_theme(th, qapp)
         # 执行 render_cdn_results，验证无 NameError/UnboundLocalError(针对 primary_c)
         MainWindow.render_cdn_results(dummy, mock_results)
-        assert "pixiv_web" in dummy.cdn_card_widgets
-        card = dummy.cdn_card_widgets["pixiv_web"]
+        assert test_sid in dummy.cdn_card_widgets
+        card = dummy.cdn_card_widgets[test_sid]
         from ip_pool import SERVICES_LIST
         # 验证涵盖全量服务测速目标卡片
         assert dummy.cdn_results_layout.count() >= len(SERVICES_LIST)

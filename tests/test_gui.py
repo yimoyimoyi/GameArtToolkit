@@ -22,6 +22,7 @@ import ast
 import time
 from pathlib import Path
 from typing import List, Dict, Any
+from unittest.mock import patch
 
 # 设置输出流为 UTF-8 编码，防止 Windows 终端字符编码问题
 if hasattr(sys.stdout, "reconfigure"):
@@ -443,10 +444,32 @@ def run_full_verification():
     report.assert_true("#EEF5FD" in MATERIAL_LIGHT_QSS, "亮色模式全局底色已升级为淡冰蓝 #EEF5FD")
     report.assert_true("#E4EFFB" in MATERIAL_LIGHT_QSS, "亮色模式侧边栏底色已升级为浅霜蓝 #E4EFFB")
 
-    main_win.start_acceleration(show_toast_on_fail=False)
-    report.assert_true(True, "MainWindow.start_acceleration 执行无未定义异常 (enabled_services 回归)")
-    main_win.stop_acceleration()
-    report.assert_true(True, "MainWindow.stop_acceleration 执行正常")
+    # 本项只做冒烟验证 ("调用不抛异常"), 必须隔离副作用: 未隔离时
+    # start/stop_acceleration 会真的启停开发机上正在运行的 nginx、改写
+    # config.json 的 enabled_services, 并在测试结束后把用户的服务停掉。
+    # 逐方法 mock 而非整体替换对象: 这些调用方按 (ok, msg) 元组解包,
+    # 整体 mock 会让返回值变成 MagicMock 而解包失败
+    with patch("pyside_app.nginx_mgr.start", return_value=(True, "OK")), \
+         patch("pyside_app.nginx_mgr.stop", return_value=(True, "OK")), \
+         patch("pyside_app.nginx_mgr.is_running", return_value=True), \
+         patch("pyside_app.hosts_mgr.apply_rules", return_value=(True, "OK")), \
+         patch("pyside_app.hosts_mgr.remove_rules"), \
+         patch("pyside_app.cert_mgr.is_cert_installed", return_value=True), \
+         patch("pyside_app.cert_mgr.install_cert", return_value=(True, "OK")), \
+         patch("pyside_app.cert_mgr.restore_dev_environments"), \
+         patch("pyside_app.health_monitor.start"), \
+         patch("pyside_app.health_monitor.stop"), \
+         patch("pyside_app.relay_server.start", return_value=(True, "OK")), \
+         patch("pyside_app.relay_server.stop", return_value=(True, "OK")), \
+         patch("pyside_app.relay_server.clear_proxy_routes"), \
+         patch("pyside_app.ech_tunnel.start", return_value=(True, "OK")), \
+         patch("pyside_app.ech_tunnel.stop", return_value=(True, "OK")), \
+         patch("pyside_app.load_config", return_value={"enabled_services": ["pixiv_web"]}), \
+         patch("pyside_app.save_config"):
+        main_win.start_acceleration(show_toast_on_fail=False)
+        report.assert_true(True, "MainWindow.start_acceleration 执行无未定义异常 (enabled_services 回归)")
+        main_win.stop_acceleration()
+        report.assert_true(True, "MainWindow.stop_acceleration 执行正常")
     main_win._is_force_quit = True
     main_win.safe_shutdown()
     main_win.close()

@@ -43,6 +43,10 @@ DEFAULT_CONFIG = {
     "auto_cdn_optimize_on_startup": True,
     "auto_cdn_min_interval_minutes": 30,
     "auto_cdn_only_enabled": True,
+    "auto_cdn_wait_network_ready": True,
+    "auto_cdn_network_stable_delay_seconds": 60,
+    "auto_proxy_after_cdn": True,
+    "network_probe_target": "www.baidu.com",
     "ip_version_mode": "prefer_ipv4",  # "prefer_ipv4" | "prefer_ipv6" | "dual_stack" | "ipv4_only"
     "cdn_timeout_seconds": 1.5,
     "cdn_max_workers": 16,

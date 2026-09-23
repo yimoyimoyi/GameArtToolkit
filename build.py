@@ -41,6 +41,36 @@ def get_app_version() -> str:
             pass
     return "1.1.0"
 
+def build_ech_tunnel() -> bool:
+    """构建 ECH 隧道可执行文件 (需要 Go 工具链)
+
+    隧道源码在 tools/ech_tunnel/, 通过 build.ps1 编译成静态单文件。
+    Go 工具链缺失时返回 False —— 调用方应降级为警告而非中断打包:
+    缺少隧道只会让标记 ech_enabled 的服务退回常规分支, 不影响其余功能。
+    """
+    script = BASE_DIR / "tools" / "ech_tunnel" / "build.ps1"
+    if not script.exists():
+        print(f"  [WARN] 未找到构建脚本: {script}")
+        return False
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=300,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0:
+            print("  " + (result.stdout or "").strip().replace("\n", "\n  "))
+            return True
+        print(f"  [WARN] ECH 隧道构建失败: {(result.stderr or '').strip()[:300]}")
+    except FileNotFoundError:
+        print("  [WARN] 未找到 PowerShell, 跳过 ECH 隧道构建")
+    except subprocess.TimeoutExpired:
+        print("  [WARN] ECH 隧道构建超时")
+    except Exception as e:
+        print(f"  [WARN] 调用 ECH 隧道构建脚本异常: {e}")
+    return False
+
+
 def find_iscc() -> str:
     """寻找系统安装的 Inno Setup 编译器 ISCC.exe"""
     # 1. 检查环境变量 PATH
@@ -271,6 +301,24 @@ VSVersionInfo(
         shutil.copyfile(BASE_DIR / "app" / "icon.ico", target_out_dir / "icon.ico")
     if (BASE_DIR / "app" / "icon.png").exists():
         shutil.copyfile(BASE_DIR / "app" / "icon.png", target_out_dir / "icon.png")
+
+    # 部署 ECH 隧道可执行文件 (Go 静态二进制, 无运行时依赖)
+    # 只复制 exe: 源码与构建脚本留在仓库, 不进发布包
+    print("\n- 部署 ECH 隧道可执行文件...")
+    tunnel_exe = BASE_DIR / "tools" / "ech_tunnel" / "ech-tunnel.exe"
+    if not tunnel_exe.exists():
+        print("  未找到已编译的隧道, 尝试现场构建...")
+        build_ech_tunnel()
+    if tunnel_exe.exists():
+        tunnel_dst = target_out_dir / "tools" / "ech_tunnel"
+        tunnel_dst.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(tunnel_exe, tunnel_dst / "ech-tunnel.exe")
+        size_mb = tunnel_exe.stat().st_size / (1024 * 1024)
+        print(f"  已部署 ECH 隧道: {tunnel_dst / 'ech-tunnel.exe'} ({size_mb:.1f} MB)")
+    else:
+        # 不中断打包: 缺少隧道时, 标记 ech_enabled 的服务会退回常规分支
+        print("  [WARN] ECH 隧道不可用, 本次发布将不含 ECH 直连能力")
+        print("         标记 ech_enabled 的服务会自动退回常规分支")
 
     # 5. 生成 Release 发布资产 (便携包 + 安装包 + SHA256)
     print("\n[5/5] 生成 Release 发布资产包...")

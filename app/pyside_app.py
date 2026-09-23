@@ -46,8 +46,9 @@ from steam_manager import SteamManager
 from cert_manager import CertManager
 from hosts_manager import HostsManager
 from nginx_manager import NginxManager
-from cdn_optimizer import CDNOptimizer, CDNHealthMonitor
+from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
 from l4_relay import relay_server
+from ech_tunnel import ech_tunnel
 from dns_server import local_dns_server
 from env_detector import EnvDetector
 from win_utils import (
@@ -76,6 +77,26 @@ cert_mgr = CertManager()
 hosts_mgr = HostsManager()
 nginx_mgr = NginxManager()
 cdn_opt = CDNOptimizer()
+
+
+def is_ech_service(sid: str) -> bool:
+    """该服务的直连是否由 ECH 隧道承担
+
+    模块级而非 MainWindow 方法: render_cdn_results 会被轻量替身对象调用
+    (见 tests/test_theme_and_layout.py 的 DummyWindow), 实例方法会导致其
+    AttributeError; 本函数只依赖 cdn_opt, 不需要实例状态。
+
+    优先看 last_ech_services (反映实际生效的状态: 隧道未就绪时会退化为常规
+    直连, 此时不应显示为 ECH); 启动早期尚未跑过优化时回退到 profile 配置。
+    """
+    if sid in getattr(cdn_opt, "last_ech_services", set()):
+        return True
+    from service_profile import PROFILES_BY_ID
+
+    profile = PROFILES_BY_ID.get(sid)
+    return bool(profile and getattr(profile, "ech_enabled", False))
+
+
 # 巡检周期从配置读取 (health_check_interval_seconds), 支持设置页运行中调整
 health_monitor = CDNHealthMonitor(cdn_opt,
                                   check_interval=float(load_config().get("health_check_interval_seconds") or 30),
@@ -271,17 +292,72 @@ class SingleCDNTestWorker(QThread):
 
 class StartupAutoCDNWorker(QThread):
     finished = Signal(dict)
+    status_changed = Signal(str)
 
-    def __init__(self, filter_services: Optional[List[str]] = None):
+    def __init__(self, filter_services: Optional[List[str]] = None,
+                 wait_network: bool = True,
+                 stable_delay_sec: int = 60,
+                 probe_target: str = "www.baidu.com",
+                 skip_cdn_test: bool = False):
         super().__init__()
         self.filter_services = filter_services
+        self.wait_network = wait_network
+        self.stable_delay_sec = max(0, stable_delay_sec)
+        self.probe_target = probe_target
+        self.skip_cdn_test = skip_cdn_test
         self._stop_requested = False
 
     def request_stop(self):
         self._stop_requested = True
 
     def run(self):
-        results = cdn_opt.test_all_services(filter_services=self.filter_services)
+        # 阶段 1: 外网连通性探测 (针对校园网/Portal 认证环境, 循环等待 autologin 或用户登录成功)
+        if self.wait_network:
+            print(f"[StartupFlow] 开始探测外网连通性 (目标: {self.probe_target})...")
+            self.status_changed.emit("正在等待外网连接 (校园网认证中)...")
+            max_wait_seconds = 180  # 最长探测等待 3 分钟
+            deadline = time.time() + max_wait_seconds
+            is_online = False
+            while time.time() < deadline:
+                if self._stop_requested:
+                    return
+                if is_internet_available(self.probe_target, timeout=0.8):
+                    is_online = True
+                    print("[StartupFlow] 外网探测已通畅！")
+                    break
+                # 每 2.5 秒探测一次，其间高频响应 stop 请求
+                for _ in range(5):
+                    if self._stop_requested:
+                        return
+                    time.sleep(0.5)
+
+            if not is_online:
+                print("[StartupFlow] 等待外网连通超时 (超过 180 秒)，结束启动流程。")
+                if not self._stop_requested:
+                    self.finished.emit({})
+                return
+
+        # 阶段 2: 网络稳定缓冲等待 (默认 60 秒，确保深澜网关 NAT 会话与 DNS 缓存就绪)
+        if self.stable_delay_sec > 0:
+            print(f"[StartupFlow] 外网已就绪，进入稳定缓冲等待 ({self.stable_delay_sec} 秒)...")
+            self.status_changed.emit(f"外网已连通，等待网络稳定 ({self.stable_delay_sec}s)...")
+            remain = float(self.stable_delay_sec)
+            while remain > 0:
+                if self._stop_requested:
+                    return
+                step = min(remain, 1.0)
+                time.sleep(step)
+                remain -= step
+
+        # 阶段 3: 执行 CDN 测速 (在干净、稳定的公网环境下)
+        if self.skip_cdn_test:
+            print("[StartupFlow] 跳过 CDN 测速步骤，直接就绪。")
+            results = {}
+        else:
+            print("[StartupFlow] 缓冲等待完毕，开始执行启动 CDN 测速优选...")
+            self.status_changed.emit("正在执行 CDN 测速优选...")
+            results = cdn_opt.test_all_services(filter_services=self.filter_services)
+
         if not self._stop_requested:
             self.finished.emit(results)
 
@@ -666,6 +742,7 @@ class MainWindow(QMainWindow):
         self.cdn_single_buttons: Dict[str, QPushButton] = {}
         self._single_cdn_workers: Dict[str, SingleCDNTestWorker] = {}
         self._startup_cdn_worker: Optional[StartupAutoCDNWorker] = None
+        self._startup_flow_in_progress: bool = False
 
         # 控制台分块折叠
         self.collapsed_sections: Set[str] = set(load_config().get("collapsed_dashboard_sections", []))
@@ -735,14 +812,24 @@ class MainWindow(QMainWindow):
         # 初始刷新网络环境与代理诊断
         self.refresh_env_diagnostics_ui()
 
-        # 4. 自动托管启动
-        if cfg.get("auto_proxy", True):
-            if not nginx_mgr.is_running() or not hosts_mgr.is_applied():
-                self.start_acceleration(show_toast_on_fail=False)
+        # 4. 自动托管与启动测速编排流程 (支持"外网连通并测速后再开启代理劫持")
+        auto_proxy_enabled = cfg.get("auto_proxy", True)
+        auto_cdn_enabled = cfg.get("auto_cdn_optimize_on_startup", True)
+        defer_proxy = cfg.get("auto_proxy_after_cdn", True)
 
-        # 5. 启动时后台静默 CDN 测速并优选 (延迟 2.5 秒，避开启动竞争高峰)
-        if cfg.get("auto_cdn_optimize_on_startup", True):
-            QTimer.singleShot(2500, self.trigger_startup_auto_cdn)
+        if defer_proxy and (auto_proxy_enabled or auto_cdn_enabled):
+            # 开启了"延迟到测速后启用代理": 开机不立即写入 hosts 劫持流量,
+            # 而是由启动编排 Worker 先探活外网、缓冲稳定并测速, 测速成功后再正式启用代理
+            self._startup_flow_in_progress = True
+            print("[StartupFlow] 已启用测速后启动代理策略，等待外网就绪与测速完成...")
+            QTimer.singleShot(1500, self.trigger_startup_auto_cdn)
+        else:
+            # 传统模式: 立即启用加速
+            if auto_proxy_enabled:
+                if not nginx_mgr.is_running() or not hosts_mgr.is_applied():
+                    self.start_acceleration(show_toast_on_fail=False)
+            if auto_cdn_enabled:
+                QTimer.singleShot(2500, self.trigger_startup_auto_cdn)
 
     def _update_service_icon(self, sid: str, is_checked: bool):
         """根据开关状态与当前主题动态调整服务卡片图标色彩"""
@@ -2416,6 +2503,15 @@ class MainWindow(QMainWindow):
 
         show_toast(self, "正在并发探测全量服务的候选节点延迟...", toast_type="info", duration=2500)
 
+        if getattr(self, "_startup_flow_in_progress", False):
+            self._startup_flow_in_progress = False
+            if self._startup_cdn_worker and self._startup_cdn_worker.isRunning():
+                self._startup_cdn_worker.request_stop()
+
+        probe_target = load_config().get("network_probe_target", "www.baidu.com")
+        if not is_internet_available(probe_target, timeout=0.6):
+            show_toast(self, "未检测到公网连通 (校园网未认证或断网)，测速可能全部超时", toast_type="warning", duration=4000)
+
         self.cdn_worker = CDNTestWorker()
         self.cdn_worker.finished.connect(self.on_cdn_ping_finished)
         self.cdn_worker.start()
@@ -2437,6 +2533,88 @@ class MainWindow(QMainWindow):
         self.render_cdn_results(results)
         show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
 
+    def _set_badge(self, sid: str, latency: int, is_star: bool = False, via_proxy: bool = False):
+        """统一更新主控制台延迟徽章; ECH 服务渲染隧道状态(含其健康度, 不谎报可用)"""
+        if sid not in self.service_badges:
+            return
+        if is_ech_service(sid):
+            from ech_tunnel import ech_tunnel
+
+            self.service_badges[sid].set_latency(0, ech=True, ech_ok=ech_tunnel.is_healthy())
+        else:
+            self.service_badges[sid].set_latency(latency, is_star=is_star, via_proxy=via_proxy)
+
+    def _render_ech_service_card(self, sid: str, name: str):
+        """渲染 ECH 隧道服务的状态卡片
+
+        ECH 服务的上游是本地隧道端口, 与候选节点延迟不是同一维度; 逐个 IP
+        展示"超时"既无信息量又误导。这里改为呈现隧道本身的状态。
+        """
+        from ech_tunnel import ech_tunnel
+
+        is_dark = ThemeManager.get_instance().is_dark
+        st = ech_tunnel.status()
+        healthy = st["healthy"]
+
+        card = QFrame()
+        card.setProperty("class", "MDCard")
+        self.cdn_card_widgets[sid] = card
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(16, 14, 16, 14)
+        card_l.setSpacing(10)
+
+        card_top = QHBoxLayout()
+        # 标题跟随实际状态: 隧道未就绪时不能仍宣称"经 ECH 直连"
+        suffix = "经 ECH 隧道直连" if healthy else "ECH 隧道未就绪"
+        lbl_title = QLabel(f"{name} ({suffix})")
+        lbl_title.setProperty("class", "CategoryTitle")
+        lbl_title.setWordWrap(True)
+        card_top.addWidget(lbl_title)
+        card_top.addStretch()
+
+        # 独立测速对 ECH 服务无意义: 探测发的是普通握手, 必然失败。
+        # 保留按钮位避免布局错位, 但禁用并说明原因。
+        btn_single = QPushButton("独立测速")
+        btn_single.setProperty("class", "MDBtnTiny")
+        btn_single.setEnabled(False)
+        btn_single.setToolTip("该服务走 ECH 隧道, 探测层无法复现其链路, 无需单独测速")
+        self.cdn_single_buttons[sid] = btn_single
+        card_top.addWidget(btn_single)
+        card_l.addLayout(card_top)
+
+        # 状态行: 隧道健康度
+        if healthy:
+            dot, text_c = ("#10B981" if is_dark else "#059669"), ("#34D399" if is_dark else "#059669")
+            status_txt = f"隧道运行中 · 127.0.0.1:{st['port']}"
+        else:
+            dot, text_c = ("#EF4444" if is_dark else "#DC2626"), ("#F87171" if is_dark else "#DC2626")
+            status_txt = "隧道未就绪 · 已回退常规直连"
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        dot_lbl = QLabel()
+        dot_lbl.setFixedSize(8, 8)
+        dot_lbl.setStyleSheet(f"background-color: {dot}; border-radius: 4px;")
+        row.addWidget(dot_lbl)
+        lbl_status = QLabel(status_txt)
+        lbl_status.setStyleSheet(f"font-family: monospace; font-size: 12px; font-weight: bold; color: {text_c};")
+        row.addWidget(lbl_status)
+        row.addStretch()
+        card_l.addLayout(row)
+
+        # 说明行: 解释为何不列节点延迟
+        cand_n = len(CANDIDATE_IPS.get(sid, []))
+        lbl_note = QLabel(
+            f"加密 SNI 直连 Cloudflare, 不依赖候选节点探测"
+            f"（候选 IP 池 {cand_n} 个, 由隧道内部解析使用）"
+        )
+        lbl_note.setWordWrap(True)
+        note_c = "#75879E" if is_dark else "#64748B"
+        lbl_note.setStyleSheet(f"font-size: 11px; color: {note_c};")
+        card_l.addWidget(lbl_note)
+
+        self.cdn_results_layout.addWidget(card)
+
     def render_cdn_results(self, results: Dict):
         """根据当前主题渲染涵盖全量测速目标与候选 IP 节点的列表"""
         while self.cdn_results_layout.count():
@@ -2455,6 +2633,17 @@ class MainWindow(QMainWindow):
             sid = srv["id"]
             name = srv["name"]
             ip_list = results.get(sid)
+
+            # ECH 服务: 探测发的是普通握手, 复现不了 ECH 路径 —— 空 SNI 会被
+            # Cloudflare 拒绝, 明文 SNI 会被按关键字阻断, 因此节点必然全部
+            # "不可用"。按常规渲染会满屏"超时", 与服务实际可用的事实相反。
+            # 这里改呈现隧道状态。
+            if is_ech_service(sid):
+                has_any_available = True
+                self._set_badge(sid, 0)
+                new_cached_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
+                self._render_ech_service_card(sid, name)
+                continue
 
             if not ip_list:
                 cand_ips = CANDIDATE_IPS.get(sid, [])
@@ -2612,12 +2801,8 @@ class MainWindow(QMainWindow):
             best_lat = results[0]["latency"]
             is_proxy = (sid in cdn_opt.last_relay_services)
 
-        if sid in self.service_badges:
-            self.service_badges[sid].set_latency(
-                int(best_lat) if best_lat != 9999 else -1,
-                is_star=True,
-                via_proxy=is_proxy
-            )
+        self._set_badge(sid, int(best_lat) if best_lat != 9999 else -1,
+                        is_star=True, via_proxy=is_proxy)
 
         # 3. 持久化缓存延迟与完整测速数据
         cfg = load_config()
@@ -2636,49 +2821,70 @@ class MainWindow(QMainWindow):
             show_toast(self, f"[{srv_name}] 节点探测超时，已回退默认候选池", toast_type="warning", duration=3500)
 
     def trigger_startup_auto_cdn(self):
-        """启动后后台静默触发 CDN 自动测速优选 (含防抖保护与按需探测)"""
+        """启动后后台静默触发 CDN 自动测速与代理启动编排"""
         cfg = load_config()
-        if not cfg.get("auto_cdn_optimize_on_startup", True):
+        auto_proxy_enabled = cfg.get("auto_proxy", True)
+        auto_cdn_enabled = cfg.get("auto_cdn_optimize_on_startup", True)
+        defer_proxy = cfg.get("auto_proxy_after_cdn", True)
+
+        if not auto_cdn_enabled and not (defer_proxy and auto_proxy_enabled):
+            self._startup_flow_in_progress = False
             return
 
         # 检查最小防抖时间 (默认 30 分钟)
         last_time = cfg.get("last_optimal_time", 0)
         min_interval_sec = cfg.get("auto_cdn_min_interval_minutes", 30) * 60
         now = time.time()
-        if now - last_time < min_interval_sec:
+        skip_cdn = False
+        if auto_cdn_enabled and (now - last_time < min_interval_sec):
             print(f"[AutoCDN] 距离上次自动测速仅 {int((now - last_time)/60)} 分钟 (< {int(min_interval_sec/60)} 分钟)，跳过启动重复测速")
-            return
+            skip_cdn = True
+
+        if not auto_cdn_enabled:
+            skip_cdn = True
 
         only_enabled = cfg.get("auto_cdn_only_enabled", True)
         target_services = cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES) if only_enabled else None
 
-        print(f"[AutoCDN] 启动后台静默 CDN 测速 (目标: {'当前已启用服务' if only_enabled else '全量服务'})...")
-        self._startup_cdn_worker = StartupAutoCDNWorker(target_services)
+        wait_net = cfg.get("auto_cdn_wait_network_ready", True)
+        delay_sec = cfg.get("auto_cdn_network_stable_delay_seconds", 60)
+        probe_tgt = cfg.get("network_probe_target", "www.baidu.com")
+
+        print(f"[StartupFlow] 启动后台静默编排 (探网: {wait_net}, 缓冲: {delay_sec}s, 测速: {not skip_cdn})...")
+        self._startup_cdn_worker = StartupAutoCDNWorker(
+            filter_services=target_services,
+            wait_network=wait_net,
+            stable_delay_sec=delay_sec,
+            probe_target=probe_tgt,
+            skip_cdn_test=skip_cdn
+        )
         self._startup_cdn_worker.finished.connect(self.on_startup_auto_cdn_finished)
         self._startup_cdn_worker.start()
 
     def on_startup_auto_cdn_finished(self, results: Dict):
-        """启动后台静默测速完成回调 (自动应用并静默热重载)"""
-        self.cached_cdn_results = results
-        ok, msg = cdn_opt.apply_optimal(results)
+        """启动后台静默测速完成回调 (自动应用并静默热重载，测速后正式启动加速)"""
         cfg = load_config()
-        cfg["last_optimal_time"] = int(time.time())
-        cfg["cached_cdn_full_results"] = results
+        if results:
+            self.cached_cdn_results = results
+            ok, msg = cdn_opt.apply_optimal(results)
+            cfg["last_optimal_time"] = int(time.time())
+            cfg["cached_cdn_full_results"] = results
 
-        new_cached_lats = {}
-        for sid, ip_list in results.items():
-            if ip_list and sid in self.service_badges:
-                best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
-                is_proxy = (sid in cdn_opt.last_relay_services)
-                self.service_badges[sid].set_latency(
-                    max(1, int(best_lat)),
-                    is_star=True,
-                    via_proxy=is_proxy
-                )
-                new_cached_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+            new_cached_lats = {}
+            for sid, ip_list in results.items():
+                if ip_list and sid in self.service_badges:
+                    best_lat = ip_list[0]["latency"] if ip_list[0]["available"] else 9999
+                    is_proxy = (sid in cdn_opt.last_relay_services)
+                    self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
+                    # ECH 服务的节点延迟无意义(探测恒失败), 缓存隧道状态本身
+                    new_cached_lats[sid] = (
+                        {"latency": 0, "via_proxy": False, "ech": True}
+                        if is_ech_service(sid)
+                        else {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+                    )
 
-        cfg["cached_latencies"] = new_cached_lats
-        save_config(cfg)
+            cfg["cached_latencies"] = new_cached_lats
+            save_config(cfg)
 
         # GitHub 全段封锁提示: 直连多段候选全挂或可用节点不足时, 弹窗提醒启用上游代理 (relay 自动绕过)
         blocked, low_avail = [], []
@@ -2731,6 +2937,14 @@ class MainWindow(QMainWindow):
             toast_type="success", duration=3200
         )
 
+        # 若处于开机/启动延迟启用流程中，测速/等待结束后正式启动加速服务并注入 Hosts
+        if self._startup_flow_in_progress:
+            self._startup_flow_in_progress = False
+            cfg_now = load_config()
+            if cfg_now.get("auto_proxy", True):
+                print("[StartupFlow] 启动阶段网络准备就绪，正式启动加速服务并应用 Hosts 规则...")
+                self.start_acceleration(show_toast_on_fail=False)
+
     def apply_optimal_cdn(self):
         if not self.cached_cdn_results:
             return
@@ -2745,12 +2959,12 @@ class MainWindow(QMainWindow):
                 if ip_list and sid in self.service_badges:
                     best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
                     is_proxy = (sid in cdn_opt.last_relay_services)
-                    if best_lat != 9999:
-                        self.service_badges[sid].set_latency(
-                            max(1, int(best_lat)),
-                            is_star=True,
-                            via_proxy=is_proxy
-                        )
+                    if is_ech_service(sid):
+                        # ECH 服务: 节点全部"不可用"是预期结果, 展示隧道状态
+                        self._set_badge(sid, 0)
+                        saved_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
+                    elif best_lat != 9999:
+                        self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
                         saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
 
             cfg["cached_latencies"] = saved_lats
@@ -3166,7 +3380,52 @@ class MainWindow(QMainWindow):
         row_cdn_only_en.addWidget(self.sw_auto_cdn_only_enabled)
         ct_layout.addLayout(row_cdn_only_en)
 
-        # 3.5 防抖周期与自愈频率
+        # 3.5 测速优选后再启用代理 (防校园网劫持)
+        row_proxy_after_cdn = QHBoxLayout()
+        r_pac_text = QVBoxLayout()
+        r_pac_text.setSpacing(2)
+        lbl_pac_title = QLabel("测速优选成功后再启用加速 (防校园网与网关劫持)")
+        lbl_pac_title.setProperty("class", "ItemTitle")
+        lbl_pac_title.setWordWrap(True)
+        lbl_pac_desc = QLabel("启动时不立即写入 Hosts 劫持流量，等待外网连通并优选出真实可用节点后再激活代理")
+        lbl_pac_desc.setProperty("class", "ItemDesc")
+        lbl_pac_desc.setWordWrap(True)
+        r_pac_text.addWidget(lbl_pac_title)
+        r_pac_text.addWidget(lbl_pac_desc)
+        row_proxy_after_cdn.addLayout(r_pac_text)
+        row_proxy_after_cdn.addStretch()
+
+        self.sw_proxy_after_cdn = MDSwitch(checked=cfg.get("auto_proxy_after_cdn", True))
+        self.sw_proxy_after_cdn.toggled.connect(lambda c: update_config_key("auto_proxy_after_cdn", c))
+        row_proxy_after_cdn.addWidget(self.sw_proxy_after_cdn)
+        ct_layout.addLayout(row_proxy_after_cdn)
+
+        # 3.6 外网连通缓冲等待时长
+        row_delay = QHBoxLayout()
+        row_delay.setSpacing(16)
+        lbl_delay = QLabel("外网连通后稳定缓冲等待:")
+        lbl_delay.setProperty("class", "ItemTitle")
+        lbl_delay.setWordWrap(True)
+        self.cmb_stable_delay = NoWheelComboBox()
+        self.cmb_stable_delay.addItem("即时 (0秒)", 0)
+        self.cmb_stable_delay.addItem("15 秒", 15)
+        self.cmb_stable_delay.addItem("30 秒", 30)
+        self.cmb_stable_delay.addItem("60 秒 (推荐)", 60)
+        self.cmb_stable_delay.addItem("90 秒", 90)
+        cur_delay = cfg.get("auto_cdn_network_stable_delay_seconds", 60)
+        for idx in range(self.cmb_stable_delay.count()):
+            if int(self.cmb_stable_delay.itemData(idx)) == int(cur_delay):
+                self.cmb_stable_delay.setCurrentIndex(idx)
+                break
+        self.cmb_stable_delay.currentIndexChanged.connect(
+            lambda idx: update_config_key("auto_cdn_network_stable_delay_seconds", self.cmb_stable_delay.itemData(idx))
+        )
+        row_delay.addWidget(lbl_delay)
+        row_delay.addWidget(self.cmb_stable_delay)
+        row_delay.addStretch()
+        ct_layout.addLayout(row_delay)
+
+        # 3.7 防抖周期与自愈频率
         row_intervals = QHBoxLayout()
         row_intervals.setSpacing(16)
 
@@ -4081,6 +4340,9 @@ class MainWindow(QMainWindow):
             self.lbl_port_detail.setStyleSheet(f"font-size: 12px; color: {success_val_c};")
 
     def watchdog_auto_heal(self):
+        if getattr(self, "_startup_flow_in_progress", False):
+            return
+
         cfg = load_config()
         if not cfg.get("auto_proxy", True):
             return
@@ -4105,6 +4367,11 @@ class MainWindow(QMainWindow):
             self.start_acceleration(show_toast_on_fail=True)
 
     def start_acceleration(self, show_toast_on_fail: bool = False):
+        if getattr(self, "_startup_flow_in_progress", False):
+            self._startup_flow_in_progress = False
+            if self._startup_cdn_worker and self._startup_cdn_worker.isRunning():
+                self._startup_cdn_worker.request_stop()
+
         self._is_manually_stopped = False
         if not cert_mgr.is_cert_installed(force_refresh=False):
             cert_mgr.install_cert()
@@ -4134,6 +4401,10 @@ class MainWindow(QMainWindow):
         else:
             self._has_prompted_hosts_perm = False
 
+        # ECH 隧道必须先于 CDN 优化就绪: 生成 upstream 时会查询隧道健康状态来决定
+        # 是否让 ech_enabled 服务走隧道, 隧道未起会退回常规分支
+        ech_ok, ech_msg = self._start_ech_tunnel()
+
         n_ok, n_msg = nginx_mgr.start()
         if not n_ok:
             hosts_mgr.remove_rules()
@@ -4155,10 +4426,37 @@ class MainWindow(QMainWindow):
 
         if show_toast_on_fail:
             extra = f" | {relay_msg}" if relay_ok else f" | ⚠ {relay_msg}"
+            # ECH 隧道仅在异常时提示, 避免正常路径刷屏
+            if not ech_ok:
+                extra += f" | ⚠ ECH: {ech_msg}"
             show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}", toast_type="success", duration=2500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
+
+    def _start_ech_tunnel(self) -> Tuple[bool, str]:
+        """启动 ECH 隧道: 聚合所有 ech_enabled 服务的域名作为白名单
+
+        域名白名单同时起到安全边界作用 —— 隧道只转发名单内的目标, 避免被当作
+        通用代理滥用。IP 池取自各服务的 candidate_ips, 作为 DoH 被投毒时的兜底
+        (实测境内 DoH 对受限域名的解析是间歇性污染的)。
+        """
+        from service_profile import PROFILES
+
+        ech_services = [p for p in PROFILES if getattr(p, "ech_enabled", False)]
+        if not ech_services:
+            return True, "无服务启用 ECH 隧道"
+
+        domains: List[str] = []
+        ip_pool: List[str] = []
+        for p in ech_services:
+            domains.extend(p.domains)
+            ip_pool.extend(p.candidate_ips)
+        # 去重保序 (多个服务可能共享域名, 如 source.pixiv.net)
+        domains = list(dict.fromkeys(domains))
+        ip_pool = list(dict.fromkeys(ip_pool))
+
+        return ech_tunnel.start(domains=domains, ip_pool=ip_pool)
 
     def _start_relay(self) -> Tuple[bool, str]:
         """启动 L4 Relay 代理转发器: 端口预检 + 从现有 upstream 配置恢复 relay 端口路由"""
@@ -4186,6 +4484,7 @@ class MainWindow(QMainWindow):
         health_monitor.stop()
         relay_server.stop()
         relay_server.clear_proxy_routes()
+        ech_tunnel.stop()
         hosts_mgr.remove_rules()
         try:
             cert_mgr.restore_dev_environments()
