@@ -18,7 +18,7 @@ import random
 import atexit
 import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Set, Tuple
+from typing import Optional, List, Dict, Set, Tuple, Any
 
 # 强制设置环境语言与标准 I/O 编码，避免 Windows 多语言环境或非 UTF-8 控制台下报错
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -45,6 +45,11 @@ from config_store import load_config, save_config, update_config_key
 from steam_manager import SteamManager
 from cert_manager import CertManager
 from hosts_manager import HostsManager
+from nrpt_manager import NrptManager, NRPT_DNS_PORT
+from redirect_manager import (
+    apply_redirect, remove_redirect, fast_remove_redirect, is_redirect_applied,
+    normalize_mode as normalize_redirect_mode, MODE_NRPT
+)
 from nginx_manager import NginxManager
 from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
 from l4_relay import relay_server
@@ -55,10 +60,11 @@ from win_utils import (
     is_process_running, is_port_in_use, is_admin, elevate_relaunch,
     is_autostart_enabled, set_autostart, register_shutdown_handler,
     fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window,
-    is_windows_dark_mode, get_port_process_info, get_critical_ports_status, kill_process_by_pid_safe
+    is_windows_dark_mode, get_port_process_info, get_critical_ports_status, kill_process_by_pid_safe,
+    get_pids_by_name
 )
 from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT, CANDIDATE_IPS
-from service_profile import NAVIGATOR_SERVICES
+from service_profile import NAVIGATOR_SERVICES, get_profile_by_domain, ServiceMode
 from reverse_search import (
     SEARCH_ENGINES, ImageSearchWorker, get_image_from_clipboard, save_image_to_temp
 )
@@ -75,8 +81,12 @@ from svg_icons import SvgIconFactory
 steam_mgr = SteamManager()
 cert_mgr = CertManager()
 hosts_mgr = HostsManager()
+nrpt_mgr = NrptManager()
 nginx_mgr = NginxManager()
 cdn_opt = CDNOptimizer()
+
+# 域名重定向分派层的运行态 (实际生效的后端 / 是否回退 / 回退原因), 供界面与日志展示
+REDIRECT_STATE: Dict[str, Any] = {}
 
 
 def is_ech_service(sid: str) -> bool:
@@ -105,42 +115,97 @@ health_monitor = CDNHealthMonitor(cdn_opt,
 # ==================== 全局快速退出与 Windows 关机安全清理通道 ====================
 _CLEANUP_LOCK = threading.Lock()
 _HAS_EMERGENCY_CLEANED = False
+_LAST_CLEANUP_RESULT: Dict[str, Any] = {"ok": True, "detail": "", "nrpt_left": 0}
 
-def emergency_fast_cleanup():
-    """全局快速退出与 Windows 关机清理通道 (幂等，不阻塞子进程)"""
-    global _HAS_EMERGENCY_CLEANED
+def emergency_fast_cleanup() -> Dict[str, Any]:
+    """全局快速退出与 Windows 关机清理通道 (幂等，不阻塞子进程)
+
+    返回清理结果并**记录失败**: 删除 NRPT 规则需要管理员权限, 而非管理员运行时删除会
+    静默失败 —— 残留的规则会把数百个域名指向无人监听的 127.0.0.1:53, 在整机范围内造成
+    解析失败 (实测事故)。因此这里必须复查"规则是否真的没了", 并把结论落盘, 供下次启动
+    提示用户 (下次提权启动时也会由 cleanup_orphans 自动回收)。
+    """
+    global _HAS_EMERGENCY_CLEANED, _LAST_CLEANUP_RESULT
     with _CLEANUP_LOCK:
         if _HAS_EMERGENCY_CLEANED:
-            return
+            return dict(_LAST_CLEANUP_RESULT)
         _HAS_EMERGENCY_CLEANED = True
 
+    result: Dict[str, Any] = {"ok": True, "detail": "", "nrpt_left": 0}
+    redirect_ok = True
     try:
         cfg = load_config()
         if cfg.get("auto_clean_hosts_on_exit", True):
-            hosts_mgr.fast_remove_rules()
+            # NRPT 规则必须一并清理: 规则残留而本机解析器已退出时, 命中域名的解析会被
+            # 导向无人监听的 127.0.0.1:53, 比 Hosts 残留严重得多
+            redirect_ok = bool(fast_remove_redirect(cfg, hosts_mgr, nrpt_mgr, local_dns_server))
         cert_mgr.restore_dev_environments()
+    except Exception as e:
+        redirect_ok = False
+        result["detail"] = f"清理异常: {e}"
+
+    # 复查 NRPT 是否真的清空 (查询不需要管理员权限, 因此这一步对非管理员运行同样有效)
+    try:
+        left = len(nrpt_mgr.list_own_rules())
     except Exception:
-        pass
+        left = 0
+    result["nrpt_left"] = left
+    result["ok"] = redirect_ok and left == 0
+    if not result["ok"] and not result["detail"]:
+        result["detail"] = (f"退出清理未完全成功: 重定向清={redirect_ok}, "
+                            f"残留 NRPT 规则 {left} 条 (删除规则需管理员权限)")
+    if not result["ok"]:
+        print(f"[Cleanup] {result['detail']}")
+        try:
+            cfg = load_config()
+            cfg["last_cleanup_warning"] = {"ts": int(time.time()), "detail": result["detail"]}
+            save_config(cfg)
+        except Exception:
+            pass
 
     try:
         local_dns_server.stop()
         health_monitor.stop()
         relay_server.stop()
+        # ECH 隧道: 与"停止加速"保持一致。遗漏的后果不只是端口(44401)被占 ——
+        # 下次 start() 会发现 is_running() 为真而直接复用该进程, 若期间域名
+        # 白名单变化过, 新域名不会被加载, 表现为部分站点静默不通。
+        ech_tunnel.stop()
     except Exception:
         pass
 
     try:
-        # 原生直接终止本地 Nginx 进程
-        pid = nginx_mgr.get_pid()
-        if pid > 0:
+        # 原生终止全部本地 Nginx 进程。必须杀"全部 nginx.exe"而非 pid 文件里的
+        # 单个 PID: fast_terminate_pid 是 TerminateProcess, 不连带终止子进程,
+        # 只杀 master 会留下孤儿 worker 占着 80/443 —— 它能继续服务请求, 却
+        # 永远无法 reload/stop (信号通道以已死的 master 为基准), 并阻塞下次启动。
+        # 仍保持本函数"不启动子进程"的约束 (不用 taskkill/nginx -s stop)。
+        pids = get_pids_by_name("nginx.exe")
+        if not pids:
+            # 进程名枚举失败时退回 pid 文件 (至少中断 master)
+            fallback = nginx_mgr.get_pid()
+            pids = [fallback] if fallback > 0 else []
+        for pid in pids:
             fast_terminate_pid(pid)
     except Exception:
         pass
 
-# 注册底层系统关机/注销与控制台事件
-register_shutdown_handler(emergency_fast_cleanup)
-# 注册 Python atexit 钩子
-atexit.register(emergency_fast_cleanup)
+    _LAST_CLEANUP_RESULT = result
+    return dict(result)
+
+
+def _register_exit_cleanup() -> None:
+    """注册进程退出清理 (只能由主程序入口 main() 调用)
+
+    绝不可放在模块级: 那样**任何** import 本模块的进程在退出时都会执行
+    emergency_fast_cleanup, 而后者会终止 nginx master —— 于是留下一个孤儿 worker
+    占着 80/443 (能服务请求却无法 reload/stop, 还阻塞下次启动)。
+    最典型的受害者是测试套件: conftest.py 的 autouse fixture 会 import pyside_app,
+    导致每跑完一次 pytest 就把用户正在运行的 nginx 打死。
+    正常 GUI 退出路径已由 main() 中的 app.aboutToQuit 信号覆盖, 无需 atexit 重复兜底。
+    """
+    register_shutdown_handler(emergency_fast_cleanup)
+    atexit.register(emergency_fast_cleanup)
 
 
 def get_app_icon() -> QIcon:
@@ -212,6 +277,63 @@ def create_tray_icon(is_active: bool = False) -> QIcon:
 # ==============================================================================
 # 异步 Worker 线程与主窗口类
 # ==============================================================================
+class BackgroundTaskWorker(QThread):
+    """把任意"重活"搬到后台线程执行, 完成后把结果发回 UI 线程
+
+    用途: 子进程 (证书安装 / nginx reload / git config)、端口与进程扫描、带超时的网络探测
+    这类操作放在按钮回调里会让界面冻结。统一走本 worker, 结果通过信号回到 UI 线程后再更新
+    界面 —— Qt 要求所有控件操作都在主线程, 因此任务函数本身不得触碰任何 Qt 对象。
+    """
+    done = Signal(object)
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+        except Exception as e:                      # 异常也必须回传, 否则界面永远等不到结果
+            result = e
+        self.done.emit(result)
+
+
+class NetProbeWorker(QThread):
+    """公网探活 (带超时的真实网络请求): 后台执行, 避免堵住按钮回调"""
+    result = Signal(bool)
+
+    def __init__(self, target: str, timeout: float = 0.8):
+        super().__init__()
+        self.target = target
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            ok = is_internet_available(self.target, timeout=self.timeout)
+        except Exception:
+            ok = False
+        self.result.emit(ok)
+
+
+class EnvDiagnosticsWorker(QThread):
+    """环境与代理诊断: 端口扫描 + 进程探测全在后台执行
+
+    为什么必须搬离 UI 线程: EnvDetector.get_full_diagnostics 要逐个探测常见代理端口,
+    在防火墙 DROP 的环境下每个端口都要等满超时, 实测可达数秒 —— 放在按钮回调/启动流程
+    里就是一次明显的界面冻结。
+    """
+    ready = Signal(dict)
+
+    def run(self):
+        try:
+            diag = EnvDetector.get_full_diagnostics()
+        except Exception as e:
+            diag = {"error": str(e)}
+        self.ready.emit(diag)
+
+
 class CDNTestWorker(QThread):
     finished = Signal(dict)
 
@@ -626,6 +748,41 @@ class NavigatorCard(QFrame):
         btn_open.clicked.connect(self.open_url)
         layout.addWidget(btn_open)
 
+        # 4. QUIC 直连按钮 (仅对"TCP 侧 SNI 被 RST、仅 UDP/443 可达"的服务显示)
+        #    总开关停用时不显示 (见 quic_probe.QUIC_ENABLED)
+        self.quic_profile = None
+        try:
+            from quic_probe import is_enabled as _quic_enabled
+            _quic_on = _quic_enabled()
+        except Exception:
+            _quic_on = False
+        try:
+            prof = get_profile_by_domain(data.get("domain", ""))
+            if _quic_on and prof and prof.mode == ServiceMode.QUIC_DIRECT and prof.candidate_ips:
+                self.quic_profile = prof
+        except Exception:
+            self.quic_profile = None
+
+        if self.quic_profile is not None:
+            btn_quic = QPushButton("QUIC 直连")
+            btn_quic.setProperty("class", "MDBtnTonal")
+            btn_quic.setToolTip("该站点 TCP 侧 TLS 被阻断, 以 HTTP/3(QUIC) 直连方式打开 "
+                                "(独立浏览器配置目录; 不走代理)")
+            btn_quic.clicked.connect(self.open_quic)
+            layout.addWidget(btn_quic)
+
+    def open_quic(self):
+        """以 QUIC(HTTP/3) 直连方式启动浏览器打开本站"""
+        prof = self.quic_profile
+        if prof is None:
+            return
+        domain = prof.domains[0]
+        import quic_launcher
+        ok, msg, _ = quic_launcher.launch(domain, extra_domains=prof.domains[1:], url=self.url)
+        if self.parent_window:
+            show_toast(self.parent_window, msg,
+                       toast_type="success" if ok else "error", duration=4500)
+
     def open_url(self):
         if self.url:
             QDesktopServices.openUrl(QUrl(self.url))
@@ -799,6 +956,19 @@ class MainWindow(QMainWindow):
         self._start_status_probe()
         self.load_steam_accounts_ui()
 
+        # 上次退出/异常终止遗留的清理告警必须显式告知: 残留的 NRPT 规则会把数百个域名
+        # 指向无人监听的 127.0.0.1:53, 表现为"突然所有加速站点都打不开"。静默失败等于
+        # 让用户自己去猜原因 (实测事故)。这里在界面拉起后提示, 并给出可执行的处理方式。
+        try:
+            warn = load_config().get("last_cleanup_warning") or {}
+            if warn.get("detail"):
+                QTimer.singleShot(1200, lambda d=warn.get("detail"): show_toast(
+                    self,
+                    f"上次退出未清理干净: {d}。请以管理员身份启动本程序以自动回收残留。",
+                    toast_type="warning", duration=9000))
+        except Exception:
+            pass
+
         # 启动时环境检查
         cfg = load_config()
         if cfg.get("auto_heal_on_startup", True) and not cfg.get("auto_proxy", True):
@@ -826,7 +996,7 @@ class MainWindow(QMainWindow):
         else:
             # 传统模式: 立即启用加速
             if auto_proxy_enabled:
-                if not nginx_mgr.is_running() or not hosts_mgr.is_applied():
+                if not nginx_mgr.is_running() or not self._is_redirect_active():
                     self.start_acceleration(show_toast_on_fail=False)
             if auto_cdn_enabled:
                 QTimer.singleShot(2500, self.trigger_startup_auto_cdn)
@@ -1599,9 +1769,9 @@ class MainWindow(QMainWindow):
         cfg["enabled_services"] = new_list
         save_config(cfg)
 
-        # 若加速运行中或 Hosts 已注入，即刻动态调整 Hosts 规则并刷新 DNS
-        if nginx_mgr.is_running() or hosts_mgr.is_applied():
-            hosts_mgr.apply_rules(new_list)
+        # 若加速运行中或重定向规则已注入，即刻动态调整规则并刷新 DNS
+        if nginx_mgr.is_running() or self._is_redirect_active():
+            self._apply_redirect(new_list)
 
         action_name = "启用" if enable else "禁用"
         show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务并同步更新 Hosts", toast_type="info", duration=2000)
@@ -1622,14 +1792,14 @@ class MainWindow(QMainWindow):
 
         srv_info = SERVICES_BY_ID.get(service_id)
 
-        # 若加速处于运行状态或 Hosts 规则已注入，即刻动态调整 Hosts
-        if nginx_mgr.is_running() or hosts_mgr.is_applied():
-            h_ok, h_msg = hosts_mgr.apply_rules(new_list)
+        # 若加速处于运行状态或重定向规则已注入，即刻动态调整
+        if nginx_mgr.is_running() or self._is_redirect_active():
+            h_ok, h_msg = self._apply_redirect(new_list)
             srv_name = srv_info["name"] if srv_info else service_id
             if not checked:
-                show_toast(self, f"已关闭 [{srv_name}] 加速，已自动从 Hosts 移除对应规则", toast_type="info", duration=1800)
+                show_toast(self, f"已关闭 [{srv_name}] 加速，已自动移除对应重定向规则", toast_type="info", duration=1800)
             elif h_ok:
-                show_toast(self, f"已开启 [{srv_name}] 加速并注入 Hosts 规则", toast_type="success", duration=1800)
+                show_toast(self, f"已开启 [{srv_name}] 加速并注入重定向规则", toast_type="success", duration=1800)
 
     # ------------------ PAGE 2: 实用工具箱 (Toolbox Hub & Sub-pages) ------------------
     def create_toolbox_page(self) -> QWidget:
@@ -1944,8 +2114,18 @@ class MainWindow(QMainWindow):
         return scroll
 
     def refresh_ports_diagnostics_ui(self):
-        """刷新核心端口占用诊断状态"""
-        statuses = get_critical_ports_status([80, 443, 53])
+        """刷新核心端口占用诊断状态 (端口/进程扫描放后台, 避免点击即卡)"""
+        worker = getattr(self, "_ports_diag_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self._run_in_background(lambda: get_critical_ports_status([80, 443, 53]),
+                                self._apply_ports_diagnostics,
+                                busy_attr="_ports_diag_worker")
+
+    def _apply_ports_diagnostics(self, statuses):
+        """把后台端口诊断结果写进界面 (仅在 UI 线程执行)"""
+        if isinstance(statuses, Exception) or not statuses:
+            return
         for item in statuses:
             port = item["port"]
             lbl = self.critical_port_labels.get(port)
@@ -2508,13 +2688,25 @@ class MainWindow(QMainWindow):
             if self._startup_cdn_worker and self._startup_cdn_worker.isRunning():
                 self._startup_cdn_worker.request_stop()
 
-        probe_target = load_config().get("network_probe_target", "www.baidu.com")
-        if not is_internet_available(probe_target, timeout=0.6):
-            show_toast(self, "未检测到公网连通 (校园网未认证或断网)，测速可能全部超时", toast_type="warning", duration=4000)
-
+        # 公网探活挪进 worker: 它本身是一次带超时的真实网络请求 (0.6s), 放在按钮回调里
+        # 会让"点击测速"这一下先卡住界面
         self.cdn_worker = CDNTestWorker()
         self.cdn_worker.finished.connect(self.on_cdn_ping_finished)
         self.cdn_worker.start()
+
+        QTimer.singleShot(0, lambda: self._probe_internet_async(load_config().get(
+            "network_probe_target", "www.baidu.com")))
+
+    def _probe_internet_async(self, probe_target: str):
+        """后台探活 (不阻塞 UI), 仅在不可达时给一条提示"""
+        self._net_probe_worker = NetProbeWorker(probe_target)
+        self._net_probe_worker.result.connect(self._on_net_probe_result)
+        self._net_probe_worker.start()
+
+    def _on_net_probe_result(self, ok: bool):
+        if not ok:
+            show_toast(self, "未检测到公网连通 (校园网未认证或断网)，测速可能全部超时",
+                       toast_type="warning", duration=4000)
 
     def on_cdn_ping_finished(self, results: Dict):
         self.cached_cdn_results = results
@@ -3562,7 +3754,8 @@ class MainWindow(QMainWindow):
         row_dns = QHBoxLayout()
         r_dns_text = QVBoxLayout()
         r_dns_text.setSpacing(2)
-        lbl_dns_title = QLabel("启用本地 DNS 智能分流 (UDP 5353)")
+        lbl_dns_title = QLabel(f"启用本地 DNS 智能分流 (UDP {local_dns_server.port})")
+        self.lbl_dns_title = lbl_dns_title
         lbl_dns_title.setProperty("class", "ItemTitle")
         lbl_dns_title.setWordWrap(True)
         lbl_dns_desc = QLabel("开启轻量本地 DNS 解析服务，加速域名智能命中，普通公网域名透明递归转发")
@@ -3577,6 +3770,35 @@ class MainWindow(QMainWindow):
         self.sw_dns_mode.toggled.connect(self.on_dns_mode_toggled)
         row_dns.addWidget(self.sw_dns_mode)
         d_layout.addLayout(row_dns)
+
+        # 5.1b 域名重定向后端: Hosts 注入 vs NRPT 策略表
+        row_redir = QHBoxLayout()
+        r_redir_text = QVBoxLayout()
+        r_redir_text.setSpacing(2)
+        lbl_redir_title = QLabel("使用 NRPT 策略表重定向 (替代 Hosts 注入)")
+        lbl_redir_title.setProperty("class", "ItemTitle")
+        lbl_redir_title.setWordWrap(True)
+        lbl_redir_desc = QLabel(
+            "把加速域名的解析劫持交给 Windows 名称解析策略表: 不改动系统 Hosts 文件, "
+            "且后缀匹配天然覆盖整个子域。需管理员权限 + 本机 53/UDP 空闲, 不满足时自动回退 Hosts"
+        )
+        lbl_redir_desc.setProperty("class", "ItemDesc")
+        lbl_redir_desc.setWordWrap(True)
+        r_redir_text.addWidget(lbl_redir_title)
+        r_redir_text.addWidget(lbl_redir_desc)
+        row_redir.addLayout(r_redir_text)
+        row_redir.addStretch()
+
+        self.sw_redirect_nrpt = MDSwitch(checked=(normalize_redirect_mode(cfg) == MODE_NRPT))
+        self.sw_redirect_nrpt.toggled.connect(self.on_redirect_mode_toggled)
+        row_redir.addWidget(self.sw_redirect_nrpt)
+        d_layout.addLayout(row_redir)
+
+        self.lbl_nrpt_status = QLabel("")
+        self.lbl_nrpt_status.setProperty("class", "ItemDesc")
+        self.lbl_nrpt_status.setWordWrap(True)
+        d_layout.addWidget(self.lbl_nrpt_status)
+        self.refresh_nrpt_status_label()
 
         # 5.2 上游公共 DNS 预设胶囊
         row_presets = QHBoxLayout()
@@ -3993,17 +4215,51 @@ class MainWindow(QMainWindow):
         tip = "已设置为关闭主窗口时最小化到托盘" if action == "minimize_to_tray" else "已设置为关闭主窗口时完全退出程序"
         show_toast(self, tip, toast_type="info", duration=2000)
 
+    def _run_in_background(self, fn, on_done, busy_attr: str = ""):
+        """在后台线程执行重活, 完成后回 UI 线程回调
+
+        :param on_done: 在主线程接收结果 (可能为 Exception 实例)
+        :param busy_attr: 用于防重入的实例属性名 (同名 worker 运行期间忽略再次触发)
+        """
+        if busy_attr:
+            running = getattr(self, busy_attr, None)
+            if running is not None and running.isRunning():
+                return
+        worker = BackgroundTaskWorker(fn)
+
+        def _deliver(result):
+            # 投递后立即断开: 否则 worker → lambda → 窗口 形成循环引用, 解释器收尾时
+            # Qt 对象析构顺序不确定 (实测表现为退出时的访问违例)
+            try:
+                worker.done.disconnect(_deliver)
+            except Exception:
+                pass
+            on_done(result)
+
+        worker.done.connect(_deliver)
+        if busy_attr:
+            setattr(self, busy_attr, worker)
+        worker.start()
+
     def diagnose_hosts_action(self):
-        diag = hosts_mgr.diagnose_and_repair(auto_fix=True)
-        if diag.get("fixes"):
-            fix_str = "；".join(diag["fixes"])
-            show_toast(self, f"Hosts 修复成功: {fix_str}", toast_type="success", duration=4000)
-        elif diag.get("is_healthy"):
-            show_toast(self, "Hosts 文件状态健康，权限正常且无任何冲突残留！", toast_type="success", duration=3000)
-        else:
-            issue_str = "；".join(diag.get("issues", []))
-            show_toast(self, f"Hosts 存在异常: {issue_str}", toast_type="warning", duration=4000)
-        self._start_status_probe()
+        """Hosts 体检: 文件读写 + flushdns 子进程, 放后台执行"""
+        def _done(result):
+            if isinstance(result, Exception):
+                show_toast(self, f"Hosts 体检异常: {result}", toast_type="error", duration=4000)
+                return
+            diag = result or {}
+            if diag.get("fixes"):
+                fix_str = "；".join(diag["fixes"])
+                show_toast(self, f"Hosts 修复成功: {fix_str}", toast_type="success", duration=4000)
+            elif diag.get("is_healthy"):
+                show_toast(self, "Hosts 文件状态健康，权限正常且无任何冲突残留！", toast_type="success", duration=3000)
+            else:
+                issue_str = "；".join(diag.get("issues", []))
+                show_toast(self, f"Hosts 存在异常: {issue_str}", toast_type="warning", duration=4000)
+            self._start_status_probe()
+
+        self._run_in_background(lambda: hosts_mgr.diagnose_and_repair(auto_fix=True),
+                                _done, busy_attr="_hosts_diag_worker")
 
     def restore_hosts_action(self):
         ok, msg = hosts_mgr.restore_default_windows_hosts()
@@ -4018,11 +4274,18 @@ class MainWindow(QMainWindow):
             show_toast(self, "请输入合法的端口号 (1-65535)", toast_type="error", duration=2500)
             return
 
-        alive = check_proxy_alive(host, port)
-        if alive:
-            show_toast(self, f"测速代理连通正常！({host}:{port} 响应活跃)", toast_type="success", duration=3000)
-        else:
-            show_toast(self, f"测速代理连接超时 ({host}:{port} 未处于监听状态)", toast_type="warning", duration=3500)
+        def _done(result):
+            if isinstance(result, Exception):
+                show_toast(self, f"测速代理检测异常: {result}", toast_type="error", duration=3000)
+                return
+            if result:
+                show_toast(self, f"测速代理连通正常！({host}:{port} 响应活跃)", toast_type="success", duration=3000)
+            else:
+                show_toast(self, f"测速代理连接超时 ({host}:{port} 未处于监听状态)", toast_type="warning", duration=3500)
+
+        # check_proxy_alive 是带超时的真实连接 (实测约 1s), 放后台避免点击即卡
+        self._run_in_background(lambda: check_proxy_alive(host, port), _done,
+                                busy_attr="_proxy_test_worker")
 
     def on_proxy_config_changed(self):
         host = self.txt_proxy_host.text().strip() or "127.0.0.1" if hasattr(self, 'txt_proxy_host') else "127.0.0.1"
@@ -4036,14 +4299,29 @@ class MainWindow(QMainWindow):
         save_config(cfg)
 
     def install_cert_action(self):
-        ok, msg = cert_mgr.install_cert()
-        show_toast(self, msg, toast_type="success" if ok else "error", duration=3000)
-        self._start_status_probe()
+        """安装根证书: PowerShell/certutil 子进程 + 信任库清理, 放后台执行"""
+        def _done(result):
+            if isinstance(result, Exception):
+                show_toast(self, f"证书安装异常: {result}", toast_type="error", duration=3500)
+            else:
+                ok, msg = result
+                show_toast(self, msg, toast_type="success" if ok else "error", duration=3000)
+            self._start_status_probe()
+
+        self._run_in_background(lambda: cert_mgr.install_cert(), _done,
+                                busy_attr="_cert_install_worker")
 
     def uninstall_cert_action(self):
-        ok, msg = cert_mgr.uninstall_cert()
-        show_toast(self, msg, toast_type="info", duration=3000)
-        self._start_status_probe()
+        def _done(result):
+            if isinstance(result, Exception):
+                show_toast(self, f"证书卸载异常: {result}", toast_type="error", duration=3500)
+            else:
+                ok, msg = result
+                show_toast(self, msg, toast_type="info", duration=3000)
+            self._start_status_probe()
+
+        self._run_in_background(lambda: cert_mgr.uninstall_cert(), _done,
+                                busy_attr="_cert_uninstall_worker")
 
     def _get_cache_size_str(self) -> str:
         try:
@@ -4188,6 +4466,12 @@ class MainWindow(QMainWindow):
             )
 
     def quit_application(self):
+        """托盘「完全退出」: 必须**同步**完成清理后再退出
+
+        清理绝不能依赖 atexit: 顺序不可控, 且 safe_shutdown 若抛异常会直接跳过清理 ——
+        残留的 NRPT 规则会把数百个域名指向无人监听的 127.0.0.1:53, 造成整机解析失败
+        (实测事故)。因此用 try/finally 确保清理一定执行, 并复查结果。
+        """
         print("[GameArt Toolkit] 正在完全退出程序...")
         if hasattr(self, 'tray') and self.tray:
             self.tray.hide()
@@ -4197,8 +4481,25 @@ class MainWindow(QMainWindow):
                 nginx_mgr.clear_cache()
             except Exception:
                 pass
-        self.safe_shutdown()
-        emergency_fast_cleanup()
+        result = {}
+        try:
+            self.safe_shutdown()
+        except Exception as e:
+            # 必须吞掉: 这是退出流程, 让异常传播会跳过下面的清理与 QApplication.quit(),
+            # 用户点「完全退出」将毫无反应 (实测由单测发现)
+            print(f"[GameArt Toolkit] 关闭定时器/线程时异常 (已忽略并继续退出): {e}")
+        finally:
+            # 无论 safe_shutdown 是否异常, 清理都必须执行
+            result = emergency_fast_cleanup()
+
+        if isinstance(result, dict) and not result.get("ok", True):
+            detail = result.get("detail") or "退出清理未完全成功"
+            print(f"[GameArt Toolkit] 退出清理告警: {detail}")
+            try:
+                self.notify_tray("清理未完全成功", f"{detail}；下次以管理员身份启动时会自动回收。",
+                                 QSystemTrayIcon.Warning, 6000)
+            except Exception:
+                pass
         QApplication.quit()
 
     def init_timers(self):
@@ -4217,7 +4518,7 @@ class MainWindow(QMainWindow):
         self.watchdog_timer.start(8000)
 
     def update_traffic_metrics(self):
-        is_acc = nginx_mgr.is_running() and hosts_mgr.is_applied()
+        is_acc = nginx_mgr.is_running() and self._is_redirect_active()
         if is_acc:
             # 维持加速链路活跃脉冲 (模拟平稳基线)
             base_down = random.uniform(10.0, 85.0)
@@ -4343,6 +4644,45 @@ class MainWindow(QMainWindow):
         if getattr(self, "_startup_flow_in_progress", False):
             return
 
+        # NRPT 存活兜底必须最先做: 规则生效而本机解析器已死时, 命中域名在整机范围内解析
+        # 失败 (查询被导向无人监听的 127.0.0.1:53)。此时"重启 nginx"毫无用处, 必须先把
+        # 解析器拉起来; 拉不起来就只能撤规则回退 Hosts, 绝不能把这个状态留着。
+        if REDIRECT_STATE.get("backend") == MODE_NRPT:
+            try:
+                dns_alive = local_dns_server.is_running() and local_dns_server.port == NRPT_DNS_PORT
+            except Exception:
+                dns_alive = False
+            if not dns_alive:
+                ok, msg = local_dns_server.ensure_bind(NRPT_DNS_PORT)
+                if ok:
+                    print(f"[Watchdog] NRPT 解析器已恢复监听 53: {msg}")
+                else:
+                    print(f"[Watchdog] NRPT 解析器无法监听 53 ({msg}), 撤除规则回退 Hosts")
+                    self._remove_redirect()
+                    self.notify_tray("解析器异常", f"本机解析器无法监听 53 ({msg})，已撤除 NRPT 规则。",
+                                     QSystemTrayIcon.Warning, 4000)
+                    return
+
+        # ECH 隧道存活兜底: 上游已指向隧道 (upstream-dynamic.conf 里写着 127.0.0.1:<隧道端口>)
+        # 而隧道进程已死时, 每个请求都会得到 **502** —— 实测事故: 隧道进程退出后 discord 全站 502,
+        # 而看门狗只查 nginx/hosts, 永远不会发现这个问题, 会一直坏到用户下次手动应用。
+        try:
+            from path_utils import NGINX_DIR as _NGINX_DIR
+            from nginx_generator import NginxConfGenerator as _Gen
+            ech_in_use = bool(_Gen._ech_services_from_upstream(
+                _NGINX_DIR / "conf" / "upstream-dynamic.conf"))
+        except Exception:
+            ech_in_use = False
+        if ech_in_use and not ech_tunnel.is_running():
+            ok, msg = self._start_ech_tunnel()
+            print(f"[Watchdog] ECH 隧道未运行, 已尝试重启: {ok} {msg}")
+            if ok:
+                try:
+                    nginx_mgr.reload()
+                except Exception:
+                    pass
+            return
+
         cfg = load_config()
         if not cfg.get("auto_proxy", True):
             return
@@ -4350,86 +4690,167 @@ class MainWindow(QMainWindow):
         if self._is_manually_stopped:
             return
 
-        if self._has_prompted_hosts_perm and not hosts_mgr.is_applied():
+        if self._has_prompted_hosts_perm and not self._is_redirect_active():
             return
 
         is_nginx = nginx_mgr.is_running()
-        is_hosts = hosts_mgr.is_applied()
+        is_hosts = self._is_redirect_active()
 
         if not is_nginx or not is_hosts:
             self.start_acceleration(show_toast_on_fail=False)
 
+    # ------------------ 域名重定向后端 (Hosts / NRPT) 分派 ------------------
+
+    def _is_redirect_active(self) -> bool:
+        """加速劫持是否已生效 (Hosts 或 NRPT 任一后端生效即为真, 覆盖回退场景)
+
+        性能注意: NRPT 后端的 is_applied 要走一次 PowerShell 查询 (进程启动开销 ~0.8s),
+        而本方法会被每 8 秒的看门狗定时器与多处 UI 回调调用 —— 若每次都查, NRPT 模式下
+        界面会周期性卡顿。因此优先信任本进程记录的后端状态 (配合"本机解析器是否已在 53
+        端口服务"这一即时判据), 仅在状态未知时才回落到真实查询。
+        """
+        if REDIRECT_STATE.get("backend") == MODE_NRPT:
+            try:
+                if local_dns_server.is_running() and local_dns_server.port == NRPT_DNS_PORT:
+                    return True
+            except Exception:
+                pass
+        try:
+            return is_redirect_applied(load_config(), hosts_mgr, nrpt_mgr)
+        except Exception:
+            try:
+                return hosts_mgr.is_applied()
+            except Exception:
+                return False
+
+    def _apply_redirect(self, services: List[str]) -> Tuple[bool, str]:
+        """按 redirect_mode 应用域名重定向, 前置条件不足时自动回退 Hosts"""
+        return apply_redirect(load_config(), services, hosts_mgr, nrpt_mgr,
+                              local_dns_server, REDIRECT_STATE)
+
+    def _remove_redirect(self) -> Tuple[bool, str]:
+        """幂等清理两种后端的全部残留, 并恢复本机解析器默认端口"""
+        return remove_redirect(load_config(), hosts_mgr, nrpt_mgr,
+                               local_dns_server, REDIRECT_STATE)
+
     def toggle_acceleration(self):
-        is_acc = nginx_mgr.is_running() and hosts_mgr.is_applied()
+        is_acc = nginx_mgr.is_running() and self._is_redirect_active()
         if is_acc:
             self.stop_acceleration()
         else:
             self.start_acceleration(show_toast_on_fail=True)
 
-    def start_acceleration(self, show_toast_on_fail: bool = False):
+    def start_acceleration(self, show_toast_on_fail: bool = False, blocking: bool = False):
+        """启动加速 (域名重定向 + ECH 隧道 + Nginx + L4 Relay + 健康巡检)
+
+        为什么默认异步执行: 本流程包含证书安装 (子进程)、重定向写入 (NRPT 模式下含 PowerShell)、
+        ECH 隧道拉起与健康等待、Nginx 启动与端口等待、relay 启动、git 配置子进程 —— 合计数秒。
+        它既被【启动加速】按钮调用, 也被"测速完成后再启用代理"的完成回调调用, 同步执行就是
+        一次明显的界面冻结 (实测 UI 线程重活 7 处)。
+        blocking=True 仅供自动化测试与非 UI 线程调用方使用。
+        """
         if getattr(self, "_startup_flow_in_progress", False):
             self._startup_flow_in_progress = False
-            if self._startup_cdn_worker and self._startup_cdn_worker.isRunning():
-                self._startup_cdn_worker.request_stop()
+            worker = self._startup_cdn_worker
+            if worker is not None and worker.isRunning():
+                worker.request_stop()
 
         self._is_manually_stopped = False
-        if not cert_mgr.is_cert_installed(force_refresh=False):
-            cert_mgr.install_cert()
 
-        cfg = load_config()
-        saved_services = cfg.get("enabled_services")
-        services = list(saved_services) if saved_services is not None else list(DEFAULT_ENABLED_SERVICES)
-        h_ok, h_msg = hosts_mgr.apply_rules(services)
-        if not h_ok:
-            if not self._has_prompted_hosts_perm:
-                self._has_prompted_hosts_perm = True
-                if show_toast_on_fail:
-                    show_toast(
-                        self, f"{h_msg} (需管理员权限修改 Hosts)",
-                        toast_type="warning", duration=6000,
-                        action_text="提权", on_action=elevate_relaunch
-                    )
-                else:
-                    self.notify_tray("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。", QSystemTrayIcon.Warning, 3000)
-            elif show_toast_on_fail:
-                show_toast(
-                    self, f"{h_msg} (需管理员权限修改 Hosts)",
-                    toast_type="warning", duration=6000,
-                    action_text="提权", on_action=elevate_relaunch
-                )
+        if blocking or threading.current_thread() is not threading.main_thread():
+            self._finish_start_acceleration(
+                self._start_acceleration_heavy(show_toast_on_fail), show_toast_on_fail)
             return
-        else:
+
+        self._run_in_background(
+            lambda: self._start_acceleration_heavy(show_toast_on_fail),
+            lambda res: self._finish_start_acceleration(res, show_toast_on_fail),
+            busy_attr="_accel_start_worker")
+
+    def _start_acceleration_heavy(self, show_toast_on_fail: bool) -> Dict[str, Any]:
+        """启动加速的重活部分 (后台线程执行, **不得触碰任何 Qt 对象**)"""
+        result: Dict[str, Any] = {"stage": "ok", "msg": "", "services": [],
+                                  "ech_ok": True, "ech_msg": "", "relay_ok": True, "relay_msg": "",
+                                  "prompted": self._has_prompted_hosts_perm}
+        try:
+            if not cert_mgr.is_cert_installed(force_refresh=False):
+                cert_mgr.install_cert()
+
+            cfg = load_config()
+            saved_services = cfg.get("enabled_services")
+            services = list(saved_services) if saved_services is not None else list(DEFAULT_ENABLED_SERVICES)
+            result["services"] = services
+
+            h_ok, h_msg = self._apply_redirect(services)
+            if not h_ok:
+                result.update(stage="redirect_fail", msg=h_msg)
+                if not self._has_prompted_hosts_perm:
+                    self._has_prompted_hosts_perm = True
+                    result["prompted"] = False
+                else:
+                    result["prompted"] = True
+                return result
             self._has_prompted_hosts_perm = False
 
-        # ECH 隧道必须先于 CDN 优化就绪: 生成 upstream 时会查询隧道健康状态来决定
-        # 是否让 ech_enabled 服务走隧道, 隧道未起会退回常规分支
-        ech_ok, ech_msg = self._start_ech_tunnel()
+            # ECH 隧道必须先于 CDN 优化就绪: 生成 upstream 时会查询隧道健康状态来决定
+            # 是否让 ech_enabled 服务走隧道, 隧道未起会退回常规分支
+            ech_ok, ech_msg = self._start_ech_tunnel()
+            result["ech_ok"], result["ech_msg"] = ech_ok, ech_msg
 
-        n_ok, n_msg = nginx_mgr.start()
-        if not n_ok:
-            hosts_mgr.remove_rules()
+            n_ok, n_msg = nginx_mgr.start()
+            if not n_ok:
+                self._remove_redirect()
+                result.update(stage="nginx_fail", msg=n_msg)
+                return result
+
+            relay_ok, relay_msg = self._start_relay()
+            result["relay_ok"], result["relay_msg"] = relay_ok, relay_msg
+            health_monitor.start(services)
+
+            # 为 Git / 开发生态注入作用域证书 (3 次 git 子进程, 放后台执行)
+            try:
+                cert_mgr.inject_dev_environments()
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            result.update(stage="error", msg=f"{type(e).__name__}: {e}")
+            return result
+
+    def _finish_start_acceleration(self, result: Dict[str, Any], show_toast_on_fail: bool):
+        """启动加速的界面收尾 (仅在 UI 线程执行)"""
+        stage = (result or {}).get("stage", "error")
+        if stage == "redirect_fail":
+            msg = result.get("msg", "")
+            if not result.get("prompted"):
+                if show_toast_on_fail:
+                    show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
+                               duration=6000, action_text="提权", on_action=elevate_relaunch)
+                else:
+                    self.notify_tray("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。",
+                                     QSystemTrayIcon.Warning, 3000)
+            elif show_toast_on_fail:
+                show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
+                           duration=6000, action_text="提权", on_action=elevate_relaunch)
+            return
+        if stage == "nginx_fail":
             if show_toast_on_fail:
-                show_toast(self, f"Nginx 启动失败: {n_msg}", toast_type="error", duration=4000)
+                show_toast(self, f"Nginx 启动失败: {result.get('msg', '')}", toast_type="error", duration=4000)
             else:
-                self.notify_tray("Nginx 启动提示", n_msg, QSystemTrayIcon.Warning, 2500)
+                self.notify_tray("Nginx 启动提示", result.get("msg", ""), QSystemTrayIcon.Warning, 2500)
+            return
+        if stage == "error":
+            show_toast(self, f"启动加速失败: {result.get('msg', '')}", toast_type="error", duration=4000)
             return
 
-        # 同步启动 L4 Relay 代理转发器 (预检端口 + 恢复既有 relay 路由) 与持续健康巡检
-        relay_ok, relay_msg = self._start_relay()
-        health_monitor.start(services)
-
-        # 为 Git / 开发生态注入作用域证书
-        try:
-            cert_mgr.inject_dev_environments()
-        except Exception:
-            pass
-
+        services = result.get("services") or []
         if show_toast_on_fail:
-            extra = f" | {relay_msg}" if relay_ok else f" | ⚠ {relay_msg}"
-            # ECH 隧道仅在异常时提示, 避免正常路径刷屏
-            if not ech_ok:
-                extra += f" | ⚠ ECH: {ech_msg}"
-            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}", toast_type="success", duration=2500)
+            extra = (f" | {result.get('relay_msg', '')}" if result.get("relay_ok")
+                     else f" | ⚠ {result.get('relay_msg', '')}")
+            if not result.get("ech_ok"):
+                extra += f" | ⚠ ECH: {result.get('ech_msg', '')}"
+            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}",
+                       toast_type="success", duration=2500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
@@ -4479,19 +4900,39 @@ class MainWindow(QMainWindow):
             pass
         return True, msg
 
-    def stop_acceleration(self):
+    def stop_acceleration(self, blocking: bool = False):
+        """停止加速 (停止数据平面 + 还原重定向与证书注入)
+
+        与 start_acceleration 同理默认异步: 其中含 relay/ECH/Nginx 进程停止、重定向还原
+        (hosts 写回 + flushdns, NRPT 模式还含 PowerShell 清理) 与证书注入还原。
+        """
         self._is_manually_stopped = True
+        if blocking or threading.current_thread() is not threading.main_thread():
+            self._stop_acceleration_heavy()
+            self._finish_stop_acceleration()
+            return
+        self._run_in_background(self._stop_acceleration_heavy,
+                                lambda _r: self._finish_stop_acceleration(),
+                                busy_attr="_accel_stop_worker")
+
+    def _stop_acceleration_heavy(self):
+        """停止加速的重活部分 (后台线程执行, 不得触碰 Qt 对象)"""
         health_monitor.stop()
         relay_server.stop()
         relay_server.clear_proxy_routes()
         ech_tunnel.stop()
-        hosts_mgr.remove_rules()
+        self._remove_redirect()
         try:
             cert_mgr.restore_dev_environments()
         except Exception:
             pass
         nginx_mgr.stop()
-        show_toast(self, "加速服务已停止，Hosts 规则已还原", toast_type="info", duration=2200)
+
+    def _finish_stop_acceleration(self):
+        """停止加速的界面收尾 (仅在 UI 线程执行)"""
+        backend = REDIRECT_STATE.get("backend")
+        cleaned = "NRPT 与 Hosts 规则均已还原" if backend is None else "重定向规则已还原"
+        show_toast(self, f"加速服务已停止，{cleaned}", toast_type="info", duration=2200)
         self._start_status_probe()
 
     def on_auto_proxy_toggled(self, checked: bool):
@@ -4500,10 +4941,25 @@ class MainWindow(QMainWindow):
         show_toast(self, f"自动托管代理已{state_str}", toast_type="info", duration=2000)
 
     def refresh_env_diagnostics_ui(self):
-        """刷新并展示系统网络环境与第三方代理诊断信息"""
+        """刷新系统网络环境与第三方代理诊断信息 (探测在后台线程, 不阻塞 UI)"""
+        worker = getattr(self, "_env_diag_worker", None)
+        if worker is not None and worker.isRunning():
+            return
         try:
-            diag = EnvDetector.get_full_diagnostics()
-            sys_p = diag["system_proxy"]
+            self.lbl_env_summary.setText("诊断结论: 正在探测本地代理端口...")
+        except Exception:
+            pass
+        self._env_diag_worker = EnvDiagnosticsWorker()
+        self._env_diag_worker.ready.connect(self._apply_env_diagnostics)
+        self._env_diag_worker.start()
+
+    def _apply_env_diagnostics(self, diag: dict):
+        """把后台诊断结果写进界面 (仅在 UI 线程执行)"""
+        try:
+            if diag.get("error"):
+                self.lbl_env_summary.setText(f"诊断异常: {diag['error']}")
+                return
+            sys_p = diag.get("system_proxy", {}) or {}
             if sys_p.get("enabled", False):
                 self.lbl_env_sys_proxy.setText(f"系统代理: 已开启 ({sys_p.get('server', '')})")
                 self.lbl_env_sys_proxy.setStyleSheet("color: #60A5FA; font-weight: bold;")
@@ -4522,8 +4978,78 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.lbl_env_summary.setText(f"诊断异常: {e}")
 
+    def refresh_nrpt_status_label(self):
+        """刷新 NRPT 后端能力状态 (系统支持 / 管理员权限 / 53 端口占用者)"""
+        if not hasattr(self, "lbl_nrpt_status"):
+            return
+        try:
+            if hasattr(self, "lbl_dns_title"):
+                self.lbl_dns_title.setText(f"启用本地 DNS 智能分流 (UDP {local_dns_server.port})")
+            caps = nrpt_mgr.capabilities()
+        except Exception as e:
+            self.lbl_nrpt_status.setText(f"NRPT 状态检测异常: {e}")
+            return
+
+        if caps.get("ready"):
+            port = caps.get("port53") or {}
+            ns = caps.get("name_server") or "127.0.0.1"
+            if port.get("family") == "ipv6":
+                # 共存说明必须显示: 用户会疑惑"53 明明被代理占了为什么还能用"
+                self.lbl_nrpt_status.setText(
+                    f"NRPT 前置条件已满足 (管理员权限); IPv4 53 被 {caps.get('port53_owner') or '代理'} 占用, "
+                    f"将改用 IPv6 回环 {ns}:53 共存")
+            else:
+                self.lbl_nrpt_status.setText(
+                    f"NRPT 前置条件已满足: 管理员权限 + 本机 53/UDP 空闲 ({ns}:53), 可直接启用")
+            self.lbl_nrpt_status.setStyleSheet("color: #34D399;")
+        else:
+            detail = caps.get("reason") or "前置条件不满足"
+            owner = caps.get("port53_owner")
+            if owner and owner not in detail:
+                detail += f"；当前占用 53 的进程: {owner}"
+            if not caps.get("admin"):
+                detail += "；提权后若 IPv4 53 被代理占用, 会自动改用 IPv6 回环 ::1 共存"
+            self.lbl_nrpt_status.setText(f"NRPT 暂不可用: {detail}")
+            self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
+
+    def on_redirect_mode_toggled(self, checked: bool):
+        """切换加速域名的重定向后端, 加速运行中即刻迁移, 未运行则随下次启动生效"""
+        update_config_key("redirect_mode", "nrpt" if checked else "hosts")
+        self.refresh_nrpt_status_label()
+
+        if not (nginx_mgr.is_running() or self._is_redirect_active()):
+            name = "NRPT 策略表" if checked else "Hosts 注入"
+            show_toast(self, f"域名重定向后端已设为 {name}（加速启动时生效）", toast_type="info", duration=2200)
+            return
+
+        cfg = load_config()
+        services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
+        ok, msg = self._apply_redirect(services)
+        self.refresh_nrpt_status_label()
+
+        if not ok:
+            show_toast(self, msg, toast_type="error", duration=4500)
+        elif REDIRECT_STATE.get("backend") == MODE_NRPT:
+            show_toast(self, f"已切换为 NRPT 重定向: {msg}", toast_type="success", duration=2800)
+        else:
+            note = REDIRECT_STATE.get("note") or ""
+            show_toast(self, f"已回退 Hosts 重定向: {note or msg}", toast_type="warning", duration=3500)
+
     def on_dns_mode_toggled(self, checked: bool):
         """响应本地 DNS 模式切换"""
+        cfg = load_config()
+
+        # NRPT 模式依赖本机解析器常驻 53 端口 (NRPT 的 NameServers 只能填 IP, 端口固定 53),
+        # 关掉它会让加速域名直接解析失败, 因此在 NRPT 生效期间强制保持开启
+        if not checked and normalize_redirect_mode(cfg) == MODE_NRPT and self._is_redirect_active():
+            update_config_key("dns_mode_enabled", True)
+            if hasattr(self, "sw_dns_mode"):
+                self.sw_dns_mode.blockSignals(True)
+                self.sw_dns_mode.setCheckedNoAnim(True)
+                self.sw_dns_mode.blockSignals(False)
+            show_toast(self, "NRPT 模式依赖本地 DNS 常驻 53 端口，已保持开启", toast_type="warning", duration=2800)
+            return
+
         update_config_key("dns_mode_enabled", checked)
         if checked:
             ok, msg = local_dns_server.start()
@@ -4531,6 +5057,7 @@ class MainWindow(QMainWindow):
         else:
             local_dns_server.stop()
             show_toast(self, "本地 DNS 服务已停止", toast_type="info", duration=2000)
+        self.refresh_nrpt_status_label()
 
     def on_health_heal_toggled(self, checked: bool):
         """响应持续健康巡检与故障自愈切换"""
@@ -4584,6 +5111,33 @@ def main():
         except Exception as e:
             print(f"[CleanHosts Error] {e}")
         sys.exit(0)
+
+    # 注册退出清理。必须放在上面那条纯命令行分支之后 (卸载器只期望清 hosts),
+    # 且必须是主程序入口而非模块级 —— 见 _register_exit_cleanup 的说明。
+    _register_exit_cleanup()
+
+    # 0.5 清理上一会话遗留的重定向 (异常退出/被强杀时会残留)。
+    # 必须在建窗口前做: NRPT 残留会把 ~数百个域名指向无人监听的 127.0.0.1:53, 在整机范围
+    # 内造成解析失败, 而用户此时可能根本不打算启动加速 —— 实测事故见 redirect_manager
+    # .cleanup_orphans 的说明。此处的判定口径是"数据平面未运行 = 上一会话的孤儿"。
+    if "--clean-redirect-silent" in sys.argv:
+        try:
+            from redirect_manager import cleanup_orphans
+            res = cleanup_orphans(load_config(), hosts_mgr, nrpt_mgr, local_dns_server,
+                                  data_plane_alive=nginx_mgr.is_running())
+            print(f"[CleanRedirect] {res.get('detail', '')}")
+        except Exception as e:
+            print(f"[CleanRedirect Error] {e}")
+        sys.exit(0)
+
+    try:
+        from redirect_manager import cleanup_orphans
+        _orphan = cleanup_orphans(load_config(), hosts_mgr, nrpt_mgr, local_dns_server,
+                                  data_plane_alive=nginx_mgr.is_running())
+        if _orphan.get("cleaned"):
+            print(f"[Startup] {_orphan.get('detail')}")
+    except Exception as e:
+        print(f"[Startup] 重定向残留清理跳过: {e}")
 
     # 1. 如果通过控制台或旧批处理启动，静默隐藏终端窗口
     hide_console_window()

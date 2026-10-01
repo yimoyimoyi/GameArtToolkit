@@ -38,6 +38,11 @@ LOG_FILE = NGINX_DIR / "logs" / "ech-tunnel.log"
 ECH_PORT_BASE = 44401
 PROCESS_NAME = "ech-tunnel.exe"
 
+# 上次启动隧道时使用的域名白名单。隧道只在启动时读取白名单, 复用一个白名单
+# 已过期的进程会让新增域名静默不通 (升级后 profile 的 domains 变化即触发,
+# 表现为部分站点无响应且无任何报错, 极难排查), 故落盘以便比对是否需要重启。
+DOMAINS_STATE_FILE = NGINX_DIR / "logs" / "ech-tunnel.domains"
+
 # DoH 端点: 仅作 ECHConfig 自举与域名解析的补充路径。实测境内 DoH 对受限
 # 域名会间歇性返回污染结果, 真正可靠的是域名自带的静态 IP 池, 因此这里的
 # 端点失败不影响可用性 (隧道内部有网段过滤与池回退)。
@@ -82,6 +87,32 @@ class EchTunnelManager:
         }
 
     # ------------------------------------------------------------------
+    # 域名白名单状态 (决定能否复用已在运行的隧道进程)
+    # ------------------------------------------------------------------
+    def _save_domains(self, domains: List[str]) -> None:
+        try:
+            DOMAINS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DOMAINS_STATE_FILE.write_text("\n".join(domains), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _domains_unchanged(self, domains: List[str]) -> bool:
+        """在运行的隧道其白名单是否与本请求一致
+
+        读不到状态文件时保守返回 False —— 宁可重启一次, 也不要沿用白名单未知的
+        进程。误判代价不对称: 多重启一次的代价是启动慢几百毫秒, 而沿用过期白名单
+        的代价是部分域名静默不通。
+        """
+        try:
+            if not DOMAINS_STATE_FILE.exists():
+                return False
+            saved = [d for d in DOMAINS_STATE_FILE.read_text(
+                encoding="utf-8", errors="ignore").splitlines() if d]
+            return saved == list(domains)
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
     def build_command(
@@ -110,7 +141,11 @@ class EchTunnelManager:
         doh_endpoints: Optional[List[str]] = None,
         force_restart: bool = False,
     ) -> Tuple[bool, str]:
-        """启动隧道。已在运行且 force_restart=False 时直接返回成功。"""
+        """启动隧道。已在运行且白名单一致时直接返回成功。
+
+        复用判据是"进程在 + 白名单一致", 不能只看进程: 隧道只在启动时读取域名
+        白名单, 复用一个白名单已过期的进程会让新增域名静默不通。
+        """
         if not self.exe_path.exists():
             return False, (
                 f"未找到隧道可执行文件: {self.exe_path}\n"
@@ -121,7 +156,7 @@ class EchTunnelManager:
             return False, "未指定任何域名白名单, 拒绝启动 (隧道将不限制目标域名)"
 
         if self.is_running():
-            if not force_restart:
+            if not force_restart and self._domains_unchanged(domains):
                 return True, f"ECH 隧道已在运行 ({self.get_pids()})"
             self.stop()
             time.sleep(0.3)
@@ -149,6 +184,7 @@ class EchTunnelManager:
             for _ in range(20):
                 time.sleep(0.1)
                 if self.is_healthy():
+                    self._save_domains(domains)  # 记录本次白名单, 供下次比对
                     return True, f"ECH 隧道启动成功 (127.0.0.1:{self.port}, {len(domains)} 个域名)"
             if self.is_running():
                 return False, f"ECH 隧道进程已起但端口 {self.port} 未监听, 详见 {LOG_FILE}"

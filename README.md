@@ -26,6 +26,24 @@
   - **开发者与 AI 生态**：GitHub 主站 Web/API、GitHub 静态资产与 Raw 直连、GitHub Releases 附件极速下载 (L4 Relay 旁路直通)、GitHub 前端 JS/CSS CDN、GitHub S3 大文件对象存储 (Release 安装包与 Issue 上传图片)、GitLab 国际版、HuggingFace 模型权重 LFS 直连与全套图片 CDN (缩略图/头像/资产图)、Cloudflare Turnstile 与 hCaptcha 人机验证码加速、公共前端 CDN (jsDelivr / unpkg / cdnjs) 矩阵加速。
   - **本地磁盘二级缓存**：二次打开插画与静态资源实现本地 0ms 闪电响应。
   - **L4 Relay 旁路隧道**：针对直连受阻的海外服务，自动经由本地上游代理端口透明转发，无需修改系统全局代理。
+  - **域名劫持双后端 (Hosts / NRPT)**：可在「系统 Hosts 注入」与「Windows NRPT 名称解析策略表」之间切换。NRPT 后端不改动 Hosts 文件，且后缀匹配天然覆盖整棵子域树，代价是需管理员权限并独占 53/UDP；前置条件不满足时按配置自动回退 Hosts，并把回退原因（含 53 端口占用进程名）显示在设置页。
+  - **替代路线解锁（按站点选最轻通道）**：对"TCP 侧 TLS 标准 SNI 被 RST / 被污染"的站点，逐站点选择
+    真正需要的那一层，**全部无需第三方代理**：
+    - **厂商化伪 SNI 掩护**（Fastly / Akamai 实测接受跨租户掩护 SNI）→ 已解 `imgur` / `myanimelist` / **`reddit`**
+      （实测 `cover=www.fastly.com` @199.232.16x.140 → 200 + `CN=*.reddit.com`）；
+    - **本地 ECH 隧道**（项目自带 Go 组件，加密内层 SNI）→ 已解 `discord`（Cloudflare 拒绝跨租户掩护 SNI，
+      四种掩护组合实测全 403；经隧道实测 200 + 真实 HTML），并同时承载 `pixiv_web` / `booth_pm`；
+    - **普通自身 SNI** → `stackoverflow`（实测 @198.252.206.1 返回 302 且证书匹配，早期按 QUIC 处理属配置错误）；
+    - **HTTP/3(QUIC) 直连**保留为**备选通道**与内置「QUIC 直连」启动器（强制 h3，无需管理员）。
+    ⚠️ **重要实测结论（2026-10-01，netlog 实证）**：本机 DNS 只能**修正被污染的 A 记录**，
+    但**默认浏览器不会因此改走 HTTP/3** —— Chrome 在非安全 DNS（`secure_dns_mode=0`）下不会采用 HTTPS RR 的
+    `alpn`，仍只用 TCP（`HTTP_STREAM_JOB expect_spdy=false`）。因此把"浏览器自行走 h3"当作前提的方案不可靠，
+    已按上表改为"由本机 nginx 终止浏览器 TLS、上游腿选可用通道"，**默认浏览器零配置即可打开**。
+    实测数据与复现脚本见 [docs/uplift-route-findings.md](docs/uplift-route-findings.md) 第十四～十六节。
+  - **QUIC 独立测速与自愈**：QUIC 直连类服务的 TCP 侧必然被 RST，常规测速对它们只会给出"全挂"的假阴性 ——
+    因此为它们单独建立**真实 QUIC 握手 + HTTP/3 请求**的测速通道，优选结果持久化到 `config.quic_optimal_ips`，
+    并由本机解析器与 Hosts 消费；健康巡检发现主力节点失效时自动切换并落盘。
+    （QUIC 探测不依赖可选库：缺 `aioquic` 时自动回退到标准库+cryptography 的 Initial 探测。）
 
 - **⚡ 全网 CDN 节点双通道测速与热重载**
   - 多线程高并发探测全部候选节点 TLS / TCP 握手延迟。
@@ -128,6 +146,8 @@ GameArtToolkit/
 │   ├── l4_relay.py          # L4 TCP SNI 透明代理隧道
 │   ├── cert_manager.py      # Windows CryptoAPI 原生根证书自检与静默管理
 │   ├── hosts_manager.py     # 标签化 Hosts 原子读写、体检修复与备份轮转
+│   ├── nrpt_manager.py      # Windows NRPT 策略表域名重定向后端 (能力探测/规则增删/体检)
+│   ├── redirect_manager.py  # 域名重定向后端分派 (Hosts / NRPT 切换、回退与幂等清理)
 │   ├── config_store.py      # 配置原子持久化与自动迁移
 │   ├── ip_pool.py           # 兼容层服务导出字典与候选池索引
 │   ├── frameless_helper.py  # Win32 DWM 原生无边框与贴靠布局支持
@@ -151,9 +171,13 @@ GameArtToolkit/
 1. **80 / 443 端口占用**：本地加速需要绑定 80 与 443 端口。若被 IIS、Skype 或 VMware 占用，请在设置页面中进行端口诊断并释放对应端口。
 2. **退出 Hosts 自动还原**：程序正常关闭或系统异常关机时均会自动还原系统 Hosts；下次启动时若检测到残留亦会自动体检修复。
 3. **Steam 账号安全保证**：免密切换功能基于 Steam 官方在本地生成的凭据配置 (`loginusers.vdf`)，本程序不涉及任何用户密码或令牌的网络传输。
+4. **NRPT 重定向开关显示"暂不可用"**：NRPT 的 DNS 目标端口固定为 53，若本机 53/UDP 已被 Clash Verge 等代理的 DNS 覆写占用，则无法启用（设置页会直接标出占用进程名）。此时可继续使用 Hosts 后端，或在代理软件中关闭 DNS 覆写 / 把其 DNS 监听端口改到非 53 端口后再开启。设计说明见 [docs/nrpt-redirect-design.md](docs/nrpt-redirect-design.md)。
+5. **受信任根证书里有一堆历史证书**：早期版本的卸载路径 `certutil -delstore` 对根证书是空操作（返回成功但并未删除），导致每次 CA 重新生成都会在受信任根里新增一个永不回收的证书。现已改为 crypt32 原生删除 + **删除后复查确认**，并在每次安装前自动清理历史代际。清理既有残留需管理员权限：`python -m app.cert_manager --report` 查看、`--prune` 执行。详见 [docs/cert-trust-hygiene.md](docs/cert-trust-hygiene.md)。
 
 ---
 
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 授权开源。
+
+第三方参考与许可边界说明（含被参考项目的许可核查、"明确未取用"清单与干净室记录）见 [docs/third-party-provenance.md](docs/third-party-provenance.md)。

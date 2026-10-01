@@ -51,6 +51,26 @@ PSEUDO_SNI_SERVICES = {p_id for p_id, m in SNI_MODES.items() if m not in ("host"
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
 SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
 
+# 上游节点熔断策略 (写进 upstream-dynamic.conf 的 server 行)
+#
+# 为什么是 max_fails=1 / fail_timeout=5s (而非早期的 3 / 30s):
+#   实测 GFW 的封锁是**逐段分钟级轮换** —— 日志里同段三个主力可同时 "while connecting"
+#   超时, 而数秒后的独立探测又全部可达。3 次失败才熔断, 意味着一次段封锁期内要白白
+#   失败 3 轮请求; 30s 的熔断期又跨过了封锁段的实际轮换周期, 结果是"节点早已不可达,
+#   却仍在被轮询"。改为 1 次即熔断 + 5s 后重试: 坏节点在一个请求内被踢出, 封锁解除后
+#   5s 内自动回归, 与轮换周期同量级。
+UPSTREAM_MAX_FAILS = 1
+UPSTREAM_FAIL_TIMEOUT = "5s"
+
+# QUIC 直连服务的单节点测速预算 (秒)。QUIC 握手正常在 250ms 内完成, 6s 已足够覆盖
+# 跨洋高丢包; 该值同时作为 aioquic 的 idle_timeout 上限, 避免静默丢包时按默认 60s 空等。
+QUIC_PROBE_TIMEOUT = 6.0
+
+
+def _upstream_server_opts() -> str:
+    """生成 server 行的熔断参数"""
+    return f"max_fails={UPSTREAM_MAX_FAILS} fail_timeout={UPSTREAM_FAIL_TIMEOUT}"
+
 
 @dataclass(frozen=True)
 class ProbeDefaults:
@@ -274,6 +294,27 @@ _DOH_CACHE: Dict[str, Tuple[float, List[str]]] = {}
 _DOH_CACHE_LOCK = threading.Lock()
 _DOH_CACHE_TTL = 600.0  # 10 分钟有效
 
+# DoH 专用 opener: ProxyHandler({}) 表示"不使用任何代理", 同时继承系统 CA
+_DOH_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _doh_fetch(url: str, timeout: float) -> bytes:
+    """DoH 请求发出口 (独立函数便于单测打桩, 返回原始响应体)
+
+    必须走独立 opener 而非 urllib.request.urlopen: 探测链路若命中系统代理,
+    代理的 Fake-IP 会污染解析结果, 必须显式绕过代理。
+    注意不能用 Request.set_proxy("", "https") 来禁代理 —— 该调用会把 req.host
+    置为空串, 请求退化为 URLError("no host given") 并被调用方的 except 静默吞掉,
+    使整条 DoH 通道恒返回空 (实测修复前对任何域名都是空, 候选池因此彻底丧失
+    自补充能力)。
+    """
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/dns-json",
+        "User-Agent": "GameArtToolkit/2.0",
+    })
+    with _DOH_OPENER.open(req, timeout=timeout) as resp:
+        return resp.read()
+
 
 def clear_doh_cache() -> None:
     """清空 DoH 解析内存缓存 (供单测隔离与手动重置使用)"""
@@ -292,7 +333,7 @@ def doh_resolve(domain: str, timeout: float = 3.0,
     """
     if not domain:
         return []
-    
+
     if use_cache:
         now = time.monotonic()
         with _DOH_CACHE_LOCK:
@@ -304,14 +345,7 @@ def doh_resolve(domain: str, timeout: float = 3.0,
     for base in (endpoints or DOH_ENDPOINTS):
         try:
             url = f"{base}?name={domain}&type=A"
-            req = urllib.request.Request(url, headers={
-                "Accept": "application/dns-json",
-                "User-Agent": "GameArtToolkit/2.0",
-            })
-            req.set_proxy("", "http")
-            req.set_proxy("", "https")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            payload = json.loads(_doh_fetch(url, timeout).decode("utf-8", errors="replace"))
             ips = [a.get("data", "") for a in payload.get("Answer", [])
                    if a.get("type") == 1 and ":" not in a.get("data", "")]
             clean = [ip for ip in ips if not ip.startswith(POLLUTED_IP_PREFIXES) and is_valid_public_cdn_ip(ip)]
@@ -854,9 +888,24 @@ class CDNOptimizer:
         self.last_ech_services: set = set()
         # 标记了 ech_enabled 但隧道未就绪、已退回常规分支的服务
         self.last_ech_degraded: set = set()
+        # 单轮生成内的兜底探测缓存 (key=ip, value=(ok, latency))
+        # 各服务的候选池大量重叠 (如 github_raw/release/assets 共用 185.199.108-111 段),
+        # 按 IP 去重后同一轮只需探测一次。实测全量兜底 33 个服务串行重复探测耗时 105s,
+        # 去重后只剩约 113 个唯一 IP 的探测量。
+        self._probe_cache: Dict[str, Tuple[bool, Optional[float]]] = {}
 
     def test_service_dual(self, srv_id: str, max_workers: Optional[int] = None) -> List[Dict]:
-        """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)"""
+        """单服务双通道探测 (直连 + 经本地代理 CONNECT 隧道, 供健康巡检自愈调用)
+
+        QUIC 直连服务必须分流到真实 QUIC 探测: 它们的 TCP 侧必然全挂, 走下面的 TCP/TLS
+        路径会让**单项测速按钮**恒显示失败 (界面表现即"检测失败"), 这是纯误报。
+        """
+        profile = PROFILES_BY_ID.get(srv_id)
+        if getattr(profile, "skip_cdn_probe", False):
+            holder: Dict[str, List[Dict]] = {srv_id: []}
+            self._probe_quic_services(holder)
+            return holder.get(srv_id) or []
+
         if max_workers is None:
             max_workers = int(load_config().get("cdn_max_workers", 16))
         ips = CANDIDATE_IPS.get(srv_id, [])
@@ -864,6 +913,12 @@ class CDNOptimizer:
 
     def test_group(self, group_name: str, ip_list: List[str], max_workers: int = 16) -> List[Dict]:
         """测试指定服务的一组候选 IP (双通道三态探测, 自动补充 DNS 当前解析节点, 遵从 IPv4/v6 偏好)"""
+        # 直接以 test_group 调用进 QUIC 服务时同样分流 (工具箱测速页可能直接调它)
+        profile = PROFILES_BY_ID.get(group_name)
+        if getattr(profile, "skip_cdn_probe", False):
+            holder: Dict[str, List[Dict]] = {group_name: []}
+            self._probe_quic_services(holder)
+            return holder.get(group_name) or []
         cfg = load_config()
         # 服务级档位优先 (profile.probe_timeout), 回退全局 cdn_timeout_seconds
         timeout = probe_timeout_for(group_name, float(cfg.get("cdn_timeout_seconds", 1.5)))
@@ -948,10 +1003,17 @@ class CDNOptimizer:
 
         target_set = set(filter_services) if filter_services is not None else None
 
+        # 跳过 TCP/TLS 探测的服务 (QUIC 直连类: 其 TCP 侧 SNI 本就被 RST, 探测只会得到
+        # 假阴性并把静态实测 IP 判死; 这类服务的 IP 由实测数据静态维护)
+        skip_probe_ids = {sid for sid, p in PROFILES_BY_ID.items()
+                          if getattr(p, "skip_cdn_probe", False)}
+
         # 1. 异步并发预热所有服务域名的 DoH 缓存 (0ms 消除主循环串行阻塞)
         domains_to_preload = []
         for srv_id in CANDIDATE_IPS:
             if target_set is not None and srv_id not in target_set:
+                continue
+            if srv_id in skip_probe_ids:
                 continue
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
@@ -964,6 +1026,8 @@ class CDNOptimizer:
         all_unique_ips = set()
         for srv_id, ips in CANDIDATE_IPS.items():
             if target_set is not None and srv_id not in target_set:
+                continue
+            if srv_id in skip_probe_ids:
                 continue
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
@@ -1055,8 +1119,19 @@ class CDNOptimizer:
                 results_by_srv[srv_id].append(item)
             executor.shutdown(wait=False, cancel_futures=True)
 
+        # 5.5 QUIC 直连服务: 用真实 QUIC 握手测速替换 (必须在此处完成, 不能放到 apply_optimal)
+        #     这类服务在 TCP 侧必然全挂, 若不在此替换, 第 6 步的"补齐未完成项"会把它们全部
+        #     标成 rank3 不可用 —— UI 表现为"测速失败"; 同时又因为 apply_optimal 是在 UI 线程
+        #     被按钮回调调用, 若把真实 QUIC 握手放在那里就会**冻结界面**。测速必须在 worker 里做。
+        #     总开关停用时整体跳过 (见 quic_probe.QUIC_ENABLED), 此时线上也没有 QUIC_DIRECT 画像。
+        self._probe_quic_services(results_by_srv)
+
         # 6. 补齐未完成/兜底项并按统一排序键 (rank → 协议偏好 → 稳定段 → 延迟) 保序排序
         for srv_id, items in results_by_srv.items():
+            if getattr(PROFILES_BY_ID.get(srv_id), "skip_cdn_probe", False):
+                # QUIC 直连服务的候选项已由 _probe_quic_services 完整给出, 不再补 rank3 噪声项
+                items.sort(key=lambda x: _service_sort_key(x, ip_mode, None))
+                continue
             done_ips = {it["ip"] for it in items}
             for expected_ip in CANDIDATE_IPS.get(srv_id, []):
                 if ip_mode == "ipv4_only" and ":" in expected_ip:
@@ -1074,7 +1149,8 @@ class CDNOptimizer:
         #    复核结果直接替换该服务结果; 复核后仍低存活则保留诚实结果。
         if target_set is None or len(target_set) > 1:
             recheck_list = [sid for sid, items in results_by_srv.items()
-                            if items and sum(1 for it in items if it.get("rank", 3) == 0) < 3]
+                            if items and sum(1 for it in items if it.get("rank", 3) == 0) < 3
+                            and not getattr(PROFILES_BY_ID.get(sid), "skip_cdn_probe", False)]
             if recheck_list:
                 rlock = threading.Lock()
 
@@ -1095,6 +1171,78 @@ class CDNOptimizer:
 
         return results_by_srv
 
+    def _probe_quic_services(self, results_by_srv: Dict[str, List[Dict]]) -> None:
+        """为 QUIC 直连服务写入真实 QUIC 测速结果 (在测速 worker 线程内执行)
+
+        为什么必须在测速阶段完成, 而不是在 apply_optimal 里补:
+          1. apply_optimal 由 UI 线程的按钮回调直接调用 —— 在其中做真实 QUIC 握手会冻结界面;
+          2. 本阶段结果会进入统一排序与 UI 渲染, 若缺失则服务显示为"测速失败/全挂"。
+
+        结果项与常规探测保持一致的结构, 以便排序/徽章/应用逻辑复用同一套代码。
+
+        总开关 (quic_probe.QUIC_ENABLED) 停用时整体跳过 —— 此时线上也没有 QUIC_DIRECT 画像。
+        """
+        try:
+            from quic_probe import is_enabled as _quic_enabled
+            if not _quic_enabled():
+                return
+        except Exception:
+            return
+        try:
+            from quic_probe import probe_candidates, set_optimal_ips, get_optimal_ips
+        except Exception as e:
+            print(f"[QUIC] 测速跳过: {e}")
+            return
+
+        # 并行处理各服务: 串行时每个服务都要等自身握手/响应头 (实测 3 个服务就要 ~20s,
+        # 吃掉了全量测速 45s 预算的一半), 并行后与 optimize_quic_services 同量级。
+        quic_ids = [sid for sid in list(results_by_srv)
+                    if getattr(PROFILES_BY_ID.get(sid), "skip_cdn_probe", False)]
+        if not quic_ids:
+            return
+
+        def _one(srv_id: str):
+            profile = PROFILES_BY_ID.get(srv_id)
+            if profile is None:
+                return
+            domain = (profile.domains or [""])[0]
+            candidates = list(dict.fromkeys(
+                list(get_optimal_ips(srv_id)) + list(profile.candidate_ips or [])))
+            if not candidates:
+                return
+            try:
+                probed = probe_candidates(candidates, domain, timeout=QUIC_PROBE_TIMEOUT)
+            except Exception as e:
+                print(f"[QUIC] {srv_id} 测速异常: {e}")
+                return
+
+            new_items: List[Dict] = []
+            for r in probed:
+                ok = bool(r.get("ok"))
+                new_items.append({
+                    "ip": r.get("ip"),
+                    "latency": r.get("latency_ms") if ok else None,
+                    "available": ok,
+                    "rank": 0 if ok else 3,
+                    "via_proxy": False,
+                    "recommend": "direct" if ok else "none",
+                    "sni_mode": "quic",
+                    "direct": {"http_status": r.get("status"), "quic": True},
+                    "proxy": None,
+                    "proxy_used": False,
+                    "quic_error": r.get("error") or "",
+                    "handshake_ms": r.get("handshake_ms"),
+                })
+            if new_items:
+                results_by_srv[srv_id] = new_items
+                usable = [it["ip"] for it in new_items if it["rank"] == 0]
+                if usable:
+                    # 顺序持久化供 DNS / Hosts 读取 (可用节点在前)
+                    set_optimal_ips(srv_id, usable + [it["ip"] for it in new_items if it["rank"] != 0])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(quic_ids))) as pool:
+            list(pool.map(_one, quic_ids))
+
     def _load_existing_upstream_blocks(self) -> Dict[str, str]:
         """读取现有 upstream-dynamic.conf, 按服务提取已有 upstream 块 (供增量合并)"""
         blocks: Dict[str, str] = {}
@@ -1108,6 +1256,152 @@ class CDNOptimizer:
         except Exception:
             pass
         return blocks
+
+    @staticmethod
+    def _probe_one(ip: str, timeout: float) -> Tuple[bool, Optional[float]]:
+        """单点探测 + 抖动补偿
+
+        实测同一 IP 会在 70ms 与超时之间剧烈跳变 (20.27.177.113 六次采样:
+        70/1072/超时/71/244/1076), 单次采样容易把可用节点误判为死节点。故在
+        "失败"或"结果明显偏慢"时补测一次取更优值。恒定节点(如 20.205.243.166
+        六次均为 83~106ms)不会触发补测, 因此不增加常规开销。
+        """
+        ok, lat = fast_tcp_ping(ip, 443, timeout)
+        if not ok or (lat is not None and lat > 300):
+            ok2, lat2 = fast_tcp_ping(ip, 443, timeout)
+            if ok2 and lat2 is not None and (not ok or (lat is not None and lat2 < lat)):
+                return ok2, lat2
+        return ok, lat
+
+    def _cached_probe(self, ip: str, timeout: float) -> Tuple[bool, Optional[float]]:
+        """带单轮缓存的 TCP 探测
+
+        各服务候选池重叠度很高(如 185.199.108-111 段被 github_raw/release 共用),
+        逐服务重复探测是纯浪费。缓存以 IP 为键, 由 generate_upstream_conf 在每轮
+        开始时清空。并发下可能存在两次探测同一 IP 的竞态, 但结果一致, 无副作用。
+        """
+        try:
+            return self._probe_cache[ip]
+        except KeyError:
+            result = CDNOptimizer._probe_one(ip, timeout)
+            self._probe_cache[ip] = result
+            return result
+
+    @staticmethod
+    def _tls_pass_count(ip: str, sni: str, timeout: float = 2.5, attempts: int = 4) -> int:
+        """TLS 层复验: 返回 attempts 次握手中成功的次数 (用于批内横向比较)
+
+        为什么仅靠 TCP 测速不够: 实测 github_raw 的 IPv6 节点 TCP 81ms 握手通过,
+        TLS 阶段却超时(IPv6 路径上存在 SNI 层阻断); 而同批次的 gitlab IPv6 节点
+        TCP 76ms / TLS 151ms 完全正常 —— 两者在纯 TCP 维度无法区分。
+
+        这类阻断是概率性的: github_raw 四个 IPv6 节点各采 10 次, 通过数只有
+        0/1/2/0, 而 IPv4 同域名 10/10。单次采样会有 10~20% 概率把"绝大部分时候
+        用不了"的节点误判成可用, 故取多次采样, 交由调用方做批内比较。
+
+        返回次数而非布尔值, 是因为网络本身会整体抖动: 实测同一 IPv4 节点在数分钟
+        内从 10/10 掉到 0/3。若用绝对阈值, 抖动期会把所有节点一并判死, 排序退化。
+        """
+        if not sni or sni.startswith("*"):
+            return attempts
+        ok = 0
+        for _ in range(max(1, attempts)):
+            sock = None
+            try:
+                fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+                sock = socket.socket(fam, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((ip, 443))
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.wrap_socket(sock, server_hostname=sni).close()
+                ok += 1
+            except Exception:
+                pass
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+        return ok
+
+    def _probe_fallback_candidates(self, items: List[Dict], timeout: float = 1.2,
+                                   sni: str = "", verify_top: int = 4,
+                                   tls_attempts: int = 4) -> List[Dict]:
+        """兜底候选池的现场测速: 补齐 latency 字段并按延迟重排
+
+        为什么必须补这一步: 兜底分支构造出的项只有 {"ip": ...}, 没有 rank/latency/
+        throughput, _service_sort_key 的各维度于是全部退化为常量 —— 排序结果等同于
+        candidate_ips 的手工书写顺序。而那份顺序并不反映当前网络: 实测 github_web
+        前三位 140.82.113.x 建连 264ms, 而 76ms 的 20.205.243.166 排在其后, 经
+        [:3]/[3:8] 主备切分后, 最快的三台恰好全被划入 backup —— nginx 语义下 backup
+        只在主力全失效时才启用, 等于永不参与, 代理因此比直连还慢 3 倍以上。
+
+        探测失败的节点保留在末尾而非丢弃: upstream 为空会让 nginx 启动失败, 宁可
+        留一个假节点也要保证配置可用(与既有兜底策略一致)。
+        """
+        if not items:
+            return items
+        alive: List[Dict] = []
+        dead: List[Dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(items))) as ex:
+            futures = {ex.submit(self._cached_probe, it["ip"], timeout): it for it in items}
+            for fut in concurrent.futures.as_completed(futures):
+                item = futures[fut]
+                try:
+                    ok, lat = fut.result()
+                except Exception:
+                    ok, lat = False, None
+                if ok and lat is not None:
+                    # TCP 可达: 保留调用方预设的 rank (来自主探测三态), 未预设则视为可用
+                    alive.append({**item, "latency": lat, "rank": item.get("rank", 0)})
+                else:
+                    # TCP 都不可达: 明确降权, 使其退居 backup 而非占据主力位参与轮询
+                    dead.append({**item, "rank": 3})
+        alive.sort(key=lambda x: x["latency"])
+
+        # TCP 可达 ≠ 真能用: 对排名靠前的候选做 TLS 复验, 把"握手能过但 TLS 被
+        # 阻断"的节点降权(不淘汰 —— 段封锁会来回变化, 留作后续轮次的候选)。
+        # 用 rank 字段承载结论: _service_sort_key 以 rank 为第一排序键, 因此下面的
+        # 防御性排序会自然地把复验通过的节点排到前面。
+        # 只复验 IPv6 候选: 实测 TLS 层阻断集中出现在 IPv6 路径上(github_raw 四个
+        # IPv6 节点通过率 0~2/10, 而同域名 IPv4 是 10/10, gitlab 的 IPv6 则完全正常),
+        # IPv4 候选极少出现"TCP 通 TLS 断", 对其复验纯属浪费 —— 全量复验会让单轮
+        # 兜底生成从约 20s 涨到 130s, 而去掉后正常服务几乎零开销。
+        # IPv4 万一遇到 TLS 层问题, 仍有 nginx 的 max_fails/fail_timeout 兜底。
+        v6_candidates = [it for it in alive if ":" in str(it["ip"])][:verify_top]
+        if sni and v6_candidates:
+            sample = v6_candidates
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(sample))) as ex:
+                futures = {ex.submit(CDNOptimizer._tls_pass_count, it["ip"], sni, 2.5,
+                                     tls_attempts): it
+                           for it in sample}
+                passes = {futures[fut]["ip"]: fut.result()
+                          for fut in concurrent.futures.as_completed(futures)}
+            # 判据必须相对化, 不能是绝对阈值:
+            # 1) 阻断是概率性的 —— github_raw 的 IPv6 通过率 0~2/10, 单次采样有
+            #    10~20% 概率把"绝大部分时候用不了"的节点误判成可用; 而同域名 IPv4
+            #    是 10/10。用 attempts 次采样后的通过率可以稳定区分这两类。
+            # 2) 网络本身会整体抖动 —— 实测 raw.githubusercontent.com 数分钟内从
+            #    10/10 掉到 0/2(同期 github.com / gitlab 仍 2/2, 属针对该域名的
+            #    间歇阻断)。若用绝对阈值, 抖动期会把所有节点一并判死, 排序退化。
+            # 故: 以批内最好成绩为及格线, 及格线以上才做区分; 整批都不及格说明是
+            # 暂时性网络问题, 不降权任何节点, 交回延迟排序。
+            if passes:
+                best = max(passes.values())
+                if best * 2 >= tls_attempts:
+                    for it in alive:
+                        # 只降不升: 复验通过者保留调用方预设的 rank (兜底构造时已按主探测
+                        # 的三态结论写入 —— TLS 通者 0、仅 TCP 通者 3), 否则会把"TCP 通但
+                        # TLS 被 RST"的节点重新提回主力位。缺失 rank 的项才补默认 0
+                        # (缺失会被 _service_sort_key 当作 3 直接沉底)。
+                        if it["ip"] in passes and passes[it["ip"]] * 2 < tls_attempts:
+                            it["rank"] = 3      # IPv6 复验不达标: 降权
+                        else:
+                            it.setdefault("rank", 0)   # 复验通过或未参与复验: 维持原判
+        return alive + dead
 
     @staticmethod
     def _fmt_server(ip: str, extra: str = "") -> str:
@@ -1125,14 +1419,15 @@ class CDNOptimizer:
         - 直连全挂但经代理验证可用 (rank1/2) 且本地代理在线时, 写 relay 代理转发端口
           (127.0.0.1:<port>), 由 L4 Relay 经本地代理 CONNECT 域名出网
         - 双通道全挂服务回退候选池默认 IP, 并加注释告警 (宁可用假节点也绝不让 nginx 起不来)
-        - max_fails=3 fail_timeout=30s 减缓熔断雪崩; hash/least_conn 组不携带 backup 参数
+        - max_fails=1 fail_timeout=5s 快速熔断 (对准 GFW 逐段分钟级轮换, 见 UPSTREAM_MAX_FAILS 注释);
+          hash/least_conn 组不携带 backup 参数
         """
         lines = [
             "# ==============================================================================",
             "# GameArt Toolkit - 动态 Upstream 优选配置 (由双通道测速引擎自动生成)",
             f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "# 仅写入 rank0 (直连三态全通) 节点, 排除假节点导致 502",
-            "# 3 主力 + 最多 5 备份冗余; max_fails=3 fail_timeout=30s 减缓节点熔断雪崩",
+            "# 3 主力 + 最多 5 备份冗余; max_fails=1 fail_timeout=5s 快速熔断 (对准分钟级段轮换)",
             "# ==============================================================================\n"
         ]
 
@@ -1140,6 +1435,8 @@ class CDNOptimizer:
         self.last_relay_services = set()
         self.last_ech_services = set()
         self.last_ech_degraded = set()
+        # 重置兜底探测缓存: 结果只在一轮生成内复用, 跨轮必须重新探测以反映网络变化
+        self._probe_cache.clear()
 
         # 读取现有配置用于增量合并: 未参与本次测速的服务保留其已有 upstream 块,
         # 避免单服务自愈/局部重测顺带把其余服务重置回候选池
@@ -1150,34 +1447,38 @@ class CDNOptimizer:
             ip_items = test_results.get(srv_id)
 
             # --------------------------------------------------------------
-            # ECH 隧道分支 (优先级: rank0 直连 > ECH > relay):
-            # 标记 ech_enabled 且探测未给出直连可用节点时, 改由本地 ECH 隧道承担。
-            # 隧道在回环上提供明文 HTTP 入口, 自行发起带 ECH 的 TLS 连接。
+            # ECH 隧道分支 (优先级: ECH > relay > 候选池):
+            # 标记 ech_enabled 的服务一律交给本地 ECH 隧道, 隧道在回环上提供明文
+            # HTTP 入口, 自行发起带 ECH 的 TLS 连接。
             #
-            # 为什么这里的判据不能是探测结果: ECH 的加密 SNI 必须在 ClientHello
-            # 构造时注入, 而探测发的是普通握手 —— 空 SNI 会被 Cloudflare 拒绝,
-            # 明文 SNI 会被按关键字阻断, 两者都注定失败, rank0 恒为空。
-            # 真正的可用性判据是隧道自身的健康状态。
+            # 为什么判据只看隧道健康、不看探测结果: 探测发的是普通 TLS 握手, 其
+            # 成败与"带 ECH 的连接能否成功"无关, 不能用它证伪 ECH。实测反例:
+            # pixiv_web 的候选池含 210.140.139.x (Pixiv 源站, 非 Cloudflare 托管),
+            # 这些 IP 的普通握手会间歇性通过, 于是 rank0 非空、判据翻向候选池 ——
+            # 而候选池必须走 https:// + 明文 SNI, 正是被阻断的那条路。
+            # (原注释断言"rank0 恒为空", 该断言在上述候选池下不成立)
             #
             # 为什么置于增量合并之前: ECH 服务的上游是本地隧道端口, 与探测结果
             # 无关, 必须每轮重新评估 —— 否则隧道状态变化会被旧块掩盖
             # (实测: 该分支原本在合并之后, 未测速的服务直接沿用旧块, ECH 永不生效)。
             # --------------------------------------------------------------
             if getattr(PROFILES_BY_ID.get(srv_id), "ech_enabled", False):
-                has_direct = any(it.get("rank", 3) == 0 for it in (ip_items or []))
-                if not has_direct:
-                    if ech_tunnel.is_healthy():
-                        lines.append(f"upstream upstream_{srv_id} {{")
-                        lines.append(f"    # 经本地 ECH 隧道直连 Cloudflare (port={ech_tunnel.port})")
-                        lines.append(f"    server 127.0.0.1:{ech_tunnel.port} max_fails=3 fail_timeout=30s;")
-                        lines.append("    keepalive 32;")
-                        lines.append("    keepalive_timeout 120;")
-                        lines.append("    keepalive_requests 10000;")
-                        lines.append("}\n")
-                        self.last_ech_services.add(srv_id)
-                        continue
-                    # 隧道未就绪: 不静默兜底, 记下来供上层告警, 再走常规分支
-                    self.last_ech_degraded.add(srv_id)
+                if ech_tunnel.is_healthy():
+                    lines.append(f"upstream upstream_{srv_id} {{")
+                    lines.append(f"    # 经本地 ECH 隧道直连 Cloudflare (port={ech_tunnel.port})")
+                    lines.append(f"    server 127.0.0.1:{ech_tunnel.port} {_upstream_server_opts()};")
+                    lines.append("    keepalive 32;")
+                    lines.append("    keepalive_timeout 30;")
+                    lines.append("    keepalive_requests 10000;")
+                    lines.append("}\n")
+                    self.last_ech_services.add(srv_id)
+                    continue
+                # 隧道未就绪: 不静默兜底, 记下来供上层告警, 再走常规分支。
+                # 此时 upstream 会落到候选池 (https 后端), 对应 site 配置必须写
+                # https:// —— 由 NginxConfGenerator 依据本文件实际内容决定, 见
+                # _ech_services_from_upstream。两处判据不一致会产出
+                # "http:// 打向 :443" 的错配, 上游直接回 400 (已实测)。
+                self.last_ech_degraded.add(srv_id)
 
             if not ip_items:
                 old_block = existing_blocks.get(f"upstream_{srv_id}")
@@ -1207,9 +1508,9 @@ class CDNOptimizer:
                             self.last_relay_services.add(srv_id)
                             lines.append(f"upstream upstream_{srv_id} {{")
                             lines.append(f"    # 经本地代理转发 relay={domain}:443 port={port}")
-                            lines.append(f"    server 127.0.0.1:{port} max_fails=3 fail_timeout=30s;")
+                            lines.append(f"    server 127.0.0.1:{port} {_upstream_server_opts()};")
                             lines.append("    keepalive 32;")
-                            lines.append("    keepalive_timeout 120;")
+                            lines.append("    keepalive_timeout 30;")
                             lines.append("    keepalive_requests 10000;")
                             lines.append("}\n")
                             continue
@@ -1218,17 +1519,57 @@ class CDNOptimizer:
             usable = rank0
             fallback = not usable
             if not usable:
-                usable = [{"ip": it["ip"]} for it in ip_items if "ip" in it and it["ip"]]
+                # 兜底: 主探测虽未产出 rank0, 但其分阶段三态结果 (tcp/tls/http) 仍能
+                # 区分节点质量 —— 原先只取 ip 字段, 把"TCP 通但 TLS 被 RST"的节点与
+                # "TLS/HTTP 都通、仅状态码可疑"的节点一视同仁。
+                # 实测 i.pximg.net 在 210.140.139.131~134 上 TCP 全通而 TLS 全部 RST:
+                # 这类节点会被纯 TCP 探测判为健康并占住主力位, nginx 每次转发都失败。
+                # rank 语义与 _service_sort_key 一致 (0 优先 / 3 垫后)。
+                usable = []
+                for it in ip_items:
+                    if not it.get("ip"):
+                        continue
+                    d = it.get("direct") or {}
+                    p = it.get("proxy") or {}
+                    if d or p:
+                        # 有主探测三态结果: 以 TLS 是否握手成功分层
+                        tls_ok = bool(d.get("tls_ok") or p.get("tls_ok"))
+                        usable.append({"ip": it["ip"], "rank": 0 if tls_ok else 3})
+                    else:
+                        # 无探测数据 (首轮生成 / 增量合并): 不预设 rank —— 排序键会退化为
+                        # "稳定段优先 + 候选池顺序", 这已经足够; 真正的分层由测速阶段给出。
+                        usable.append({"ip": it["ip"]})
+                # 这里**刻意不做任何网络探测**:
+                # generate_upstream_conf 会被 apply_optimal 调用, 而 apply_optimal 处于 UI
+                # 线程 (按钮回调 / 测速完成回调)。早期版本在此处现场做 TCP/TLS 探测补齐
+                # latency, 遇到"无测速结果且无旧块"的服务 (典型就是刚新增的服务) 时会在
+                # 主线程连续握手数十次, 表现为**界面冻结数十秒** —— 这正是本项目实测过的
+                # "单个用例要等 40s+" 的来源。延迟必须由测速阶段 (worker 线程) 提供;
+                # 缺数据时按 稳定段 → 候选池顺序 输出, 由 nginx 的
+                # max_fails=1/fail_timeout=5s 快速故障转移到可用节点。
 
             # 防御性排序: 复用统一排序键 (稳定段优先于延迟), 不依赖调用方预排序
             # 若这里只按延迟排序, 会覆盖 test_all_services 的稳优先结果导致白做
             stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
             usable.sort(key=lambda x: _service_sort_key(x, None, stable_set))
             valid_ips = [it["ip"] for it in usable if it.get("ip")]
+            # 可用性分层: rank0 (TLS 可通) 优先占主力位, 其余退到 backup。
+            # nginx 语义下 backup 只在主力全部失效时才启用, 因此"TCP 通但 TLS 超时"的
+            # 死节点不再参与日常轮询 —— 否则候选池小的服务会被它们占满主力位:
+            # 实测 nuget_api 仅 3 个候选, 三个全进主力后每次轮到 .113/.8.183 都要等满
+            # proxy_connect_timeout 才交棒 (error.log 中可见连串 upstream timed out),
+            # 表现为"打开 nuget 偶尔卡数秒"。全死时回退原行为 (前 3 主力 + 其余备份)。
+            healthy = [it["ip"] for it in usable if it.get("ip") and it.get("rank", 3) == 0]
+            degraded = [it["ip"] for it in usable if it.get("ip") and it.get("rank", 3) != 0]
             # 稳定性冗余: 3 主力 + 最多 5 备份 (原 2+2 单节点被封即单点故障;
             # GitHub/Fastly 段被 GFW 逐段封锁时, 多备份保证 nginx 自动故障转移)
-            primary_ips = valid_ips[:3]
-            backup_ips = valid_ips[3:8]
+            if healthy:
+                primary_ips = healthy[:3]
+                backup_ips = (healthy[3:] + degraded)[:5]
+            else:
+                # 全死: 回退原行为 (前 3 主力 + 其余备份), 保证 upstream 仍有节点可用
+                primary_ips = degraded[:3]
+                backup_ips = degraded[3:8]
 
             lines.append(f"upstream upstream_{srv_id} {{")
             if fallback:
@@ -1240,19 +1581,19 @@ class CDNOptimizer:
             elif srv_id == "pixiv_web":
                 lines.append("    hash $connection consistent;")
                 for ip in valid_ips[:6]:
-                    lines.append(self._fmt_server(ip, "max_fails=3 fail_timeout=30s"))
+                    lines.append(self._fmt_server(ip, _upstream_server_opts()))
             elif srv_id == "pixiv_img":
                 lines.append("    least_conn;")
                 for ip in valid_ips[:6]:
-                    lines.append(self._fmt_server(ip, "max_fails=3 fail_timeout=30s"))
+                    lines.append(self._fmt_server(ip, _upstream_server_opts()))
             else:
                 for ip in primary_ips:
-                    lines.append(self._fmt_server(ip, "max_fails=3 fail_timeout=30s"))
+                    lines.append(self._fmt_server(ip, _upstream_server_opts()))
                 for ip in backup_ips:
-                    lines.append(self._fmt_server(ip, "backup max_fails=3 fail_timeout=30s"))
+                    lines.append(self._fmt_server(ip, "backup " + _upstream_server_opts()))
 
             lines.append("    keepalive 32;")
-            lines.append("    keepalive_timeout 120;")
+            lines.append("    keepalive_timeout 30;")
             lines.append("    keepalive_requests 10000;")
             lines.append("}\n")
 
@@ -1266,7 +1607,10 @@ class CDNOptimizer:
             if not conf_file.exists():
                 continue
             text = conf_file.read_text(encoding="utf-8", errors="ignore")
-            for m in re.finditer(r"proxy_pass\s+https://(upstream_[a-z0-9_]+)", text):
+            # 必须同时匹配 http:// —— ECH 隧道的上游是本地回环上的明文 HTTP 入口,
+            # 只匹配 https 会让这几个服务的引用游离在校验之外 (上游漏定义也拦不下,
+            # nginx 直接启动失败)
+            for m in re.finditer(r"proxy_pass\s+https?://(upstream_[a-z0-9_]+)", text):
                 refs.add(m.group(1))
         return refs
 
@@ -1308,8 +1652,10 @@ class CDNOptimizer:
             relayed = [s for s in failed if s in self.last_relay_services]
             fallback = [s for s in failed if s not in self.last_relay_services]
             # 低存活率服务: rank0 直连节点不足 2 个 (单点依赖, GFW 逐段封锁下随时全挂)
+            # QUIC 直连服务除外: 其候选池本就小 (2~3 个 IP 即够), 且"启用本地代理"对它们无意义
             low_avail = [srv_id for srv_id, items in test_results.items()
                          if srv_id not in ech_ok
+                         and not getattr(PROFILES_BY_ID.get(srv_id), "skip_cdn_probe", False)
                          and sum(1 for it in items if it.get("rank", 3) == 0) < 2]
             msg = "已生成延迟最低的节点配置并写入 upstream-dynamic.conf！"
             if ech_ok:
@@ -1331,6 +1677,28 @@ class CDNOptimizer:
                 hint = "。检测到本地代理可用, 建议开启上游代理以启用 relay 兜底" if proxy_now else \
                        ", 可用节点过少, 建议启用本地代理后重测"
                 msg += f" ⚠️ {len(low_avail)} 个服务可用节点不足({', '.join(sorted(low_avail))}){hint}"
+
+            # QUIC 直连服务的优选结果已在测速阶段 (_probe_quic_services) 完成并持久化 ——
+            # 这里绝不能再发起网络探测: apply_optimal 由 UI 线程的按钮回调调用, 任何真实
+            # 握手都会直接冻结界面 (早期版本正是这样引入 UI 冻结的)。
+            try:
+                from service_profile import ServiceMode as _SM
+                from quic_probe import get_optimal_ips
+                quic_ids = [p.id for p in PROFILES_BY_ID.values()
+                            if getattr(p, "mode", None) == _SM.QUIC_DIRECT
+                            and p.id in test_results]
+                if quic_ids:
+                    ready = [sid for sid in quic_ids if get_optimal_ips(sid)]
+                    pending = [sid for sid in quic_ids if not get_optimal_ips(sid)]
+                    if ready:
+                        detail = ", ".join(f"{sid}({get_optimal_ips(sid)[0]})" for sid in ready)
+                        msg += f" | QUIC 直连已优选: {detail}"
+                    if pending:
+                        msg += (f" | ⚠️ QUIC 直连服务 {', '.join(pending)} 暂无可用节点"
+                                f" (其解析需由本机 DNS 后端下发, Hosts 模式不生效)")
+            except Exception as e:
+                print(f"[CDN] QUIC 结果汇总跳过: {e}")
+
             return True, msg
         except Exception as e:
             return False, f"写入 upstream 配置失败: {e}"
@@ -1373,11 +1741,68 @@ class CDNHealthMonitor:
         with self._lock:
             self.check_interval = seconds
 
+    def _check_and_heal_quic(self, srv_id: str) -> bool:
+        """QUIC 直连服务的健康巡检与自愈
+
+        这类服务的 TCP 侧 SNI 必然被 RST, 常规双通道探针只会永久判定"故障"并触发无意义
+        自愈, 因此改用**真实 QUIC 握手**复测候选池:
+          - 当前主力 IP 仍可用 -> 健康, 无需自愈
+          - 当前主力失效但池中另有可用节点 -> 持久化新顺序 (自愈), 返回 True
+          - 全部不可用 -> 记一次失败, 不谎报自愈
+
+        总开关停用时直接返回 False (不探测、不误报自愈)。
+        """
+        try:
+            from quic_probe import is_enabled as _quic_enabled
+            if not _quic_enabled():
+                return False
+        except Exception:
+            return False
+        try:
+            from quic_probe import optimize_service, current_best_ip
+        except Exception as e:
+            print(f"[Health] QUIC 巡检跳过 ({srv_id}): {e}")
+            return False
+
+        try:
+            current = current_best_ip(srv_id)
+            report = optimize_service(srv_id, persist=True)
+            ok_ips = {r["ip"] for r in report.get("results", []) if r.get("ok")}
+
+            if current and current in ok_ips:
+                with self._lock:
+                    self.failure_counts[srv_id] = 0
+                return False
+            if ok_ips:
+                new_best = report.get("best_ip") or ""
+                with self._lock:
+                    self.failure_counts[srv_id] = 0
+                if new_best and new_best != current:
+                    print(f"[Health] QUIC 服务 {srv_id} 主力节点 {current} 失效, 已自愈切换至 {new_best}")
+                    return True
+                return False
+            with self._lock:
+                self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
+            return False
+        except Exception as e:
+            print(f"[Health] QUIC 服务 {srv_id} 巡检异常: {e}")
+            return False
+
     def check_and_heal_service(self, srv_id: str) -> bool:
         """检查单个服务的当前主力节点，并在故障时自动选举自愈"""
         srv = SERVICES_BY_ID.get(srv_id)
         if not srv:
             return False
+
+        # QUIC 直连服务必须**最先**分流: 其 TCP 侧 SNI 必然被 RST, 若先走下面的常规
+        # 双通道探针, 每轮巡检都要白等一次注定失败的 TCP/TLS 超时, 再被判"故障"。
+        try:
+            from service_profile import ServiceMode as _SM
+            _is_quic = getattr(PROFILES_BY_ID.get(srv_id), "mode", None) == _SM.QUIC_DIRECT
+        except Exception:
+            _is_quic = False
+        if _is_quic:
+            return self._check_and_heal_quic(srv_id)
 
         with self._lock:
             items = self.cached_results.get(srv_id)
@@ -1414,8 +1839,13 @@ class CDNHealthMonitor:
                 return True
             return False
 
+        # QUIC 直连服务: TCP 侧 SNI 必然被 RST, 常规探针只会永久失败并触发无意义"自愈"。
+        # (已在函数入口分流到 _check_and_heal_quic, 此处不再处理)
+
         # 轻量探针检查当前主力节点 (三态验证 + 多域全验证 + 状态码放行, 全部通过才算健康)
         # 与测速判定完全一致: 假阳性节点 (S3 403 / 多域任一可疑) 不再被误判健康, 可被自愈替换
+
+        # 轻量探针检查当前主力节点 (三态验证 + 多域全验证 + 状态码放行, 全部通过才算健康)
         profile = PROFILES_BY_ID.get(srv_id)
         sni_mode = SNI_MODES.get(srv_id, "host")
         domain = srv["domains"][0] if srv["domains"] else ""
@@ -1572,3 +2002,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print(f"优选结果应用状态: {'[成功]' if ok else '[失败]'} -> {msg}")
     print("=" * 80)
+

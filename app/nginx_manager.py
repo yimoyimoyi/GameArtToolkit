@@ -32,6 +32,18 @@ class NginxManager:
         """检查 Nginx 进程是否正在运行"""
         return is_process_running("nginx.exe")
 
+    def is_master_alive(self) -> bool:
+        """pid 文件记录的 master 是否仍然存活
+
+        为什么不能只看 is_running(): 后者按进程名判断, 孤儿 worker 同样为真。
+        而 nginx 的 reload/stop 信号通道 (Global\\ngx_reload_<master_pid>) 以
+        master 为基准 —— master 一旦消失, 只剩 worker 时任何热重载都注定失败,
+        且 _repair_pid_file 会把 worker 的 PID 写进 pid 文件, 让状态进一步污染
+        (worker 监听 80/443, 正是它被误判为 master 的原因)。据此可识别该状态。
+        """
+        pid = self.get_pid()
+        return pid > 0 and pid in get_pids_by_name("nginx.exe")
+
     def get_pid(self) -> int:
         """从 logs/nginx.pid 读取当前主进程 PID"""
         if self.pid_file.exists():
@@ -87,30 +99,41 @@ class NginxManager:
         if not self.nginx_exe.exists():
             return False, "未找到 nginx.exe"
         try:
-            # 1. 自动从 ServiceProfile 单源渲染三大站点配置
-            NginxConfGenerator.generate_all(self.nginx_dir / "conf")
-
-            # 2. 自动确保证书与私钥在本地按需自生成就绪 (零分发与自愈)
-            CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir).ensure_certificates()
-
-            # 3. upstream-dynamic.conf 缺失, 或 site 引用的 upstream 未定义时自动补全
-            #    (新增 ServiceProfile 后 site 配置会引用新 upstream, 若未重新测速则 nginx 无法启动;
-            #    增量合并保留既有已优选节点, 仅补充缺失服务块)
             from cdn_optimizer import CDNOptimizer
             upstream_conf = self.nginx_dir / "conf" / "upstream-dynamic.conf"
-            missing_refs = []
-            if upstream_conf.exists():
-                try:
-                    text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
-                    defined = set(re.findall(r"upstream (upstream_[a-z0-9_]+)", text))
-                    refs = CDNOptimizer(upstream_conf)._scan_site_upstream_refs()
-                    missing_refs = sorted(refs - defined)
-                except Exception:
-                    pass
-            if not upstream_conf.exists() or missing_refs:
+
+            # 1. 先确保 upstream-dynamic.conf 就绪 —— site 配置里 proxy_pass 的协议
+            #    以该文件实际写入的后端为准 (走 ECH 隧道是回环明文 HTTP 入口, 退化
+            #    到候选池则是 https), 故它必须先于站点配置存在, 否则首轮渲染会按
+            #    "隧道不可用" 输出 https:// 而 upstream 实际写的是隧道地址。
+            if not upstream_conf.exists():
                 ok_apply, _ = CDNOptimizer(upstream_conf).apply_optimal({})
                 if not ok_apply:
-                    return False, f"自动补全 upstream 配置失败 (缺失: {missing_refs or '文件缺失'})"
+                    return False, "自动补全 upstream 配置失败 (缺失: 文件缺失)"
+
+            # 2. 自动从 ServiceProfile 单源渲染三大站点配置
+            NginxConfGenerator.generate_all(self.nginx_dir / "conf")
+
+            # 3. 自动确保证书与私钥在本地按需自生成就绪 (零分发与自愈)
+            CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir).ensure_certificates()
+
+            # 4. site 引用的 upstream 未定义时自动补全
+            #    (新增 ServiceProfile 后 site 配置会引用新 upstream, 若未重新测速则 nginx 无法启动;
+            #    增量合并保留既有已优选节点, 仅补充缺失服务块)
+            missing_refs = []
+            try:
+                text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
+                defined = set(re.findall(r"upstream (upstream_[a-z0-9_]+)", text))
+                refs = CDNOptimizer(upstream_conf)._scan_site_upstream_refs()
+                missing_refs = sorted(refs - defined)
+            except Exception:
+                pass
+            if missing_refs:
+                ok_apply, _ = CDNOptimizer(upstream_conf).apply_optimal({})
+                if not ok_apply:
+                    return False, f"自动补全 upstream 配置失败 (缺失: {missing_refs})"
+                # upstream 内容已变: 重新渲染一次, 让 proxy_pass 的协议跟上
+                NginxConfGenerator.generate_all(self.nginx_dir / "conf")
 
             # 3. 执行 Nginx 语法预检 (不传 -p 以避免 Windows 下中文路径 ANSI 转换 1113 错误，以 cwd 为 prefix)
             cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf", "-t"]
@@ -145,12 +168,21 @@ class NginxManager:
             return False, test_msg
 
         if self.is_running():
-            if force_restart:
+            # 孤儿 worker 状态 (进程在但 master 已消失) 必须强制重启而非热重载:
+            # reload 的信号通道以 master 为基准, 此时必然 OpenEvent failed, 而
+            # _repair_pid_file 还会把 worker 的 PID 写进 pid 文件让状态更脏。
+            # stop() 走 taskkill /F /T 杀进程树, 能把 master+worker 一并清掉。
+            if force_restart or not self.is_master_alive():
                 self.stop()
                 time.sleep(0.3)
             else:
-                self.reload()
-                return True, "Nginx 配置已刷新并处于运行状态"
+                ok, reload_msg = self.reload()
+                if ok:
+                    return True, "Nginx 配置已刷新并处于运行状态"
+                # 热重载失败不再静默吞掉 (原先无条件 return True, 导致配置更新
+                # 实际未生效却报成功)。降级为强制重启, 重启也失败才向上报错。
+                self.stop()
+                time.sleep(0.3)
 
         # 检查 80 与 443 端口
         if is_port_in_use(80):
@@ -162,12 +194,27 @@ class NginxManager:
             for sub in ["logs", "temp", "cache"]:
                 (self.nginx_dir / sub).mkdir(parents=True, exist_ok=True)
 
-            cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf"]
-            subprocess.Popen(
-                cmd, cwd=str(self.nginx_dir), shell=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                **get_silent_startup_kwargs()
-            )
+            # 必须显式指定 -p 前缀。缺省时 nginx 使用编译期默认 prefix, 而 pid 文件
+            # (logs/nginx.pid) 与 reload/stop 依赖的 Global\ngx_reload_<master_pid>
+            # 事件对象都以 prefix 为基准, 于是全部与项目目录错位 —— 实测表现为
+            # master 启动后随即退出、只剩一个孤儿 worker 占着 80/443 (能服务请求但
+            # 永远无法 reload/stop, OpenEvent 恒报错), 且该状态会长期残留。
+            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-c", "conf/nginx.conf"]
+            # CREATE_BREAKAWAY_FROM_JOB: 让 nginx master 脱离本进程的 Job Object。
+            # Windows 下 subprocess 创建的子进程默认继承调用方的 Job, 一旦本进程退出、
+            # Job 关闭, master 会被连带终止 (worker 反而存活), 结果只剩一个孤儿 worker
+            # 占着 80/443 —— 它能服务请求却永远无法 reload/stop (OpenEvent 恒报错),
+            # 并且阻塞下次启动。宿主 Job 不允许 breakaway 时 CreateProcess 会直接失败,
+            # 故回退常规启动以兼容受限环境。
+            flags = get_silent_startup_kwargs()
+            flags["creationflags"] = flags.get("creationflags", 0) | subprocess.CREATE_BREAKAWAY_FROM_JOB
+            try:
+                subprocess.Popen(cmd, cwd=str(self.nginx_dir), shell=False,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **flags)
+            except OSError:
+                flags["creationflags"] &= ~subprocess.CREATE_BREAKAWAY_FROM_JOB
+                subprocess.Popen(cmd, cwd=str(self.nginx_dir), shell=False,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **flags)
             time.sleep(0.4)
 
             if self.is_running():
@@ -187,10 +234,10 @@ class NginxManager:
 
         pid = self.get_pid()
 
-        # 1. 优先优雅停止
+        # 1. 优先优雅停止 (-p 同 start/reload: 信号通道以 prefix 为基准)
         try:
             subprocess.run(
-                [str(self.nginx_exe), "-s", "stop"],
+                [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "stop"],
                 cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                 **get_silent_startup_kwargs()
             )
@@ -214,7 +261,7 @@ class NginxManager:
         if self.is_running():
             try:
                 subprocess.run(
-                    [str(self.nginx_exe), "-s", "quit"],
+                    [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "quit"],
                     cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                     **get_silent_startup_kwargs()
                 )
@@ -245,7 +292,9 @@ class NginxManager:
             return False, test_msg
 
         try:
-            cmd = [str(self.nginx_exe), "-s", "reload"]
+            # -p 必须与 start() 一致, 否则 nginx 会去默认 prefix 下找 pid 文件,
+            # 找不到 master 就报 OpenEvent failed, 热重载永远失败
+            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "reload"]
             proc = subprocess.run(
                 cmd, cwd=str(self.nginx_dir), capture_output=True,
                 text=True, errors="ignore", timeout=3, **get_silent_startup_kwargs()

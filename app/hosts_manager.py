@@ -29,6 +29,80 @@ LEGACY_BLOCK_END = "# <<<<< PixivToolkit Rules End <<<<<"
 
 DEFAULT_MAX_BACKUPS = 5
 
+
+def build_domain_targets(enabled_services: List[str]) -> Dict[str, str]:
+    """
+    由启用服务列表推导"域名 -> 目标 IP"重定向映射 (全项目唯一推导入口)
+
+    - Direct 模式: 直接写测速优选出的最优 CDN IP (不经本机反代)
+    - QUIC 直连模式: 同样写真实 CDN IP —— 其目标 IP 只用于 DNS 解析层, 真正的可达性靠
+      本机解析器额外下发 HTTPS RR(alpn=h3) 让浏览器走 QUIC (见 dns_server)
+    - 其余模式:   写 127.0.0.1, 交由本机 Nginx / L4 Relay 数据平面接管
+    兼容旧版粗粒度服务组键名 ('pixiv' / 'steam' / 'github'), 统一映射到本地反代。
+    """
+    domain_ip_map: Dict[str, str] = {}
+    # QUIC 实测优选结果优先于静态候选池 (静态值被封后无自愈能力)
+    try:
+        from quic_probe import get_optimal_ips
+    except Exception:
+        get_optimal_ips = None
+
+    for s_id in enabled_services:
+        profile = get_profile_by_id(s_id)
+        srv = SERVICES_BY_ID.get(s_id)
+        if not srv:
+            continue
+        if profile and profile.mode in (ServiceMode.DIRECT, ServiceMode.QUIC_DIRECT):
+            target_ip = ""
+            if get_optimal_ips is not None:
+                try:
+                    ips = get_optimal_ips(s_id)
+                    target_ip = ips[0] if ips else ""
+                except Exception:
+                    target_ip = ""
+            if not target_ip:
+                target_ip = profile.candidate_ips[0] if profile.candidate_ips else "127.0.0.1"
+        else:
+            target_ip = "127.0.0.1"
+
+        for d in srv.get("domains", []):
+            domain_ip_map[d] = target_ip
+
+    legacy_group_keys = {
+        "pixiv": "acg",
+        "steam": "gaming",
+        "github": "dev",
+    }
+    for legacy_key, group in legacy_group_keys.items():
+        if legacy_key in enabled_services:
+            for s in SERVICES_LIST:
+                if s["group"] == group:
+                    for d in s["domains"]:
+                        domain_ip_map[d] = "127.0.0.1"
+
+    return domain_ip_map
+
+
+def build_quic_direct_domains(enabled_services: List[str]) -> Set[str]:
+    """
+    收集 QUIC 直连模式的域名
+
+    这些域名必须**排除在 Hosts 之外**: Hosts 会在 DNS 之前直接给出地址, 浏览器因此不会去
+    查询 HTTPS RR, 也就永远不会启用 HTTP/3 —— 而其 TCP 侧又被 RST, 结果是彻底不可用。
+    它们的解析必须交给本机 DNS 服务 (配合 NRPT 或手动指定 DNS), 由解析器下发
+    真实 IP + HTTPS RR(alpn=h3)。
+    """
+    domains: Set[str] = set()
+    for s_id in enabled_services:
+        profile = get_profile_by_id(s_id)
+        srv = SERVICES_BY_ID.get(s_id)
+        if not profile or not srv or profile.mode != ServiceMode.QUIC_DIRECT:
+            continue
+        for d in srv.get("domains", []):
+            domains.add(d)
+    return domains
+
+
 class HostsManager:
     def __init__(self, hosts_file: Path = HOSTS_PATH, backup_dir: Optional[Path] = None):
         self.hosts_file = hosts_file
@@ -221,38 +295,14 @@ class HostsManager:
 
             base_content = self.remove_rules_from_content(content)
 
-            # 收集所有已启用服务的域名与目标 IP 映射
-            domain_ip_map: Dict[str, str] = {}
-            for s_id in enabled_services:
-                profile = get_profile_by_id(s_id)
-                srv = SERVICES_BY_ID.get(s_id)
-                if not srv:
-                    continue
-                # 判定目标 IP (Direct 模式直接写最优 CDN IP, 代理模式写 127.0.0.1)
-                if profile and profile.mode == ServiceMode.DIRECT and profile.candidate_ips:
-                    target_ip = profile.candidate_ips[0]
-                else:
-                    target_ip = "127.0.0.1"
+            # 收集所有已启用服务的域名与目标 IP 映射 (推导逻辑见 build_domain_targets)
+            domain_ip_map = build_domain_targets(enabled_services)
 
-                for d in srv.get("domains", []):
-                    domain_ip_map[d] = target_ip
-
-            # 兼容旧版服务组键名 ('pixiv', 'steam', 'github', 'huggingface')
-            if "pixiv" in enabled_services:
-                for s in SERVICES_LIST:
-                    if s["group"] == "acg":
-                        for d in s["domains"]:
-                            domain_ip_map[d] = "127.0.0.1"
-            if "steam" in enabled_services:
-                for s in SERVICES_LIST:
-                    if s["group"] == "gaming":
-                        for d in s["domains"]:
-                            domain_ip_map[d] = "127.0.0.1"
-            if "github" in enabled_services:
-                for s in SERVICES_LIST:
-                    if s["group"] == "dev":
-                        for d in s["domains"]:
-                            domain_ip_map[d] = "127.0.0.1"
+            # QUIC 直连域名必须排除在 Hosts 之外: Hosts 会绕过 DNS, 使浏览器拿不到
+            # HTTPS RR(alpn=h3) 从而无法启用 HTTP/3; 而它们的 TCP 侧本就被 RST。
+            quic_domains = build_quic_direct_domains(enabled_services)
+            for d in quic_domains:
+                domain_ip_map.pop(d, None)
 
             if not domain_ip_map:
                 self._safe_write_hosts(base_content)
@@ -262,7 +312,8 @@ class HostsManager:
                     ProxyBypassManager.restore_bypass()
                 except Exception:
                     pass
-                return True, "已清空所有加速 Hosts 规则"
+                return True, (f"已清空所有加速 Hosts 规则"
+                              + (f"（{len(quic_domains)} 个 QUIC 直连域名改由本机 DNS 下发）" if quic_domains else ""))
 
             # 构造全新的注入规则块 (按域名排序输出)
             lines = [BLOCK_START, "# 本规则由 GameArt Toolkit 自动安全托管，退出程序时将自动完全清理"]
@@ -283,7 +334,8 @@ class HostsManager:
                 pass
 
             self.flush_dns()
-            return True, f"已成功注入 {len(domain_ip_map)} 条加速域名规则！"
+            extra = f"，另 {len(quic_domains)} 个 QUIC 直连域名交由本机 DNS 下发" if quic_domains else ""
+            return True, f"已成功注入 {len(domain_ip_map)} 条加速域名规则{extra}！"
         except PermissionError:
             from win_utils import is_admin
             if not is_admin():

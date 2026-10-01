@@ -55,7 +55,17 @@ DEFAULT_CONFIG = {
 
     # 本地 DNS 与网络缓存维护
     "dns_mode_enabled": True,
+    "dns_listen_port": 5353,
     "upstream_dns_servers": ["223.5.5.5", "119.29.29.29"],
+
+    # 加速域名解析劫持后端: "hosts" (写系统 Hosts, 默认) | "nrpt" (写 Windows NRPT 策略表)
+    # NRPT 需要管理员权限 + 独占 53/UDP; 条件不满足且 nrpt_auto_fallback 为真时自动回退 Hosts
+    "redirect_mode": "hosts",
+    "nrpt_auto_fallback": True,
+
+    # QUIC(HTTP/3) 直连服务的优选 IP 顺序 (由 quic_probe 用真实 QUIC 握手测速生成)
+    "quic_optimal_ips": {},
+
     "cache_max_size_mb": 1024,
     "auto_clear_cache_on_exit": False,
 
@@ -72,7 +82,16 @@ _LEGACY_SERVICE_MAPPING = {
     "steam": ["steam_store", "steam_community", "steam_akamai", "ubisoft"],
     "github": ["github_web", "github_raw", "github_release", "github_assets", "github_s3", "gitlab"],
     "huggingface": ["huggingface"],
+    # nuget 于 2026-09 拆为三个独立后端 (api/www/包 CDN 的 IP 互不通用, 合池必然错配)
+    "nuget": ["nuget_api", "nuget_www", "nuget_cdn"],
 }
+
+# 一次性迁移表: "本次升级新增且默认启用"的服务, 用于还没有 known_service_ids 快照的老配置。
+# 之后新增服务由快照机制自动接纳 (见 _sanitize_config 的 2.1), 无需再往这里加。
+_AUTO_ENABLE_MIGRATIONS = (
+    "discord_gateway",   # 2026-10-01: Discord WebSocket 网关独立画像 (需 upgrade 头)
+)
+
 
 def _sanitize_config(data: dict) -> dict:
     """清洗配置项，自动迁移旧版粗粒度服务 ID 并移除废弃字段"""
@@ -91,9 +110,37 @@ def _sanitize_config(data: dict) -> dict:
                 for target_id in _LEGACY_SERVICE_MAPPING[sid]:
                     if target_id in SERVICES_BY_ID:
                         new_services.add(target_id)
+        # 2.1 新增服务的自动接纳 (升级迁移)
+        # 为什么必须做: 老配置里 `enabled_services` 是一份**显式清单**, 版本升级新增的
+        # 默认启用服务不会被它接纳 —— 实测事故: 新增的 discord_gateway (WebSocket 网关)
+        # 未进入清单, 于是 gateway.discord.gg 没被劫持、走污染解析, 客户端 WS 一直失败,
+        # 而其它 discord 域正常 (因为它们早就在清单里)。
+        # 判定依据: 与 known_service_ids (上次写配置时存在的全部服务 id) 求差 —— 只有
+        # "本次升级新出现" 的服务才会被自动加入, 因此**用户手动关闭的服务不会被重新打开**。
+        known = data.get("known_service_ids")
+        current_ids = set(SERVICES_BY_ID)
+        if isinstance(known, list):
+            new_ids = current_ids - set(known)
+            for sid in DEFAULT_ENABLED_SERVICES:
+                if sid in new_ids:
+                    new_services.add(sid)
+        else:
+            # 首次引入 known_service_ids 快照时没有"上一版服务清单"可比对, 只能靠一次性
+            # 迁移表: 把"本次升级新增且默认启用"的服务补进老配置。
+            # 实测事故: discord_gateway (WebSocket 网关) 未进老配置的显式清单 →
+            # gateway.discord.gg 没被劫持 → 客户端 WS 无限失败, 而其它 discord 域正常。
+            for sid in _AUTO_ENABLE_MIGRATIONS:
+                if sid in SERVICES_BY_ID:
+                    new_services.add(sid)
+        data["known_service_ids"] = sorted(current_ids)
         data["enabled_services"] = sorted(list(new_services))
     elif curr_services is None:
         data["enabled_services"] = list(DEFAULT_ENABLED_SERVICES)
+        data["known_service_ids"] = sorted(SERVICES_BY_ID)
+
+    # 2. 归一化重定向后端取值 (非法值一律回落 Hosts, 保证历史行为不受损)
+    mode = str(data.get("redirect_mode", "hosts") or "hosts").strip().lower()
+    data["redirect_mode"] = mode if mode in ("hosts", "nrpt") else "hosts"
 
     return data
 

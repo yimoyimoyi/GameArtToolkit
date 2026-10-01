@@ -49,6 +49,13 @@ CANDIDATE_IPS = {p.id: p.candidate_ips for p in PROFILES}
 # 默认开启全部已实测直连可用的服务 (需代理的 fandom/wikipedia/google_translate 已移除;
 # yandere 区域 301 循环已知不可用已移除)
 EXPERIMENTAL_OR_PROXY_SERVICES = set()
-DEFAULT_ENABLED_SERVICES = [p.id for p in PROFILES if p.id not in EXPERIMENTAL_OR_PROXY_SERVICES]
+
+# 需要本机 DNS 后端 (NRPT / 手动指定 DNS) 才能生效的服务不纳入默认启用:
+# QUIC 直连类的解析结果必须由本机 DNS 下发 (Hosts 无法传递 HTTPS RR), 在默认的 Hosts 模式下
+# 启用它们只会得到"有延迟但不可用"的假象 —— 宁可默认关闭, 由用户显式开启并被告知前置条件。
+DEFAULT_ENABLED_SERVICES = [
+    p.id for p in PROFILES
+    if p.id not in EXPERIMENTAL_OR_PROXY_SERVICES and not getattr(p, "requires_dns_backend", False)
+]
 
 

@@ -129,3 +129,35 @@ scripts/probe_candidates_results.json
 TEST_REPORT_UNUSABLE.md
 # 测速超时诊断脚本 (本地排查用)
 scripts/diag_timeout.py
+
+# ==============================================================================
+# 本地运行产物 / 文档 / 结果数据 (不上传)
+# ==============================================================================
+# QUIC 直连启动器创建的浏览器专用配置目录 (体积可达数十 MB, 纯缓存)
+browser_profiles/
+# 本地备份 (hosts / nginx 配置 / upstream 快照)
+backups/
+# 文档目录: 本地留存, 不上传
+docs/
+# 探测/审计的结果数据 (脚本可上传, 结果属本机实测数据)
+scripts/*_results.json
+scripts/_probe_*
+tools/audit_result.txt
+# 测试与调试留下的临时文件
+temp_fast_hosts
+nginx/conf/*.bak_*
+*.orig
+
+# ==============================================================================
+# 测试套件与本地探测脚本 (仅本地回归/实测使用, 不上传)
+# ==============================================================================
+# 测试套件: 保留在本地用于回归, 不随仓库上传
+tests/
+# 本地探测 / 审计 / 验证脚本 (历次实测的复现工具)
+scripts/probe_*.py
+scripts/audit_*.py
+scripts/test_*.py
+scripts/benchmark_*.py
+# tools 下的开发脚本 (运行时必需的 tools/ech_tunnel/ 不受影响: 只匹配 tools/*.py)
+tools/*.py
+scripts/*.json

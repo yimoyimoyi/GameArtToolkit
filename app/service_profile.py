@@ -18,6 +18,9 @@ class ServiceMode(str, Enum):
     L7_NGINX = "l7_nginx"     # L7 HTTP/HTTPS 反向代理与缓存 (Nginx)
     L4_RELAY = "l4_relay"     # L4 TCP 隧道转发 + SNI 嗅探路由 (轻量 Relay)
     DIRECT = "direct"         # 纯 DNS / Hosts 优选直连 (无 MITM, 直接与 CDN TLS 握手)
+    QUIC_DIRECT = "quic_direct"  # 纯 DNS 引导 HTTP/3 (QUIC) 直连: 不应答 127.0.0.1, 且
+                                 # 由本机解析器额外下发 HTTPS RR(alpn=h3) 让浏览器自行走 QUIC
+                                 # —— TCP 侧 SNI 被 RST 但 UDP/443 放行的站点靠它可直连
 
 
 class SniMode(str, Enum):
@@ -25,6 +28,59 @@ class SniMode(str, Enum):
     HOST = "host"             # 使用客户端请求的原始 Host 域名作为 SNI
     EMPTY = "empty"           # 空 SNI (不发送 server_name 扩展，绕过 SNI 审查)
     CUSTOM = "custom"         # 使用指定伪装域名 (如 CloudFront 分发域名 / Akamai 状态页)
+
+
+# ------------------------------------------------------------------------------
+# 伪 SNI / 域名前置 (Domain Fronting) 的 CDN 厂商能力表
+#
+# 2026-10-01 无代理国内直连出口实测 (scripts/probe_uplift_routes.py):
+#   同 IP 上「掩护 SNI + 真实 Host」的结果 ——
+#     Fastly      : imgur 302 (证书 CN=*.imgur.com) / twitch 200 (证书 CN=twitch.tv)  => 放行
+#     Akamai      : myanimelist 200 (掩护 steambroadcast.akamaized.net)                => 放行
+#     Cloudflare  : patreon / nhentai / discord / fandom 全部 403                       => 要求 SNI=Host
+#     CloudFront  : deviantart 421 Misdirected Request                                  => 要求 SNI=Host
+# 因此「伪 SNI 一律无效」是过度概括: 该路线只对 Fastly / Akamai 系站点成立。
+# ------------------------------------------------------------------------------
+VENDOR_COVER_SNI = {
+    "fastly": "www.fastly.com",
+    "akamai": "steambroadcast.akamaized.net",
+}
+
+# 逐服务验证过的额外掩护域名 (同 CDN、同段、且自身 SNI 未被封锁)。
+# 与 VENDOR_COVER_SNI 的区别: 后者是"该厂商通用掩护", 这里是"某个具体服务的对症掩护"。
+EXTRA_VERIFIED_COVERS = {
+    "objects.githubusercontent.com": (
+        "GitHub raw 家族对症掩护: 与 raw 同处 185.199.x 同段、自身 SNI 未被封锁。"
+        "2026-10-01 实测 32 个 GitHub 域名中仅 raw.githubusercontent.com 被 SNI 硬阻断"
+        "(4 IP × 3 轮 TCP 全通但 TLS 全 RST, IPv6 路径同样 RST), 而用本域名作掩护 SNI、"
+        "Host 保持 raw.githubusercontent.com 时返回 200 与真实文件内容。"
+    ),
+}
+
+VENDOR_COVER_UNSUPPORTED = {
+    "cloudflare": "Cloudflare 要求 SNI 与 Host 一致, 掩护 SNI 实测返回 403",
+    "cloudfront": "CloudFront 拒绝跨分发掩护 SNI (实测 421 Misdirected Request)",
+}
+
+# 「自分发掩护」例外: CloudFront 不接受**别的分发/别的租户**的域名作 SNI, 但允许用
+# **同一个分发**的其他别名 (含其 *.cloudfront.net 默认域名) —— 这类用法不是域名前置,
+# 而是该分发自身的合法入口。huggingface 即长期使用该分发的默认域名作 SNI。
+VENDOR_SELF_DISTRIBUTION_SUFFIX = {
+    "cloudfront": (".cloudfront.net",),
+}
+
+
+def is_self_distribution_cover(vendor: str, cover: str) -> bool:
+    """判断掩护 SNI 是否属于该厂商的"同分发自有域名"例外"""
+    suffixes = VENDOR_SELF_DISTRIBUTION_SUFFIX.get(str(vendor or "").strip().lower(), ())
+    cover = str(cover or "").strip().lower()
+    return bool(cover) and any(cover.endswith(s) for s in suffixes)
+
+
+def suggest_cover_sni(vendor: str) -> Optional[str]:
+    """按 CDN 厂商给出可用的掩护 SNI; 该厂商不支持时返回 None (调用方须放弃伪 SNI 路线)"""
+    return VENDOR_COVER_SNI.get(str(vendor or "").strip().lower())
+
 
 
 @dataclass
@@ -58,8 +114,21 @@ class ServiceProfile:
     measure_throughput: bool = False          # 是否在测速时实测下行吞吐 (B/s), 用于大文件/git pack 排序
     probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
     probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
+    cdn_vendor: str = ""                      # 上游 CDN 厂商 (fastly/akamai/cloudflare/cloudfront), 决定伪 SNI 是否可行
+    skip_cdn_probe: bool = False              # 跳过 TCP/TLS 测速 (QUIC_DIRECT 服务 TCP 侧本就被 RST, 探测只会得到假阴性)
+    requires_dns_backend: bool = False         # 必须由本机 DNS 下发解析结果才能生效 (QUIC 直连类)
+                                               # —— 默认的 Hosts 模式无法传递 HTTPS RR, 这类服务在
+                                               # Hosts 模式下"启用了也不可用", 因此不纳入默认启用
     proxy_connect_by_domain: bool = False     # 代理通道探测时 CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT 规则直连、CDN geo 限制中国 IP 的场景)
     ech_enabled: bool = False                 # 经本地 ECH 隧道直连 (要求目标托管在 Cloudflare; 见 docs/ech-tunnel-proposal.md)
+    websocket: bool = False                   # 该服务的 location / 需要透传 WebSocket 升级头 (Connection "upgrade")
+    # 让 nginx 对上游 404 也执行换节点重试。
+    # 通用模板默认【不】重试 404 —— 因为 githubassets / crates.io / google_fonts 等服务的
+    # 根路径 404 属正常响应, 重试纯属浪费。但当 upstream 内混有"错误 vhost"节点时
+    # (该节点对该域名返回 404 而非超时), 不重试就意味着 404 被原样透传给用户 ——
+    # nginx 的 max_fails 熔断只对连接失败/超时生效, 对"成功返回 404"完全无感。
+    # 故仅对已确认存在此类节点的服务开启 (minecraft / xbox, 详见各自 candidate_ips 注释)。
+    retry_on_404: bool = False
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -112,6 +181,7 @@ PROFILES: List[ServiceProfile] = [
         icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_store",
+        cdn_vendor="akamai",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 统一伪 SNI
         candidate_ips=["23.1.179.144", "23.46.229.9", "104.91.87.202", "96.7.99.225"]
     ),
@@ -124,6 +194,7 @@ PROFILES: List[ServiceProfile] = [
         icon="gamepad",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_community",
+        cdn_vendor="akamai",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 实测最佳伪 SNI 绕过 GFW 且 Akamai 响应 200 OK
         candidate_ips=["23.1.179.144", "23.46.229.9", "104.91.87.202", "96.7.99.225"],
         # Host 分流 (由 nginx_generator 特判渲染 map 实现): api.steampowered.com 保持原 Host
@@ -142,6 +213,7 @@ PROFILES: List[ServiceProfile] = [
         icon="zap",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_akamai",
+        cdn_vendor="akamai",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 统一伪 SNI
         enable_cache=True,  # 开启本地磁盘缓存，防击穿并消除频次冲击
         # 403/404 放行: Akamai 对 steamstatic 根路径返回 403 (无根文档, 实测确定性响应,
@@ -195,13 +267,40 @@ PROFILES: List[ServiceProfile] = [
         id="xbox",
         group="gaming",
         name="Xbox 微软游戏生态",
-        desc="Xbox 商店、支持与游戏生态 (Azure + Akamai)",
-        domains=["xbox.com", "www.xbox.com", "store.xbox.com", "support.xbox.com"],
+        desc="Xbox 商店、支持与游戏生态 (Akamai)",
+        # 2026-09-29 修复: 移除裸域 xbox.com。
+        # 该域由 Azure 段服务 (证书含 xbox.com, 301), 而其子域由 Akamai 服务
+        # (证书 *.xbox.com, 307/302) —— 两者后端完全不同。混合进同一条 upstream 会
+        # 同时踩两个坑: 裸域在 Akamai 节点上返回 400, 子域在 Azure 节点上返回 404;
+        # 而 nginx 的 proxy_next_upstream 既不接受 http_400 (写了直接 [emerg] 起不来,
+        # 项目已有实测记录), 默认又不重试 404 —— 单条 upstream 无法同时容错两侧。
+        # 裸域直连实测可用 (DNS 解析到 Azure 段并 301 → www.xbox.com), 按"能直连的
+        # 不加"原则不加速; 用户访问 xbox.com 时经直连 301 跳到 www 后即进入加速接管。
+        # support.xbox.com 亦移除: 其真实后端是 Azure Front Door
+        # (fde-sxc-ui-pme-prod-*.b01.azurefd.net → 150.171.110.135/136, 证书含
+        # support.xbox.com, 返回 200), 与 www/store 的 Akamai 后端不同源。
+        # 该域在 Akamai 节点上恒返回 400 Bad Request —— 而 http_400 **不在**
+        # nginx proxy_next_upstream 编译期白名单内 (写进去直接 [emerg] 起不来),
+        # 无法靠重试规避, 只能不放进这条 upstream。实测直连可用 (200), 按
+        # "能直连的不加"原则不加速。
+        domains=["www.xbox.com", "store.xbox.com"],
         icon="gamepad",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_xbox",
         ssl_sni_mode="host",
-        candidate_ips=["20.76.201.171", "20.70.246.20", "20.231.239.246", "20.112.250.133", "104.83.196.58", "150.171.110.133"]
+        # 清理依据 (openssl 实测, 证书 SAN + 状态码双验证):
+        #   以下 5 个 Akamai 节点 -> www 307 / store 302, 证书均为 *.xbox.com ✅
+        #     (Akamai 按 SNI 路由且边缘为多客户共享, 同段 IP 不可通用 —— 实测
+        #      104.83.196.57/.59/.60/.90 的证书分别是 nike / dell / godaddy /
+        #      dentalcremer, 故只能用解析到 xbox 属性的这几个)
+        #   20.70.246.20 / 20.231.239.246 / 20.112.250.133 / 20.76.201.171
+        #     -> 子域 404, 证书 reroute443.microsoft.com ❌
+        #        (一个与 Xbox 完全无关的微软内部路由服务, 比 minecraft 的
+        #         *.azureedge.net 更彻底 —— 该段从未服务过 xbox 子域)
+        candidate_ips=["104.83.196.58", "23.214.124.57", "104.89.105.188",
+                       "23.207.192.64", "23.41.36.71"],
+        probe_domains=("www.xbox.com", "store.xbox.com"),
+        retry_on_404=True,  # 兜底: 若将来再混入错误 vhost 节点, 换节点重试而非透传 404
     ),
     ServiceProfile(
         id="minecraft",
@@ -213,7 +312,26 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_minecraft",
         ssl_sni_mode="host",
-        candidate_ips=["150.171.110.137", "184.28.7.173", "184.28.7.166", "184.28.7.164"]
+        # 2026-09-29 修复"频繁 Page not found":
+        # 原候选池混入了 Azure 段 (150.171.110.137 / .70) —— 该段只服务【裸域】
+        # minecraft.net (308), 对 www.minecraft.net 与 account.mojang.com 会落到
+        # Azure 默认站点, 返回 266KB 的 "Page not found" 页面, 且证书退化为
+        # *.azureedge.net (正确证书应为 *.minecraft.net)。证书 SAN 是判定"错误
+        # vhost"的黄金判据 —— 错误 vhost 返回的是默认站点证书, 一眼可辨。
+        # 因 profile 的 probe_domains 原为空, 测速只探测 domains[0] (裸域),
+        # Azure 段凭 308 被判"三态全通"而混入主力池; 而用户实际访问的是 www 子域,
+        # 于是轮询到 Azure 节点时 (2/5 ≈ 40%) 直接 404 —— 实测今日真实流量
+        # 15 请求 5 个 404 (33.3%), 与节点占比吻合。
+        # 清理依据 (openssl 实测, 证书 SAN + 状态码双验证):
+        #   184.28.7.164/166/173 -> 301/302/301  证书 minecraft.net,*.minecraft.net ✅
+        #   23.49.104.170/181    -> 301/302/301  证书 *.minecraft.net + *.mojang.com ✅
+        #   150.171.110.137/.70  -> 308/404/404  证书 *.azureedge.net ❌ (已移除)
+        candidate_ips=["184.28.7.166", "184.28.7.164", "184.28.7.173",
+                       "23.49.104.181", "23.49.104.170"],
+        # 全域探测: 三个域全部验证。这是根本防线 —— 只要探测覆盖用户实际访问的
+        # 子域, 只服务裸域的节点就无法再蒙混进主力池 (与 github_web 同做法)。
+        probe_domains=("minecraft.net", "www.minecraft.net", "account.mojang.com"),
+        retry_on_404=True,  # 兜底: 若仍有漏网的错误 vhost 节点, 换节点重试而非透传 404
     ),
 
     # --------------------------------------------------------------------------
@@ -230,7 +348,7 @@ PROFILES: List[ServiceProfile] = [
             "payment.pixiv.net", "factory.pixiv.net", "comic.pixiv.net", "novel.pixiv.net",
             "imp.pixiv.net", "sensei.pixiv.net", "fanbox.pixiv.net",
             "source.pixiv.net", "i1.pixiv.net", "i2.pixiv.net", "i3.pixiv.net", "i4.pixiv.net",
-            "app-api.pixiv.net", "lc-event.pixiv.net"
+            "app-api.pixiv.net", "lc-event.pixiv.net", "embed.pixiv.net"
         ],
         icon="palette",
         mode=ServiceMode.L7_NGINX,
@@ -244,22 +362,24 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="empty",  # 保留: 非 ECH 路径 (relay 代理转发) 仍按空 SNI 直通
         candidate_ips=["104.18.42.239", "172.64.145.17", "104.18.10.118", "104.18.11.118"]
     ),
-    # embed.pixiv.net 已实测并放弃 (2026-08): Cloudflare geo 限制中国 IP (直连 403/RST),
-    # 仅代理可用 -> 按"仅代理可用的服务不加入"原则移除 (影响面小, 代理本身即可解决)。
+    # embed.pixiv.net 复测后并入本组 (2026-09-28): 2026-08 曾判为"仅代理可用"而放弃,
+    # 该判断实为误读 —— 当时观察到的 RST 耗时仅 0.15s, 是 GFW 按明文 SNI 的关键字
+    # 阻断特征, 而非 Cloudflare 的地理封锁 (CF 地理封锁返回 HTTP 错误页, 不会瞬断)。
+    # 有 ECH 隧道后复测: 与主站同 zone (证书 *.pixiv.net / Google Trust Services)、
+    # 同边缘 IP 池, 明文 SNI 全灭而经隧道 28/28 成功, 稳定性与主站等价, 故并入。
+    # 无需独立 IP 池: 隧道白名单按后缀匹配 pixiv.net 已覆盖, 本组 candidate_ips 直接复用。
     # proxy_connect_by_domain 字段保留: 通用能力, 未来同类场景可直接启用
     ServiceProfile(
         id="pixiv_img",
         group="acg",
         name="Pixiv pximg 插画 CDN",
         desc="解决插画大图破图，二次打开从本地磁盘缓存加载",
-        domains=[
-            "i.pximg.net", "s.pximg.net", "source.pixiv.net", "imgaz.pixiv.net",
-            "hls1.pixivsketch.net", "hls2.pixivsketch.net", "hls3.pixivsketch.net", "hls4.pixivsketch.net",
-            "hls5.pixivsketch.net", "hls6.pixivsketch.net", "hls7.pixivsketch.net", "hls8.pixivsketch.net",
-            "hls9.pixivsketch.net", "hls10.pixivsketch.net", "hls11.pixivsketch.net", "hls12.pixivsketch.net",
-            "hlsa1.pixivsketch.net", "hlsa2.pixivsketch.net", "hlsa3.pixivsketch.net", "hlsa4.pixivsketch.net",
-            "hlsc1.pixivsketch.net", "hlsc2.pixivsketch.net", "hlse1.pixivsketch.net", "hlse2.pixivsketch.net"
-        ],
+        # 2026-09 复测调整:
+        # - 移除 source.pixiv.net: 已随主站迁至 Cloudflare, 实际由 pixiv_web (ECH 隧道)
+        #   接管, 留在本组只会与 pixiv_web 重复声明 server_name。
+        # - 移除 imgaz.pixiv.net: 池段实测 RST, 其真实后端 74.86.17.48 亦 TCP 超时。
+        # - 新增 booth.pximg.net: BOOTH 商品图, 实测与 pximg 同后端 (210.140.139.x 返回 301)。
+        domains=["i.pximg.net", "s.pximg.net", "booth.pximg.net"],
         icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_img",
@@ -267,6 +387,12 @@ PROFILES: List[ServiceProfile] = [
         enable_cache=True,
         candidate_ips=["210.140.139.131", "210.140.139.132", "210.140.139.133", "210.140.139.134", "210.140.139.135", "210.140.139.136", "210.140.139.137", "210.140.139.149", "210.140.139.150"]
     ),
+    # Pixiv Sketch 直播流 (hls1~12 / hlsa / hlsc / hlse .pixivsketch.net) 已移除 (2026-09):
+    # 原先与 pximg 合并在 pixiv_img 内共用 upstream, 但两者是两套后端 —— 实测 pximg 的
+    # 210.140.139.129~150 池段对 hls*.pixivsketch.net 恒定返回 421 Misdirected Request
+    # (应用层明确拒绝, 非抖动), 而其真实后端 (DoH 解析到的 210.140.139.172~174 与
+    # 103.97.176.x / 103.56.16.x) 全部 TCP 不可达 = 线路级封锁。
+    # 既有池段用不了、正确后端连不上, 符合"仅代理可用的服务不加入"原则, 故整体移除。
     ServiceProfile(
         id="pixiv_fanbox",
         group="acg",
@@ -309,7 +435,14 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_vndb",
         ssl_sni_mode="host",
-        candidate_ips=["217.182.194.133",
+        # 2026-09-29 修复: 原 IPv4 候选 217.182.194.133 是【错误 vhost】——
+        # 其证书为 srv12.arobases.fr (与 VNDB 完全无关的域名), 对 t.vndb.org 返回
+        # 200 的是它的"默认站点"页面。正是这个 200 让它长期被误判为健康节点:
+        # 探测只比对状态码, 而错误 vhost 只需返回一份 200 就能骗过状态码检查。
+        # 真实解析 (阿里 DoH) 为 82.192.72.172, 证书 SAN 含 s.vndb.org /
+        # s2.vndb.org / t.vndb.org —— 这才是正确后端, 对两域均正常服务
+        # (其对根路径的 404 属"图片 CDN 无根文档", 是正常响应)。
+        candidate_ips=["82.192.72.172",
                        "2001:1af8:5301:117:1c00:d7ff:fe00:ffd"]  # IPv6 实测可用
     ),
     ServiceProfile(
@@ -358,18 +491,40 @@ PROFILES: List[ServiceProfile] = [
         probe_timeout=2.0,  # Fastly/Azure 跨洋链路高丢包, 适度放宽档位 (原 3.0 致单任务预算 11.8s 拖慢整体测速)
         measure_throughput=True,  # git clone 的 smart-HTTP pack 走 github.com, 用真实下载吞吐排序
         # 全域探测: 主域 + API 域双验证 (GFW 可能只特判封锁 api.github.com SNI 而网页仍通)
-        # 404 放行: raw 容灾段 (.133) 对 api.github.com 根路径返回 404 (Fastly 识别虚拟主机但无根文档)
+        # 404 放行: 保留 —— 部分 Fastly 段对"有 vhost 但无根文档"的路径确实返回 404。
+        # 但须注意其固有局限: 放行 404 无法区分"根路径无文档"与"错误 vhost 返回 404",
+        # 且副域验证共用同一放行集, 命中放行码时不触发 http_subdomains_ok=False 降权。
+        # 原 .133 段正是借此蒙混过关 (详见 candidate_ips 处注释), 已从候选池移除。
         probe_domains=("github.com", "api.github.com"),
         probe_ok_statuses=(404,),
         # 稳定性策略: 跨网络(Azure/Fastly/Pages) 跨段(逐段封锁互为兜底) 跨协议(IPv4/IPv6) 三层容灾
-        # 实测: 140.82.113.22 / 140.82.113.21 / 140.82.114.22 证书有效且 git 端点延迟最低 (~1.4s) 置顶
-        stable_ips=["140.82.113.22", "140.82.113.21", "140.82.114.22", "20.27.177.113"],  # 已知稳定段, 排序稳优先
+        # 2026-09 复测修正: 原置顶的 140.82.113.22/21 + 140.82.114.22 (GitHub 自建机房) 现建连
+        #   252~272ms, 而已在候选池中的 20.27.177.113 / 20.205.243.165 / 20.205.243.166 (Azure 亚太)
+        #   仅 67~79ms —— 相差约 4 倍。原先只有前者被标为 stable, 于是 stable_penalty 把它们永久
+        #   压在快节点之上, 排序整段倒挂。现把实测快段一并纳入 stable 组: 组内仍按延迟竞争,
+        #   慢段保留在列内作为跨段兜底(某段被整段封锁时仍能顶上), 但不再占据主力位。
+        # 2026-09 复测: 20.205.243.165 / 140.82.112.25 / 140.82.112.17 / 140.82.114.26
+        #   已从候选池移除 —— 五采样全量返回 400 Bad Request, 而 140.82.113.22 与
+        #   20.27.177.113 同期恒定 200。
+        #   必须清理而不能指望重试兜住: nginx 的 proxy_next_upstream 状态码白名单只支持
+        #   403/404/429/500/502/503/504, 不接受 http_400 (写了直接 [emerg] 起不来),
+        #   故上游一旦返回 400 就会被原样透传给用户。
+        #   20.205.243.166 同期为恒定 403 但予以保留: 403 在白名单内, nginx 会自动切节点。
+        stable_ips=["20.27.177.113", "20.205.243.166",
+                    "140.82.113.22", "140.82.113.21", "140.82.114.22"],  # 已知稳定段, 排序稳优先
         candidate_ips=["140.82.113.22", "140.82.113.21", "140.82.114.22",  # 实测证书有效+最低延迟 (git clone 最快)
                        "20.27.177.113", "20.200.245.247",  # Azure 亚太 (次选)
-                       "20.205.243.166", "20.205.243.165", "20.205.243.168",  # Fastly 新加坡段 (github520 现行推荐)
-                       "140.82.112.25", "140.82.114.21", "140.82.112.17", "140.82.114.26", "140.82.113.22",  # Fastly Anycast 全球段 (github520 实测)
+                       "20.205.243.166", "20.205.243.168",  # Fastly 新加坡段 (github520 现行推荐)
+                       "140.82.114.21",  # Fastly Anycast 全球段 (github520 实测)
                        "140.82.121.4", "140.82.114.4", "140.82.113.4", "140.82.112.4",  # GitHub 官方 IP 列表段
-                       "185.199.108.133", "185.199.109.133", "185.199.110.133", "185.199.111.133",  # 跨段容灾: raw 段实测可服务 github.com (200), GFW 逐段封锁时互为兜底
+                       # 原 .133 段 (185.199.108~111.133, 注释为"跨段容灾") 已移除 (2026-09):
+                       # 该段属 *.githubusercontent.com 的 Fastly 服务, 并不服务本站点的多个子域 ——
+                       # community / education / enterprise / classroom / redirect .github.com
+                       # 以及 api.github.com 在其上恒定返回 404 (community 为 3/3 采样恒定),
+                       # 而正确后端返回 301/200。且本 profile 的 probe_ok_statuses=(404,) 会把这个
+                       # "错误 vhost"与"根路径无文档"一并放行, 连 probe_domains 多域验证也不触发
+                       # 降权 —— 即该段能否进主力纯属排序巧合, 非设计可控。
+                       # 该段在其真实归属的 github_raw 中仍为候选主力, 此处容灾职责由原生 IPv6 段承担。
                        "2606:50c0:8000::154", "2606:50c0:8001::154",  # GitHub 原生 IPv6, 实测直连可用
                        "2606:50c0:8002::154", "2606:50c0:8003::154"]
     ),
@@ -389,7 +544,11 @@ PROFILES: List[ServiceProfile] = [
         icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_raw",
-        ssl_sni_mode="host",
+        cdn_vendor="fastly",
+        # raw.githubusercontent.com 是 32 个 GitHub 域名中唯一被 SNI 硬阻断者 (TCP 通但 TLS 一律 RST,
+        # IPv6 路径同样被拦); 同段的 objects.githubusercontent.com 未被封锁, 用它作掩护 SNI 即可
+        # 正常取回 raw 内容 (实测 HTTP 200 + 真实文件正文)。Host 仍由 nginx 保持真实域名。
+        ssl_sni_mode="objects.githubusercontent.com",
         stable_ips=["185.199.109.133", "185.199.108.133"],  # 实测低延迟稳定段 (github520 现行推荐 109 段)
         candidate_ips=["185.199.109.133", "185.199.108.133", "185.199.110.133", "185.199.111.133",
                        "2606:50c0:8000::154", "2606:50c0:8001::154",  # GitHub 原生 IPv6, 实测直连可用
@@ -495,7 +654,8 @@ PROFILES: List[ServiceProfile] = [
         icon="cpu",
         mode=ServiceMode.L4_RELAY,  # 采用 L4 Relay 旁路高带宽下载，突破 Nginx 缓冲与体积限制
         upstream_name="upstream_huggingface",
-        ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",
+        cdn_vendor="cloudfront",
+        ssl_sni_mode="d1cnjqbqjby1vq.cloudfront.net",  # 同分发自有域名 (非跨租户域名前置)
         measure_throughput=True,  # 模型权重 LFS 大文件, 按真实下载吞吐排序
         # 候选池按 2026-08 实测延迟排序 (CloudFront Anycast), 测速引擎会再次动态优选
         stable_ips=["54.230.71.56", "3.175.207.31", "3.175.207.30"],
@@ -559,18 +719,61 @@ PROFILES: List[ServiceProfile] = [
         enable_cache=True,  # 纯静态 JS/CSS, 本地磁盘缓存收益大
         candidate_ips=["104.18.22.203", "172.64.150.76", "104.16.1.34"]
     ),
+    # NuGet 三拆 (2026-09): 原为单个 nuget profile, 但三个域的真实后端分属三个平台,
+    # 且 IP 互不通用 —— 实测任一候选 IP 只对其中一部分域是有效前端:
+    #   api.nuget.org        Azure App Service 香港 (23.101.10.x)
+    #   www.nuget.org        Azure Front Door      (172.183.192.203)
+    #   globalcdn.nuget.org  Akamai                (184.26.91.x / 23.32.91.x)
+    # 合池的后果是 nginx 轮询必然将请求打到错误后端, 实测 (三次采样恒定):
+    #   www.nuget.org       @ 23.101.10.141 → 404 Site Not Found (Azure 默认站点)
+    #   api.nuget.org       @ 172.183.192.203 → 超时
+    #   globalcdn.nuget.org @ 池中全部 IP → 404 (其 Akamai 后端原先一个都不在池中)
+    # 其中 globalcdn 是 .nupkg 包体下载域 (api 的索引会 302 过去), 该域不可用
+    # 等于 dotnet restore / nuget install 无法下载任何包。
     ServiceProfile(
-        id="nuget",
+        id="nuget_api",
         group="dev",
-        name="NuGet 包索引",
-        desc=".NET 包索引与文件分发加速 (Azure, 110ms 实测)",
-        domains=["api.nuget.org", "www.nuget.org", "globalcdn.nuget.org"],
+        name="NuGet 包索引 API",
+        desc="dotnet/nuget 客户端索引与元数据 (Azure App Service 香港)",
+        domains=["api.nuget.org"],
         icon="terminal",
         mode=ServiceMode.L7_NGINX,
-        upstream_name="upstream_nuget",
+        upstream_name="upstream_nuget_api",
         ssl_sni_mode="host",
-        candidate_ips=["23.101.10.141", "23.101.10.113", "23.101.8.183",
-                       "172.183.192.203"]  # www.nuget.org 当前实测解析 (Azure 新段, 200)
+        # 2026-09 复测: 仅 .141 可达 (302); .113 与 8.183 已 TCP 超时, 保留作跨段兜底
+        # (探测层会自动剔除, 仅在主力全挂时才会被兜底分支用到)
+        candidate_ips=["23.101.10.141", "23.101.10.113", "23.101.8.183"]
+    ),
+    ServiceProfile(
+        id="nuget_www",
+        group="dev",
+        name="NuGet 官网",
+        desc="nuget.org 网页与包详情页 (Azure Front Door + IIS)",
+        domains=["www.nuget.org"],
+        icon="file_text",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_nuget_www",
+        ssl_sni_mode="host",
+        # 52.159.113.5 虽是 nuget.org 主域的解析结果, 实测同样正确服务 www vhost (200),
+        # 用作冗余避免单点; nuget.org 主域本身未纳入 profile —— 实测可直连且仅 301 跳转到
+        # www, 按"能直连的不加"原则不加速, 跳转后的 www 已由本 profile 接管。
+        candidate_ips=["172.183.192.203", "52.159.113.5"]
+    ),
+    ServiceProfile(
+        id="nuget_cdn",
+        group="dev",
+        name="NuGet 包下载 CDN",
+        desc=".nupkg 包体与客户端分发 (Akamai)，dotnet restore 下包必经",
+        domains=["globalcdn.nuget.org", "dist.nuget.org"],
+        icon="rocket",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_nuget_cdn",
+        ssl_sni_mode="host",
+        # 400 放行: globalcdn 根路径实测恒定返回 400 Bad Request (纯对象存储, 无根文档),
+        # 而真实包路径 /packages/<id>.<ver>.nupkg 三个节点均 200; dist 根路径为 301。
+        # 不放行则 domains[0] (globalcdn) 的根路径探测会被判可疑 → 该服务永远走兜底。
+        probe_ok_statuses=(400,),
+        candidate_ips=["184.26.91.32", "184.26.91.88", "23.32.91.198"]
     ),
     ServiceProfile(
         id="maven_central",
@@ -654,6 +857,163 @@ PROFILES: List[ServiceProfile] = [
         ssl_sni_mode="host",
         enable_cache=True,
         candidate_ips=["104.17.25.14", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+
+    # --------------------------------------------------------------------------
+    # 2026-10-01 新增: 由"替代路线"实测解锁的服务
+    #   伪 SNI 路线 (Fastly / Akamai): ssl_sni_mode 填掩护域名, nginx 以该 SNI 连上游,
+    #     Host 仍为真实域名 —— 实测 imgur 302 / twitch 200 / myanimelist 200。
+    #   QUIC 路线 (Cloudflare 等): QUIC_DIRECT 模式, 由本机 DNS 下发真实 IP 与
+    #     HTTPS RR(alpn=h3), 浏览器自行走 HTTP/3 —— 实测 reddit/discord/stackoverflow 均 200。
+    #   证据与复现脚本见 docs/uplift-route-findings.md。
+    # --------------------------------------------------------------------------
+    ServiceProfile(
+        id="imgur",
+        group="acg",
+        name="Imgur 图床",
+        desc="Reddit/社交常用图床 (Fastly, 伪 SNI 掩护可直连, 图片可缓存)",
+        # 子资源域必须一并登记: 只登记主域会得到"页面能开、图片全破"的假可用
+        # (s.imgur.com 静态资源 / api.imgur.com 接口域, 实测掩护 SNI 下 302/301 正常)
+        domains=["imgur.com", "www.imgur.com", "i.imgur.com", "s.imgur.com", "api.imgur.com",
+                 # Stack Exchange 的图片域 (问题/回答里的配图): 干净解析指向 198.252.206.17,
+                 # 而**系统解析被污染成 31.13.112.4** (Facebook 段), 自身 SNI 实测 502;
+                 # 经 imgur 同款掩护通道 (www.fastly.com) 实测返回 301 -> 并入本画像处理。
+                 "i.stack.imgur.com"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_imgur",
+        cdn_vendor="fastly",
+        ssl_sni_mode="www.fastly.com",   # Fastly 实测接受 SNI≠Host, 且原站 SNI 已被 RST
+        enable_cache=True,
+        candidate_ips=["146.75.92.193", "199.232.192.193", "199.232.196.193"]
+    ),
+    ServiceProfile(
+        id="myanimelist",
+        group="acg",
+        name="MyAnimeList 动漫资料库",
+        desc="欧美向动漫评分与资料库 (Akamai, 伪 SNI 掩护可直连)",
+        # 同上: cdn(图片) / api / static 是页面内容与海报图的来源, 缺任一个都会"有页面没图"
+        domains=["myanimelist.net", "www.myanimelist.net",
+                 "cdn.myanimelist.net", "api.myanimelist.net", "static.myanimelist.net"],
+        icon="book",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_myanimelist",
+        cdn_vendor="akamai",
+        ssl_sni_mode="steambroadcast.akamaized.net",  # 与 steam_akamai 同款 Akamai 掩护域名
+        # 图片/接口域对根路径返回 404/400 属确定性正常响应 (无根文档), 需放行否则被判"全挂"
+        probe_ok_statuses=(400, 404),
+        probe_domains=("myanimelist.net", "cdn.myanimelist.net"),
+        candidate_ips=["23.33.184.235", "23.33.184.234"]
+    ),
+    # twitch_web 已于 2026-10-01 移除: 主域 www.twitch.tv 经伪 SNI 掩护可加载 (200), 但页面内容
+    # 依赖的 gql/api/passport/assets.twitch.tv 实测 —— api/passport 在掩护 SNI 下返回 421 (不在该
+    # Fastly 服务上), 而用其自身 SNI 又是 tls_rst (SNI 被阻断或不在可用池内), 即"主页能开、内容
+    # 永远出不来"。按项目筛选原则 (不通的服务一律不加入, 不做假可用), 不予登记。
+    # 注: static.twitchcdn.net / usher.ttvnw.net 走 CloudFront 本就可达, 无需也不应劫持。
+    ServiceProfile(
+        id="reddit",
+        group="dev",
+        name="Reddit 论坛",
+        desc="全球最大兴趣社区 (经本机 nginx + Fastly 掩护 SNI 直连, 含图片/视频/样式域)",
+        # 媒体域为什么必须走这里而不是 DIRECT (2026-10-01 用临时 nginx 复现生产路径实测):
+        #   掩护 SNI=www.fastly.com 时 i.redd.it / styles.redditmedia.com / emoji.redditmedia.com /
+        #   b.thumbs.redditmedia.com 返回 404, v.redd.it / preview.redd.it / external-preview.redd.it /
+        #   packaged-media.redd.it 返回 403 (根路径无权限, 属正常) —— 都是 Fastly **已服务**该域;
+        #   而**自身 SNI 一律 502** (被阻断) —— 所以 DIRECT(钉真实 IP + 自身 SNI) 会把图片/视频全部弄坏。
+        #   反例: i.redditmedia.com 掩护下返回 421 (Fastly 拒绝跨租户) -> 不得登记。
+        domains=["reddit.com", "www.reddit.com", "old.reddit.com",
+                 "i.redd.it", "v.redd.it", "preview.redd.it", "external-preview.redd.it",
+                 "packaged-media.redd.it", "styles.redditmedia.com",
+                 "b.thumbs.redditmedia.com", "emoji.redditmedia.com"],
+        icon="message",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_reddit",
+        cdn_vendor="fastly",
+        # 2026-10-01 实测: 自身 SNI 被 RST, 但掩护 SNI=www.fastly.com 时
+        # @199.232.161.140 返回 **200 + CN=*.reddit.com** (Fastly 接受跨租户掩护 SNI)。
+        # 因此无需 QUIC/ECH —— 浏览器经本机 nginx (本地 CA 证书) 即可正常加载,
+        # 不再依赖"浏览器自行采用 HTTP/3"(该前提已被 netlog 证伪, 见 docs 第十四节)。
+        ssl_sni_mode="www.fastly.com",
+        candidate_ips=["199.232.161.140", "199.232.113.140"]
+    ),
+    ServiceProfile(
+        id="reddit_static",
+        group="dev",
+        name="Reddit 静态资源",
+        desc="Reddit 前端 JS/CSS 资源域 (实测自身 SNI 可用, 仅需修正被污染的解析)",
+        # 为什么单独成画像而不并进 reddit: 后端行为不同 —— reddit 主域与**媒体域**必须用掩护 SNI
+        # (自身 SNI 一律 502), 而 www.redditstatic.com 实测**自身 SNI 可用** (curl --resolve 到
+        # 199.232.161.140 返回 404, 即 Fastly 正常服务), 只需把被污染的解析结果钉回真实 IP,
+        # 不涉及掩护/QUIC。合池会把资源域也推上掩护通道, 属多域错配
+        # (与 nuget 三拆、myanimelist 的 fal/mxj 同类教训)。
+        domains=["redditstatic.com", "www.redditstatic.com"],
+        icon="code",
+        mode=ServiceMode.DIRECT,      # 只钉真实 IP, 不经本机反代
+        cdn_vendor="fastly",
+        ssl_sni_mode="host",
+        # 必须放行 404 并把探测域钉到 www: 静态资源站**根路径本就返回 404**(无索引页),
+        # 而 _suspect_status 把 400-404 判为"可疑节点"→ 全部候选被淘汰 → 界面显示
+        # "reddit 测速总失败"(实测踩到)。apex redditstatic.com 无服务, 因此只探 www。
+        probe_ok_statuses=(403, 404),
+        probe_domains=("www.redditstatic.com",),
+        candidate_ips=["199.232.161.140", "199.232.113.140"]
+    ),
+    # stackoverflow 于 2026-10-01 移除: 实测 **可直连** —— 系统解析干净 (198.252.206.x,
+    # Stack Exchange 自有边缘), 自身 SNI 对 www/apex/cdn.sstatic.net 分别返回 302/403/307,
+    # 无需任何加速 (早期按 QUIC_DIRECT 登记属误判, 见 docs 第十六节)。
+    # 它真正被影响的是**图片域** i.stack.imgur.com (系统解析被污染成 31.13.112.4, 自身 SNI 502),
+    # 已并入 imgur 画像走掩护通道处理 —— 这属于"只加速不可达的部分"。
+    ServiceProfile(
+        id="discord",
+        group="dev",
+        name="Discord 社区",
+        desc="开发者与玩家社区 (经本机 ECH 隧道直连 Cloudflare, 浏览器无需支持 HTTP/3)",
+        # 域名必须覆盖客户端真正连的每一跳 (2026-10-01 依用户实测反馈补齐):
+        #   - cdn.discordapp.com / media.discordapp.net / images-ext-*: 头像、表情、附件与外链图片;
+        #   - discord.gg / discordapp.net: 邀请链接与旧域跳转;
+        #   - status.discord.com: 客户端的服务状态轮询 (实测经 ECH 隧道 200)。
+        # 注意: **WebSocket 网关 gateway.discord.gg 已拆成独立画像 discord_gateway** ——
+        # 它需要 Connection "upgrade" 头, 而通用块为保 upstream keepalive 用的是字面量空串,
+        # 两者不能共用一个 server 块 (见 nginx_generator 的说明)。
+        # 这些域名同时是 ECH 隧道白名单的来源 (隧道按 ech_enabled 服务的 domains 聚合) ——
+        # 未登记会被隧道直接拒绝 (实测 19 字节的 403 "domain not allowed")。
+        domains=["discord.com", "www.discord.com", "discordapp.com", "discordapp.net",
+                 "cdn.discordapp.com", "media.discordapp.net",
+                 "images-ext-1.discordapp.net", "images-ext-2.discordapp.net",
+                 "discord.gg", "status.discord.com"],
+        icon="message",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_discord",
+        cdn_vendor="cloudflare",
+        # 2026-10-01 实测: Cloudflare **拒绝跨租户掩护 SNI** —— cloudflare.com/www.cloudflare.com/
+        # challenges.cloudflare.com/cloudflare-ech.com 四种掩护组合 × 2 个 CF 边缘 IP 全部返回 403;
+        # 自身 SNI 又被 RST。只有 ECH 的加密内层 SNI 能同时通过两者, 而项目自带 ECH 隧道实测
+        # discord.com -> 200 + 真实 HTML、www.reddit.com -> 200, 故 discord 走 ECH 隧道。
+        # ssl_sni_mode 仅在"隧道不健康"的退化分支生效 (与 pixiv_web 同款处理)。
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        candidate_ips=["162.159.137.232", "162.159.136.232"]
+    ),
+    ServiceProfile(
+        id="discord_gateway",
+        group="dev",
+        name="Discord 网关 (WebSocket)",
+        desc="Discord 客户端长连接网关 (经本机 ECH 隧道 + WebSocket 升级头)",
+        # 为什么必须单独成画像: 它的路径是 `/` 而不是 `/ws/`, 因此**不能**靠 pixiv 那种
+        # "/ws/ 专用 location" 来补升级头; 而通用块为保 upstream keepalive 用的是编译期
+        # 字面量空串 Connection "" —— 那会把浏览器的 WS 升级头清掉, 客户端表现为
+        # "[WS CLOSED] An error with the websocket occurred" 无限重连 (实测事故)。
+        # 拆出来后只有这一个域付出 "Connection: upgrade" 的代价, discord.com 的
+        # keepalive 优化不受影响。
+        domains=["gateway.discord.gg"],
+        icon="wifi",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_discord_gateway",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,          # 与 discord 同走 ECH 隧道 (实测 WS 握手 101 Switching Protocols)
+        websocket=True,            # 关键: 让生成器写 Connection "upgrade"
+        ssl_sni_mode="empty",      # 仅隧道不健康时的退化分支
+        candidate_ips=["162.159.137.232", "162.159.136.232"]
     )
 ]
 
@@ -864,6 +1224,61 @@ NAVIGATOR_SERVICES = [
         "domain": "huggingface.co",
         "icon": "cpu",
         "tags": ["AI", "大模型", "Transformers", "机器学习", "HuggingFace"]
+    },
+
+    # 2026-10-01 替代路线解锁的站点 (详见 docs/uplift-route-findings.md)
+    {
+        "id": "imgur_site",
+        "group": "acg",
+        "name": "Imgur 图床",
+        "desc": "Reddit / 社交平台最常用图床 (Fastly, 伪 SNI 掩护直连)",
+        "url": "https://imgur.com",
+        "domain": "imgur.com",
+        "icon": "image",
+        "tags": ["图床", "图片", "Imgur", "贴图"]
+    },
+    {
+        "id": "myanimelist_site",
+        "group": "acg",
+        "name": "MyAnimeList 动漫资料库",
+        "desc": "欧美向动漫评分、排行榜与追番记录 (Akamai)",
+        "url": "https://myanimelist.net",
+        "domain": "myanimelist.net",
+        "icon": "book",
+        "tags": ["动漫", "评分", "追番", "MAL"]
+    },
+    {
+        "id": "reddit_site",
+        "group": "dev",
+        "name": "Reddit 社区",
+        "desc": "全球最大兴趣社区 (经本机 nginx + Fastly 掩护 SNI 直连, 浏览器直接可开)",
+        "url": "https://www.reddit.com",
+        "domain": "www.reddit.com",
+        "icon": "message",
+        "tags": ["社区", "论坛", "Reddit", "讨论"]
+    },
+    {
+        "id": "stackoverflow_site",
+        "group": "dev",
+        "name": "Stack Overflow",
+        "desc": "全球最大编程问答社区 (实测可直连, 无需加速; 图片域走 Imgur 画像)",
+        "url": "https://stackoverflow.com",
+        "domain": "stackoverflow.com",
+        "icon": "terminal",
+        "tags": ["编程", "问答", "StackOverflow", "报错"]
+    },
+    {
+        "id": "discord_site",
+        "group": "dev",
+        "name": "Discord 社区",
+        "desc": "开发者与玩家社区 (经本机 ECH 隧道直连 Cloudflare, 浏览器直接可开)",
+        "url": "https://discord.com",
+        "domain": "discord.com",
+        "icon": "message",
+        "tags": ["社区", "语音", "Discord", "开发群"]
     }
 ]
+
+
+
 
