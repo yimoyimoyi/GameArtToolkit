@@ -1758,25 +1758,39 @@ class CDNOptimizer:
         return "\n".join(lines)
 
     def _augment_block_with_pool(self, block: str, srv_id: str) -> str:
-        """把画像候选池里**旧块尚缺**的 IP 以 `backup` 身份补进旧块 (正文其余原样保留)
+        """把画像候选池里**旧块尚缺**的 IP 补进旧块; 若该块用了负载均衡方式则**不带 backup**
 
-        为什么是"补 backup"而不是"重建": 旧块是上一次的**实测快照**, 没重新测速就不该
-        改动它 (单测 TestIncrementalMerge 守的正是这条)。但"什么都不动"会让单点故障被
-        **永久固化** —— 实测 upstream_reddit 只有一个后来超时的 151.101.77.140, 而画像
-        自带的 199.232.161.140 / 199.232.113.140 在掩护 SNI 下是 301 可用, 却因为
-        "旧块里没有"而永远进不去, 服务直接 504。
-        补 backup 是两全: 已测量的主力一个不动, 候选池成为可接管的冗余。
+        为什么"补"而不是"重建": 旧块是上一次的**实测快照**, 没重新测速就不该改动它
+        (单测 TestIncrementalMerge 守的正是这条)。但"什么都不动"会让单点故障被**永久固化**
+        —— 实测 upstream_reddit 只有一个后来超时的 151.101.77.140, 而画像自带的
+        199.232.161.140 / 199.232.113.140 在掩护 SNI 下是 301 可用却永远进不去, 服务直接 504。
+
+        ⚠ 负载均衡方式与 ackup **互斥**: nginx 拒绝 hash/least_conn/ip_hash/random
+        与 ackup 并存 ("balancing method does not support parameter backup"), 而
+        pixiv_web (hash  consistent) 与 pixiv_img (least_conn) 正是这两种
+        ⇒ 带 backup 会让**整份配置被拒载**。这里同时**净化历史污染**: 早期版本无条件追加
+        backup, 而旧块是原样复用的, 非法组合会被永久固化 —— 只修"新追加的"不够。
+
+        ⚠ 顺序很关键 (2026-10-02 实测踩到): 净化必须放在**任何 early-return 之前**。
+        本函数一度有两份 missing 早返回, 而 pixiv_web 的候选**本来就在块里**
+        ⇒ missing 为空 ⇒ 在第一份早返回处直接 return, 净化永远跑不到, 于是配置一直非法。
+        "洗一遍再判断"—— 判断所依赖的文本必须先洗干净。
         """
         pool = [ip for ip in (CANDIDATE_IPS.get(srv_id, []) or []) if ip]
         if not pool:
             return block
+        balancing = any(re.search(rf"^\s*{d}\b", block, re.M)
+                        for d in ("hash", "least_conn", "ip_hash", "random"))
+        if balancing:
+            block = re.sub(r"^(\s*server\s+[^\s;]+\s+)backup\s+", r"\1", block, flags=re.M)
         missing = [ip for ip in pool if ip not in block]
         if not missing:
             return block
         idx = block.rfind("}")
         if idx < 0:
             return block
-        add = "\n".join(self._fmt_server(ip, "backup " + _upstream_server_opts())
+        flag = "" if balancing else "backup "
+        add = "\n".join(self._fmt_server(ip, flag + _upstream_server_opts())
                         for ip in missing[:5])
         return block[:idx].rstrip("\n") + "\n" + add + "\n" + block[idx:]
 

@@ -456,6 +456,24 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
             "had_hosts": applied_hosts, "had_nrpt": applied_nrpt}
 
 
+def is_pac_mode(mode: str) -> bool:
+    """该后端是否属于 **PAC 家族** (pac / pac_auto) —— 请一律用它, 不要写 `== MODE_PAC`
+
+    为什么必须抽出来 (2026-10-02 用户实测, 一次真实回归):
+      `is_redirect_applied()` 原先写的是 `normalize_mode(cfg) == MODE_PAC`, **漏了
+      pac_auto**。而 pac_auto 分支会**故意清掉 hosts 规则**(Hosts 优先于 PAC, 残留会造成
+      "有的能开有的不能"), 于是:
+        · `hosts.is_applied()` → False
+        · `normalize_mode(cfg) != MODE_NRPT` → 直接 return False
+      ⇒ 判定为"未生效", 尽管 PAC 后端在跑、AutoConfigURL 也已写入。
+      后果就是用户在界面上看到的:**点"开启加速"永远只能再开一次**, 按钮与状态条不变化
+      —— 因为 `toggle_acceleration()` 每次都认为"当前没开"。
+      与 `wildcard_capable()` 同一手法: 判据写成**能力/族查询**, 新增同族后端时
+      不必回头改每一处比较点。
+    """
+    return str(mode or "").strip().lower() in (MODE_PAC, MODE_PAC_AUTO)
+
+
 def is_redirect_applied(cfg: Dict[str, Any], hosts, nrpt=None,
                         pac_mgr=None) -> bool:
     """判定重定向是否处于生效状态 (任一后端生效即为真, 兼容 NRPT 回退 Hosts 的场景)
@@ -464,7 +482,8 @@ def is_redirect_applied(cfg: Dict[str, Any], hosts, nrpt=None,
     此处也必须查同一个实例, 否则会报"未生效"而实际后端在跑 (两边各查各的 = 假状态)。
     """
     # PAC 后端以"两个监听端口都在"为准 (它不写任何系统状态, 所以只能看进程内状态)
-    if normalize_mode(cfg) == MODE_PAC and (pac_mgr or _PAC).running:
+    # ⚠ 必须用 is_pac_mode(): 只写 == MODE_PAC 会把 pac_auto 漏掉 —— 见其 docstring。
+    if is_pac_mode(normalize_mode(cfg)) and (pac_mgr or _PAC).running:
         return True
 
     try:

@@ -58,9 +58,18 @@ DEFAULT_CONFIG = {
     "dns_listen_port": 5353,
     "upstream_dns_servers": ["223.5.5.5", "119.29.29.29"],
 
-    # 加速域名解析劫持后端: "hosts" (写系统 Hosts, 默认) | "nrpt" (写 Windows NRPT 策略表)
-    # NRPT 需要管理员权限 + 独占 53/UDP; 条件不满足且 nrpt_auto_fallback 为真时自动回退 Hosts
-    "redirect_mode": "hosts",
+    # 加速域名解析劫持后端: "pac_auto" (默认) | "pac" | "hosts" | "nrpt"
+    #
+    # ★ 默认为何是 pac_auto 而不是 hosts (2026-10-02 按用户决策变更):
+    #   通配域名 (如 *.clients6.google.com、动态节点名 rr1---sn-xxx.googlevideo.com)
+    #   **只有具备通配能力的后端才劫持得到**, 而 Hosts 不支持通配 —— 在 Hosts 下
+    #   googlevideo 会被硬拦、gemini 的会话端点会静默漏走 (实测"页面能开、对话不通")。
+    #   pac_auto 免管理员、通配是一等公民、运行中的浏览器即刻采纳, 且只改**一个**
+    #   注册表值 (AutoConfigURL), 备份还原面最小。
+    #   NRPT 仍保留但**不再推荐**: 它要管理员 + 独占本机 53/UDP, 改的是整机 DNS,
+    #   残留危害最大 (数百域名被指向没人监听的 127.0.0.1:53), 且实测其 cmdlet 会在
+    #   某些环境下抛 EndProcessing NullReferenceException (源码环境复现不出)。
+    "redirect_mode": "pac_auto",
     "nrpt_auto_fallback": True,
 
     # QUIC(HTTP/3) 直连服务的优选 IP 顺序 (由 quic_probe 用真实 QUIC 握手测速生成)
@@ -148,12 +157,19 @@ def _sanitize_config(data: dict) -> dict:
         data["enabled_services"] = list(DEFAULT_ENABLED_SERVICES)
         data["known_service_ids"] = sorted(SERVICES_BY_ID)
 
-    # 2. 归一化重定向后端取值 (非法值一律回落 Hosts, 保证历史行为不受损)
-    #    pac_auto: 同上, 但把 PAC 写进 Windows「自动配置脚本」(不拉起浏览器, 实测
-    #              运行中的浏览器会当场采用; 退出时自动还原用户原有代理设置)
+    # 2. 归一化重定向后端取值
+    #    ⚠ 这里刻意区分**"键缺失"与"值非法"** (2026-10-02):
+    #      · 键缺失 = 用户还没表达过偏好 ⇒ 用当前默认 pac_auto;
+    #      · 值非法 = 配置被手改坏了 ⇒ 回落 hosts。
+    #        为什么不跟着用 pac_auto: pac_auto 会**写系统的自动配置脚本**(注册表),
+    #        拿一个坏配置去触发注册表写入是过激的副作用; hosts 只是"不生效", 安全得多。
+    #        配置坏掉时应当"少做", 而不是"换一种方式做"。
+    #    pac_auto: 把 PAC 写进 Windows「自动配置脚本」(不拉起浏览器, 实测运行中的
+    #              浏览器会当场采用; 退出时自动还原用户原有代理设置)
     #    pac: PAC + 本地 CONNECT 转发, 把通配表达在 PAC 的 JS 里
     #         —— 免管理员、不写注册表、不占 53、不动系统 DNS (见 app/pac_redirect.py)
-    mode = str(data.get("redirect_mode", "hosts") or "hosts").strip().lower()
+    _raw = data.get("redirect_mode", DEFAULT_CONFIG["redirect_mode"])
+    mode = str(_raw if _raw else DEFAULT_CONFIG["redirect_mode"]).strip().lower()
     data["redirect_mode"] = mode if mode in ("hosts", "nrpt", "pac", "pac_auto") else "hosts"
 
     return data

@@ -1088,6 +1088,11 @@ PROFILES: List[ServiceProfile] = [
             "waa-pa.clients6.google.com",
             "geminiweb-pa.clients6.google.com",
             "ogads-pa.clients6.google.com",
+            # ★ aistudio 的 PA 主机 (2026-10-02 真机日志): 用户在有 aistudio 时控制台报
+            #   `alkalimakersuite-pa.clients6.google.com/$rpc/.../MakerSuiteService/ListModels`
+            #   → net::ERR_CONNECTION_TIMED_OUT —— 与 geminiweb-pa 完全同一类:
+            #   只被 `*.clients6.google.com` 覆盖, 而 Hosts 不支持通配 ⇒ 从没被劫持。
+            "alkalimakersuite-pa.clients6.google.com",
             # —— 模型 API (AI Studio / SDK 直连) ——
             # 注意: 这些域未登记时会被解析到 127.0.0.1 却落到默认 server (400),
             # 属"看着像通了"的失败, 故必须显式登记。

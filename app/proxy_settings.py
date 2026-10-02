@@ -29,9 +29,12 @@ GameArt Toolkit - WinINET 自动配置脚本 (PAC) 发布器 (2026-10-02 新增)
 
 只操作**当前用户**的设置, 且只碰上述三个值; 不做任何机器级改动。
 """
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+from win_utils import get_silent_startup_kwargs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -165,7 +168,35 @@ def restore(backup: Dict[str, Any]) -> Tuple[bool, str]:
         return True, "非 Windows 平台, 无需还原"
     winreg = _winreg()
     values = (backup or {}).get("values") or {}
-    try:
+
+    def _readback() -> Dict[str, Any]:
+        """用**同一个** winreg 句柄回读 (不能调 read_current(): 它会重新导入真实模块,
+        在注入替身的测试里会去读真实注册表, 于是"校验"本身失真)"""
+        now: Dict[str, Any] = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY) as k2:
+                for name in _BACKUP_VALUES:
+                    try:
+                        now[name] = winreg.QueryValueEx(k2, name)
+                    except FileNotFoundError:
+                        pass
+        except FileNotFoundError:
+            pass
+        return now
+
+    def _mismatch(now: Dict[str, Any]) -> list:
+        bad = []
+        for name in _BACKUP_VALUES:
+            if name in values:
+                want = values[name][0]
+                got = (now.get(name) or [None])[0]
+                if got != want:
+                    bad.append(f"{name} 未写成 (期望 {want!r}, 实际 {got!r})")
+            elif name in now:
+                bad.append(f"{name} 未删除 (仍为 {now[name][0]!r})")
+        return bad
+
+    def _apply() -> None:
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY, 0,
                                 winreg.KEY_SET_VALUE) as k:
             for name in _BACKUP_VALUES:
@@ -177,8 +208,61 @@ def restore(backup: Dict[str, Any]) -> Tuple[bool, str]:
                         winreg.DeleteValue(k, name)
                     except FileNotFoundError:
                         pass
-        _notify_change()
-        return True, "系统代理设置已还原"
+
+    try:
+        # ★ 为什么是"删 → 通知 → 回读 → 必要时**再删一次**" (2026-10-02 实测定因):
+        #   本函数原先无条件返回成功; 实测它在返回"系统代理设置已还原"的同时,
+        #   AutoConfigURL **原封不动**留在注册表里 —— 用户的浏览器会一直去取一个
+        #   已经不存在的本地 PAC。
+        #   进一步实测把责任定位清楚了: `winreg.DeleteValue` **本身完全正常**
+        #   (朴素 CreateKeyEx+KEY_SET_VALUE+DeleteValue 一把就删掉了)。真正的问题是
+        #   紧接着的 `_notify_change()` —— 通知 WinINET 刷新之后, 那个值**又回来了**
+        #   (WinINET 的自动配置缓存在刷新时会把值写回注册表)。
+        #   所以"删一次就完事"这个前提本身不成立: 必须**通知之后再回读, 不符就再删**。
+        #   与本项目另两处教训同源 (certutil -delstore、NRPT cmdlet): 绝不把
+        #   "命令没报错"当成"已生效", 一律写完回读。
+        surviving: list = []
+        for attempt in (1, 2):
+            # ★★ 顺序是**先通知、后改注册表** —— 这是本轮定因的核心结论 (2026-10-02)。
+            #   原先写的是 _apply() 然后 _notify_change(), 表现为"删了没用": 逐步打印
+            #   证明 DeleteValue **四个值全都成功**(手工复刻后注册表真的变成 {}), 但紧接着
+            #   的 _notify_change() 让 **WinINET 把它缓存的代理配置写回注册表** ——
+            #   删掉的四个值原样复活, 连我们从未设置过的 ProxyOverride / ProxyServer
+            #   都带着**原始取值**回来, 这是"缓存回写"而非"删除失败"的确证。
+            #   所以必须先通知(让它把缓存吐完), 再落我们的最终状态, 且其后**不再通知**。
+            _notify_change()
+            _apply()
+            surviving = _mismatch(_readback())
+            if not surviving:
+                return True, ("系统代理设置已还原"
+                              + ("" if attempt == 1 else f" (第 {attempt} 次尝试才生效)"))
+        return False, ("系统代理还原**未真正生效** (命令未报错但回读不符): "
+                       + "; ".join(surviving))
+    except Exception as e:
+        return False, f"还原系统代理设置失败: {type(e).__name__}: {e}"
+        # ---- 兜底: 走**已证实可用**的路径 (2026-10-02) ----
+        # 实测定因: winreg.DeleteValue 单独用**完全正常** (朴素
+        # CreateKeyEx+KEY_SET_VALUE+DeleteValue 一把就删掉了 AutoConfigURL),
+        # 但在本函数里连删两次都不生效 —— 根因未查明。
+        # 此时不能只"如实报失败"就收手: 留下 AutoConfigURL 指向一个已死的本地 PAC,
+        # 用户的浏览器会一直去取它; 而 pac_auto 现在是**默认后端**, 每次退出都撞这条路。
+        # reg.exe 是独立进程, 不共享本进程的注册表视图, 实测能清除。
+        if any(s.startswith("AutoConfigURL") for s in surviving):
+            _notify_change()          # 同上: 先让它回写, 再删
+            try:
+                # ⚠ reg.exe 要**完整的 hive 前缀**, 而 _SETTINGS_KEY 是 winreg 的相对路径
+                #   —— 少了 HKCU\\ 会静默什么都不做 (reg 返回非零但不抛异常)。
+                subprocess.run(["reg", "delete", "HKCU\\\\" + _SETTINGS_KEY,
+                                "/v", "AutoConfigURL", "/f"],
+                               capture_output=True, timeout=5, shell=False,
+                               **get_silent_startup_kwargs())
+            except Exception:
+                pass
+            surviving = _mismatch(_readback())
+            if not surviving:
+                return True, "系统代理设置已还原 (经 reg.exe 兜底清除)"
+        return False, ("系统代理还原**未真正生效** (命令未报错但回读不符): "
+                       + "; ".join(surviving))
     except Exception as e:
         return False, f"还原系统代理设置失败: {type(e).__name__}: {e}"
 

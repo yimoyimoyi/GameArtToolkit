@@ -1972,7 +1972,7 @@ class MainWindow(QMainWindow):
                     self,
                     f"[{_name}] 已开启, 但 Hosts 后端劫持不到它的通配域名 "
                     f"({'/'.join(_gaps[service_id])}) —— 页面可开, 而这些子域仍会走真实解析"
-                    f"(可能超时, 如 Gemini 的会话端点)。改用 PAC / NRPT 后端可完整覆盖。",
+                    f"(可能超时, 如 Gemini 的会话端点)。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                     toast_type="warning", duration=9000)
         self._update_service_icon(service_id, checked)
         cfg = load_config()
@@ -4094,10 +4094,16 @@ class MainWindow(QMainWindow):
         row_mode.addStretch()
         self.combo_redirect_mode = QComboBox()
         for _label, _value in (
-                ("Hosts 注入（需管理员）", MODE_HOSTS),
-                ("NRPT 策略表（需管理员 + 空闲 53）", MODE_NRPT),
+                # ★ 顺序即推荐度 (2026-10-02 按用户决策): PAC 置首, NRPT 移末尾。
+                #   为什么 PAC 优先: 免管理员 + 通配是一等公民 (用 host.endsWith 表达)
+                #   + 只改**一个**注册表值, 还原面最小。
+                #   为什么 NRPT 垫底: 要管理员 + 独占本机 53/UDP + 改整机 DNS,
+                #   残留危害最大 (数百域名被指向没人监听的 127.0.0.1:53),
+                #   且实测其 cmdlet 会抛 EndProcessing NullReferenceException (源码环境复现不出)。
+                ("PAC 自动配置脚本（推荐·免管理员·免重启浏览器）", MODE_PAC_AUTO),
                 ("PAC + 启动浏览器（免管理员）", MODE_PAC),
-                ("PAC 自动配置脚本（免管理员·免重启浏览器）", MODE_PAC_AUTO)):
+                ("Hosts 注入（需管理员；不支持通配）", MODE_HOSTS),
+                ("NRPT 策略表（不推荐：需管理员 + 独占 53，冲突面大）", MODE_NRPT)):
             self.combo_redirect_mode.addItem(_label, _value)
         _cur = normalize_redirect_mode(cfg)
         _i = self.combo_redirect_mode.findData(_cur)
@@ -5327,7 +5333,7 @@ class MainWindow(QMainWindow):
             show_toast(self,
                        f"⚠ 当前 Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域名: "
                        f"{self._format_gap_note(_gap_note)} —— 这些子域仍走真实解析, "
-                       f"相关功能可能超时。改用 PAC / NRPT 后端可完整覆盖。",
+                       f"相关功能可能超时。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                        toast_type="warning", duration=10000)
 
         self._start_status_probe()

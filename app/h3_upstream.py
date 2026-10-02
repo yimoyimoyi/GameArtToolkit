@@ -1014,6 +1014,17 @@ def make_handler(forwarder: H3Forwarder,
             origin = self.headers.get("Origin")
             if origin:
                 self.send_header("Access-Control-Allow-Origin", origin)
+                # ★ `Access-Control-Allow-Credentials: true` **必须**一并带上
+                #   (2026-10-02 真机日志定因): YouTube 的播放器用
+                #   `credentials: 'include'` 取 /videoplayback。当我们的腿返回 502 时,
+                #   错误响应只有 Allow-Origin、没有 Allow-Credentials, 于是 Chrome 报的是
+                #     "The value of the 'Access-Control-Allow-Credentials' header in the
+                #      response is '' which must be 'true' when the request's credentials
+                #      mode is 'include'"
+                #   —— **真实原因是 502, 却被说成 CORS 头缺失**, 播放器也无法按状态码退避重试。
+                #   这正是本项目记录过的同一类掩盖 ("32 条 CORS 错误, 逐条追下去全是 502 的
+                #   次生症状")。带上它, 真因(状态码)才看得见。
+                self.send_header("Access-Control-Allow-Credentials", "true")
                 self.send_header("Access-Control-Expose-Headers",
                                  "X-H3-Upstream-Error, Content-Length, Content-Range")
                 self.send_header("Vary", "Origin")
@@ -1440,7 +1451,8 @@ def blocked_services(services, redirect_mode: str, profiles_by_id=None) -> Dict[
                 f"[{getattr(p, 'name', sid)}] 依赖动态节点名的**通配**解析下发 "
                 f"({'/'.join(getattr(p, 'domains', None) or [])})，"
                 f"而当前解析后端 (Hosts) 不支持通配 —— 节点名不会被劫持，"
-                f"会表现为「页面能开而视频永远转圈」。请改用 NRPT 后端。")
+                f"会表现为「页面能开而视频永远转圈」。请改用 PAC 后端 "
+                f"(免管理员, 且 PAC 能在 JS 里表达通配 —— 见 app/pac_redirect.py)。")
     return out
 
 
@@ -1460,7 +1472,8 @@ def check_preconditions(redirect_mode: str) -> List[str]:
         blockers.append(
             "当前解析后端为 Hosts, 但使用 HTTP/3 上游腿的服务依赖**动态节点名**"
             "(如 rr1---sn-xxxx.googlevideo.com), Hosts 不支持通配 → 节点名不会被劫持, "
-            "会表现为'页面能开而视频永远转圈'。请改用 NRPT 后端。")
+            "会表现为'页面能开而视频永远转圈'。请改用 PAC 后端 "
+            "(免管理员; PAC 用 host.endsWith() 表达通配, 无需 DNS 具备任何通配能力)。")
     return blockers
 
 
