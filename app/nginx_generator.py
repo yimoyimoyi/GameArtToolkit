@@ -47,6 +47,60 @@ class NginxConfGenerator:
     # ECH 隧道上游判定
     # ------------------------------------------------------------------
     @classmethod
+    def _upstream_names_in_file(cls, upstream_conf: Path) -> Set[str]:
+        """解析 upstream-dynamic.conf 里已定义的 upstream 名
+
+        为什么要单独有它 (2026-10-02 实测事故): L7 画像的 upstream 由 CDNOptimizer
+        **实测后**写入该文件; 若某个画像还没被测过 (例如刚新增), 生成器会照旧输出
+        `proxy_pass {scheme}://{profile.upstream_name}` —— 而 upstream_name 为空时
+        就得到 `proxy_pass https://;`。这不是"该服务不可用", 而是**整个 nginx 拒绝加载**
+        (`nginx -t` 直接报 "no host in upstream \"\"") ⇒ 全部服务一起挂。
+        实测就是这样把一次新增画像变成了全量故障, 故这里提供回落所需的名单。
+        """
+        if not upstream_conf.exists():
+            return set()
+        try:
+            text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return set()
+        return set(re.findall(r"upstream\s+(upstream_[a-z0-9_]+)\s*\{", text))
+
+    @classmethod
+    def _static_fallback_upstream(cls, profile) -> str:
+        """为"动态 upstream 尚未测出"的画像生成内联 upstream 块 (可能是空串)
+
+        为什么用静态 candidate_ips 回落, 而不是干脆跳过该站点:
+          · 跳过 = 域名被劫持到本机却**没有站点** ⇒ 落到默认 server, 浏览器拿到
+            不匹配的证书或不相干的响应 —— 正是本轮反复出现的"假覆盖";
+          · 用内联 upstream 至少能走 profile 里已实测过的静态 IP, 与"动态优选"相比
+            只是不最优, 但**是通的**。
+        仅当 candidate_ips 为空时返回空串 (此时调用方必须报错, 不能静默输出空 upstream)。
+        """
+        ips = [ip for ip in (getattr(profile, "candidate_ips", None) or []) if ip]
+        if not ips:
+            return ""
+        # 惰性导入: 熔断参数由 cdn_optimizer 统一管理, 此处不得再造一套 (否则两边会漂移)
+        try:
+            from cdn_optimizer import _upstream_server_opts as _opts_fn
+            opts = _opts_fn()
+        except Exception:
+            opts = "max_fails=1 fail_timeout=5s"
+        name = getattr(profile, "upstream_name", "") or f"upstream_{profile.id}"
+        lines = [
+            f"# [回落] {profile.id} 的动态优选尚未测出, 使用画像自带的静态 IP",
+            f"upstream {name} {{",
+        ]
+        for ip in ips:
+            # ⚠ 必须带端口。实测教训: 写成裸 IP 时 nginx 会**默认用 80 端口**, 而中继听的是
+            # 443 ⇒ 全部候选连不上, 站点返回 502。项目里动态写出的 upstream 都是
+            # `ip:443` 形式 (见 upstream-dynamic.conf), 这里必须与之一致。
+            # 若 candidate_ips 里已自带端口则原样保留。
+            addr = ip if ":" in ip and not ip.count(":") > 1 else f"{ip}:443"
+            lines.append(f"    server {addr} {opts};")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    @classmethod
     def _ech_services_from_upstream(cls, upstream_conf: Path) -> Optional[Set[str]]:
         """从 upstream-dynamic.conf 解析实际走 ECH 隧道的服务 id 集合
 
@@ -529,10 +583,49 @@ server {{
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         results = {}
+        upstream_conf = target_dir / "upstream-dynamic.conf"
         if ech_services is None:
-            ech_services = cls._ech_services_from_upstream(target_dir / "upstream-dynamic.conf")
+            ech_services = cls._ech_services_from_upstream(upstream_conf)
         if h3_services is None:
-            h3_services = cls._h3_services_from_upstream(target_dir / "upstream-dynamic.conf")
+            h3_services = cls._h3_services_from_upstream(upstream_conf)
+
+        # 动态 upstream 名单 (用于回落判定, 见 _static_fallback_upstream 注释)
+        defined = cls._upstream_names_in_file(upstream_conf)
+
+        def _fallback_for(profiles):
+            """为缺动态 upstream 的 L7 画像生成内联 upstream 块
+
+            为什么必须做: 缺了它, 生成物里会出现 `proxy_pass https://;` —— nginx **整体拒载**
+            (实测 `nginx -t` 报 "no host in upstream \"\""), 于是**全部服务一起挂**, 而现场
+            看起来只是"刚加了一个画像"。这种"局部问题导致全局故障"必须在生成期就挡住。
+            若画像连静态 candidate_ips 都没有, 只能**明确报错**而不是输出空 upstream。
+            """
+            blocks, broken = [], []
+            for p in profiles:
+                # 只对**普通 L7 画像**做回落判定:
+                #   · h3_upstream 画像的 upstream 由 cdn_optimizer 无条件写成
+                #     `server 127.0.0.1:44411` (指向本机腿), 不依赖候选池;
+                #   · ech_enabled 画像的 upstream 由隧道写入, 同理;
+                #   · 二者在此之前就可能"没被写进动态文件", 若一并判为缺配就会误报
+                #     (实测: 加了本检查后 googlevideo 被误判为"无动态 upstream")。
+                if getattr(p, "h3_upstream", False) or getattr(p, "ech_enabled", False):
+                    continue
+                name = getattr(p, "upstream_name", "") or ""
+                if not name:
+                    broken.append(f"{p.id} (未设置 upstream_name)")
+                    continue
+                if name in defined:
+                    continue
+                blk = cls._static_fallback_upstream(p)
+                if blk:
+                    blocks.append(blk)
+                else:
+                    broken.append(f"{p.id} (无动态 upstream 且无 candidate_ips)")
+            if broken:
+                raise ValueError(
+                    "以下服务无法生成有效的 upstream, 会产出非法配置并导致 nginx 整体拒载: "
+                    + "; ".join(broken))
+            return blocks
 
         # 1. 渲染 site-gaming.conf
         gaming_profiles = [p for p in PROFILES
@@ -552,6 +645,7 @@ server {{
                 "    default steamcommunity.com;\n"
                 "}\n"
             )
+        gaming_blocks.extend(_fallback_for(gaming_profiles))
         for p in gaming_profiles:
             gaming_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         gaming_content = "\n".join(gaming_blocks)
@@ -566,6 +660,7 @@ server {{
             "# GameArt Toolkit - 二次元与创作者生态加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
+        acg_blocks.extend(_fallback_for(acg_profiles))
         for p in acg_profiles:
             acg_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         acg_content = "\n".join(acg_blocks)
@@ -580,6 +675,7 @@ server {{
             "# GameArt Toolkit - 开发者与 AI 平台加速规则 (由 ServiceProfile 模板自动生成)",
             "# ==============================================================================\n"
         ]
+        dev_blocks.extend(_fallback_for(dev_profiles))
         for p in dev_profiles:
             dev_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         dev_content = "\n".join(dev_blocks)

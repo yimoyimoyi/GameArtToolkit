@@ -877,7 +877,7 @@ PROFILES: List[ServiceProfile] = [
             "scholar.google.com", "books.google.com", "meet.google.com", "keep.google.com",
             "sites.google.com", "groups.google.com", "myactivity.google.com",
             "adssettings.google.com", "support.google.com", "workspace.google.com",
-            "cloud.google.com", "gemini.google.com", "notebooklm.google.com",
+            "cloud.google.com",
             "takeout.google.com", "earth.google.com",
             # ------------------------------------------------------------------
             # Google 国家/地区域名 (2026-10-02 补全, 起因: 用户给出的
@@ -1036,6 +1036,92 @@ PROFILES: List[ServiceProfile] = [
         probe_domains=("www.gstatic.com", "t0.gstatic.com"),
         candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
                        "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"]
+    ),
+    # ==========================================================================
+    # Gemini (Google AI) —— 2026-10-02 实测新增
+    #
+    # 实测结论 (经本机 nginx + relay, 逐域 curl --resolve):
+    #   · `gemini.google.com/` 与 `/app` 均 **HTTP 200 / ~855 KB 完整页面**
+    #     —— 即**网页版在现有链路上本来就能开**, 此前它挂在 google_web 的域名表里。
+    #   · `bard.google.com` / `aistudio.google.com` 实测 **400 "Invalid URL"**:
+    #     它们能**后缀命中** google_web 画像 (会被解析到 127.0.0.1), 但 **nginx 里没有站点**
+    #     ⇒ 落到默认 server 而失败。
+    #     这是一类必须警惕的**假覆盖**: "能反查到画像" ≠ "nginx 有 server_name"。
+    #     判据必须查**显式域名表**, 不能只信后缀匹配 (见 §下方 domains 注释)。
+    #   · `generativelanguage.googleapis.com` 未登记 ⇒ 落默认 server (预期)。
+    #
+    # 故单独成画像: 这些域与"Google 搜索/账号"是不同的使用场景, 用户需要能单独开关;
+    # 且把 gemini.google.com 从 google_web 移出, 避免同一域名被两处登记
+    # (PROFILES_BY_DOMAIN 是 dict, 重复登记只会静默保留其一)。
+    # ==========================================================================
+    ServiceProfile(
+        id="gemini",
+        group="dev",
+        name="Gemini (Google AI)",
+        desc="Gemini 网页版 / AI Studio / 生成式语言 API (经本机 nginx + g.cn 掩护 SNI)",
+        domains=[
+            # —— 应用本体 (实测 200; bard 为旧域, 实测应 301 到 gemini) ——
+            "gemini.google.com",
+            "bard.google.com",
+            "aistudio.google.com",
+            # NotebookLM: 同族 AI 服务 (2026-10-02 从 google_web 移入, 与 Gemini 同类场景)
+            "notebooklm.google.com",
+            # ★ gemini.gstatic.com —— 实测**页面有 18 处引用**它, 而它不在劫持集合里:
+            #   浏览器走真实 IP ⇒ `islands-bootstrap-runtime-*.js` / `islands-*.js`
+            #   报 net::ERR_CONNECTION_TIMED_OUT, 页面靠这些分片渲染, 于是界面残缺。
+            #   这是"资源主机必须逐个登记"的又一例 —— 与模型 API 不同, 它藏在
+            #   HTML 的 script src 里, 不抓页面就发现不了。
+            "gemini.gstatic.com",
+            # 同上: 岛屿(island)静态资源主机的**分片子域** (njl0.static.usercontent.goog 等),
+            # 用一层通配覆盖, 避免逐分片登记
+            "*.static.usercontent.goog",
+            # —— 模型 API (AI Studio / SDK 直连) ——
+            # 注意: 这些域未登记时会被解析到 127.0.0.1 却落到默认 server (400),
+            # 属"看着像通了"的失败, 故必须显式登记。
+            "generativelanguage.googleapis.com",
+            "aiplatform.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            # —— Google 前端辅助服务 (多个 Google 网页应用的通用依赖) ——
+            #   `*.clients6.google.com`: 实测页面引用 waa-pa / ogads-pa.clients6.google.com;
+            #   google_web 只登记了 apex, 子域会漏 ⇒ 用通配补齐。
+            "*.clients6.google.com",
+            "notifications-pa.googleapis.com",
+            "people-pa.googleapis.com",
+            "signaler-pa.googleapis.com",
+            "jnn-pa.googleapis.com",
+            "play.googleapis.com",
+            "csp.withgoogle.com",
+            "content-autofill.googleapis.com",
+            # —— 官方入口站 ——
+            "labs.google",
+            "deepmind.google",
+            # ⚠ 刻意**未登记**:
+            #   · recaptcha.net / www.recaptcha.net —— 被大量非 Google 站点共用, 无直接证据
+            #     前不扩大劫持面 (与 gvt1 家族同一口径);
+            #   · www.googletagmanager.com —— 纯统计脚本 (GTM), 实测页面缺它也能正常渲染,
+            #     登记它等于把统计流量也卷进中继, 无收益。
+        ],
+        icon="sparkles",
+        mode=ServiceMode.L7_NGINX,
+        # 掩护 SNI 必须与厂商声明配套: 测试会断言"用了掩护 SNI 的画像, 其厂商必须在
+        # 受支持名单内", 漏掉 cdn_vendor 会直接被拦下 (实测就是这条把我拦住的)。
+        cdn_vendor="google",
+        # ⚠ upstream_name 必须显式给: 留空会生成 `proxy_pass https://;` —— 非法配置,
+        #    让 nginx **整体拒载**(实测 "no host in upstream \"\""), 全部服务一起挂。
+        #    生成器现已加静态 IP 回落 + 缺配即报错 (见 nginx_generator._static_fallback_upstream),
+        #    但正确定义仍是第一道防线。
+        upstream_name="upstream_gemini",
+        enable_cache=False,
+        # ⚠ 必须与 google_web **同一条中继路径**: 那个成功的 200/~855KB 请求本来就是
+        #    经 google_web 的 server 块与中继 IP 拿到的 (当时 gemini.google.com 还在它的
+        #    域名表里), 故复用同一批 IP 与同一个掩护 SNI 是**据实**而非猜测。
+        #    漏掉这两项的直接后果实测过: candidate_ips 为空 -> 生成的 upstream 为空 ->
+        #    `nginx -t` 直接报 "no host in upstream" 拒绝重载。
+        candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
+                       "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"],
+        ssl_sni_mode="g.cn",
+        # 根路径有文档 (实测 200 且 ~855 KB), 故用默认放行状态
+        probe_domains=("gemini.google.com",),
     ),
     ServiceProfile(
         id="youtube_web",

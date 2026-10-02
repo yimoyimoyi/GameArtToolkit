@@ -180,6 +180,12 @@ SVG_TEMPLATES = {
         <polyline points="8 6 2 12 8 18"></polyline>
     </svg>""",
 
+    "sparkles": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"></path>
+        <path d="M18.5 15.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7Z"></path>
+        <path d="M5.5 3.5l.5 1.3 1.3.5-1.3.5-.5 1.3-.5-1.3L3.7 5.3l1.3-.5Z"></path>
+    </svg>""",
+
     "book": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"></path>
         <path d="M6 6h10"></path>
