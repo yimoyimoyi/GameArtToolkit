@@ -1238,7 +1238,7 @@ def wildcard_capable(redirect_mode: str) -> bool:
         (见 app/pac_redirect.py; 实测完整域名表 553 条, 播放成功)。
     判据写成能力查询, 新增后端时这里只需加一条, 不必改调用方。
     """
-    return str(redirect_mode or "").strip().lower() in ("nrpt", "pac")
+    return str(redirect_mode or "").strip().lower() in ("nrpt", "pac", "pac_auto")
 
 
 def needs_wildcard_resolution(profile) -> bool:

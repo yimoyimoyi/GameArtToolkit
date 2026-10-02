@@ -149,10 +149,12 @@ def _sanitize_config(data: dict) -> dict:
         data["known_service_ids"] = sorted(SERVICES_BY_ID)
 
     # 2. 归一化重定向后端取值 (非法值一律回落 Hosts, 保证历史行为不受损)
+    #    pac_auto: 同上, 但把 PAC 写进 Windows「自动配置脚本」(不拉起浏览器, 实测
+    #              运行中的浏览器会当场采用; 退出时自动还原用户原有代理设置)
     #    pac: PAC + 本地 CONNECT 转发, 把通配表达在 PAC 的 JS 里
     #         —— 免管理员、不写注册表、不占 53、不动系统 DNS (见 app/pac_redirect.py)
     mode = str(data.get("redirect_mode", "hosts") or "hosts").strip().lower()
-    data["redirect_mode"] = mode if mode in ("hosts", "nrpt", "pac") else "hosts"
+    data["redirect_mode"] = mode if mode in ("hosts", "nrpt", "pac", "pac_auto") else "hosts"
 
     return data
 
