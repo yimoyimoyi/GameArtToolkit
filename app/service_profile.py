@@ -1478,7 +1478,15 @@ PROFILES: List[ServiceProfile] = [
         ech_enabled=True,          # 与 discord 同走 ECH 隧道 (实测 WS 握手 101 Switching Protocols)
         websocket=True,            # 关键: 让生成器写 Connection "upgrade"
         ssl_sni_mode="empty",      # 仅隧道不健康时的退化分支
-        candidate_ips=["162.159.137.232", "162.159.136.232"]
+        candidate_ips=["162.159.137.232", "162.159.136.232"],
+        # 退化分支下根路径本就是非 2xx: 网关的真实用法是 WebSocket 升级, 裸 GET 会被
+        # Cloudflare 直接回 403 / 404 —— **这是对端自己的应答, 不是链路故障**。
+        # 证据 (2026-10-02 实测): 该 403 **带 `cf-ray` 头**, 即来自 Cloudflare,
+        # 而非本机 nginx 生成的错误页 (后者不会有 cf-ray)。
+        # 不声明它, 退化分支的探测会把候选全判"状态码可疑" ⇒ 拿不到主力位
+        # (实测 403×2 + 404×5 全部 suspect=True)。与 reddit_static 的 404 同类。
+        probe_ok_statuses=(403, 404),
+        probe_domains=("gateway.discord.gg",),
     )
 ]
 

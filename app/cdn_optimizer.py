@@ -534,6 +534,31 @@ def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeou
         raise ConnectionError(f"CONNECT 隧道建立失败: {line or '无响应'}")
 
 
+def _location_target(loc: str, domain: str) -> "tuple[str, str]":
+    """把 `Location` 解析成 (host, path) —— **相对 Location 必须按相对路径处理**
+
+    为什么单独抽成纯函数 (2026-10-02 定因):
+      原先在探测里内联解析, 对不带 `://` 的 Location 直接把 path 当成 "/" ——
+      于是"同 host + 同路径"的自我重定向判据**退化成"同 host"**, 任何相对重定向
+      都被误判成死循环, 候选被降为 rank3。
+      实测: `www.xbox.com/` 回 `307 Location: /zh-CN/` (正常的区域跳转),
+      6 个候选**全部**因此拿不到主力位。区域/语言跳转是 CDN 最常见的根路径行为,
+      误判面很宽, 所以按相对路径解析, 而不是打补丁排除某些路径。
+    返回值已剥掉 query/fragment —— 路径比较不该被它们影响。
+    """
+    loc = (loc or "").strip()
+    if "://" in loc:
+        rest = loc.split("://", 1)[1]
+        host = rest.split("/", 1)[0].lower()
+        path = ("/" + rest.split("/", 1)[1]) if "/" in rest else "/"
+    else:
+        host = (domain or "").lower()           # 相对 Location 沿用本 host
+        path = loc if loc.startswith("/") else "/" + loc
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    return host, path
+
+
+
 def _suspect_status(status: Optional[int]) -> bool:
     """HTTP 状态码是否表示"可疑节点" (网关错误 502-504 / Cloudflare 421 重路由 / 4xx 假阳性)
 
@@ -732,8 +757,9 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                                 loc = h.split(":", 1)[1].strip()
                                 break
                         if loc:
-                            loc_host = loc.split("://")[-1].split("/")[0].lower() if "://" in loc else domain.lower()
-                            loc_path = "/" + loc.split("://")[-1].split("/", 1)[1] if "://" in loc and "/" in loc.split("://")[1] else "/"
+                            # 相对 Location (如 `/zh-CN/`) 必须按相对路径解析 —— 见
+                            # _location_target 的注释 (这是 xbox 6 个候选被误降 rank3 的原因)
+                            loc_host, loc_path = _location_target(loc, domain)
                             if loc_host == domain.lower() and loc_path == "/":
                                 out["self_redirect"] = True
 
