@@ -55,6 +55,7 @@ from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
 from l4_relay import relay_server
 from ech_tunnel import ech_tunnel
 from h3_upstream import h3_proxy, check_preconditions as check_h3_preconditions
+from pac_redirect import launch_browser
 from dns_server import local_dns_server
 from env_detector import EnvDetector
 from win_utils import (
@@ -1927,7 +1928,40 @@ class MainWindow(QMainWindow):
         show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务并同步更新 Hosts", toast_type="info", duration=2000)
 
     def on_service_toggled(self, service_id: str, checked: bool):
-        """单个加速服务开关切换: 立即更新配置并在加速激活时自动调整 Hosts 规则"""
+        """单个加速服务开关切换: 立即更新配置并在加速激活时自动调整 Hosts 规则
+
+        ★ 启用边界硬门槛 (2026-10-02): 若该服务**在当前解析后端下无法生效**, 直接拒绝开启,
+        而不是让它开起来后静默失效。
+        为什么必须挡在这里: 原先只在启动时把原因拼进一句提示 —— 用户在 Hosts 模式下打开
+        googlevideo, 界面显示"已开启"、日志也无异常, 实际却是一个"页面能开而视频永远转圈"
+        的假可用 (节点名是动态的, Hosts 不支持通配, 根本劫持不到)。
+        与项目一贯原则一致: **宁可明确报错, 也不静默假可用。**
+        """
+        if checked:
+            _profile = SERVICES_BY_ID.get(service_id)
+            try:
+                from h3_upstream import blocked_services
+                _blocked = blocked_services(
+                    [service_id], (load_config() or {}).get("redirect_mode", "hosts"))
+            except Exception:
+                _blocked = {}
+            if service_id in _blocked:
+                # 关键: 配置与图标都要还原 —— 否则下次启动它仍是"已启用"状态
+                self._update_service_icon(service_id, False)
+                # 开关回弹: 必须走 service_switches 注册表 —— 并没有 sw_<id> 这种属性
+                # (第一版写成了 getattr(self, "sw_%s" % id), 那样取不到控件, 回弹会静默失效)
+                _sw = getattr(self, "service_switches", {}).get(service_id)
+                if _sw is not None:
+                    try:
+                        _sw.blockSignals(True)
+                        _sw.setChecked(False)
+                        _sw.blockSignals(False)
+                    except Exception:
+                        pass
+                _name = (_profile or {}).get("name", service_id)
+                show_toast(self, f"无法开启 [{_name}]: {_blocked[service_id]}",
+                           toast_type="warning", duration=6000)
+                return
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -4022,6 +4056,38 @@ class MainWindow(QMainWindow):
         d_layout.addWidget(self.lbl_nrpt_status)
         self.refresh_nrpt_status_label()
 
+        # 5.1c ★ PAC 免管理员方案 (2026-10-02): 把通配从 DNS 层挪到线路层
+        #      为什么单列一行而不是塞进上面的开关: `--proxy-pac-url` 是**进程级**参数,
+        #      无法靠写配置让已在运行的浏览器生效, 必须由本程序以该参数启动浏览器。
+        #      故这里是一个**动作**(启动浏览器), 而不是一个常驻开关。
+        row_pac = QHBoxLayout()
+        r_pac_text = QVBoxLayout()
+        r_pac_text.setSpacing(2)
+        lbl_pac_title = QLabel("PAC 免管理员方案 (以 PAC 启动浏览器)")
+        lbl_pac_title.setProperty("class", "ItemTitle")
+        lbl_pac_title.setWordWrap(True)
+        lbl_pac_desc = QLabel(
+            "把通配交给 PAC 脚本: 浏览器经本机隧道访问 nginx, 无需管理员、不写注册表、"
+            "不占用 53、不改系统 DNS。动态节点名 (如 rr1---sn-xxx.googlevideo.com) 依赖此方式"
+        )
+        lbl_pac_desc.setProperty("class", "ItemDesc")
+        lbl_pac_desc.setWordWrap(True)
+        r_pac_text.addWidget(lbl_pac_title)
+        r_pac_text.addWidget(lbl_pac_desc)
+        row_pac.addLayout(r_pac_text)
+        row_pac.addStretch()
+        self.btn_pac_browser = QPushButton("以 PAC 启动浏览器")
+        self.btn_pac_browser.setCursor(Qt.PointingHandCursor)
+        self.btn_pac_browser.clicked.connect(self.on_launch_pac_browser)
+        row_pac.addWidget(self.btn_pac_browser)
+        d_layout.addLayout(row_pac)
+
+        self.lbl_pac_status = QLabel("")
+        self.lbl_pac_status.setProperty("class", "ItemDesc")
+        self.lbl_pac_status.setWordWrap(True)
+        d_layout.addWidget(self.lbl_pac_status)
+        self.refresh_pac_status_label()
+
         # 5.2 上游公共 DNS 预设胶囊
         row_presets = QHBoxLayout()
         row_presets.setSpacing(8)
@@ -4968,7 +5034,26 @@ class MainWindow(QMainWindow):
                 return False
 
     def _apply_redirect(self, services: List[str]) -> Tuple[bool, str]:
-        """按 redirect_mode 应用域名重定向, 前置条件不足时自动回退 Hosts"""
+        """按 redirect_mode 应用域名重定向, 前置条件不足时自动回退 Hosts
+
+        ★ 第二道闸门 (2026-10-02): 在此**剔除**当前后端下无法生效的服务。
+        界面上的硬门槛挡不住手改配置文件这一路 —— 若只靠界面拦, 用户改完 config.json
+        重启后仍会得到一个静默失效的服务。这里在真正下发解析规则前再筛一次, 并把
+        剔除结果如实带回, 绝不"写了规则但规则无用"。
+        """
+        try:
+            from h3_upstream import blocked_services
+            _cfg = load_config() or {}
+            _blocked = blocked_services(services, _cfg.get("redirect_mode", "hosts"))
+        except Exception:
+            _blocked = {}
+        if _blocked:
+            services = [s for s in services if s not in _blocked]
+            print(f"[Redirect] 已剔除 {len(_blocked)} 个在当前解析后端下无法生效的服务: "
+                  f"{list(_blocked)}")
+            self._blocked_services_note = _blocked
+        else:
+            self._blocked_services_note = {}
         return apply_redirect(load_config(), services, hosts_mgr, nrpt_mgr,
                               local_dns_server, REDIRECT_STATE)
 
@@ -5179,9 +5264,18 @@ class MainWindow(QMainWindow):
         """
         from service_profile import PROFILES
 
-        h3_services = [p for p in PROFILES if getattr(p, "h3_upstream", False)]
+        # 只在**确实有已启用的服务**需要时才启动腿 —— 原先只看"画像定义里有没有"
+        # h3_upstream, 于是 googlevideo 明明关着, 腿也会常驻监听一个端口 (无谓的常驻面)。
+        # 与"服务未启用就不该有它的运行时"一致。
+        try:
+            _enabled = set((load_config() or {}).get("enabled_services",
+                                                     DEFAULT_ENABLED_SERVICES) or [])
+        except Exception:
+            _enabled = set(DEFAULT_ENABLED_SERVICES)
+        h3_services = [p for p in PROFILES
+                       if getattr(p, "h3_upstream", False) and p.id in _enabled]
         if not h3_services:
-            return True, "无服务使用 HTTP/3 上游腿"
+            return True, "无已启用的服务使用 HTTP/3 上游腿"
         ok, msg = h3_proxy.start()
         # 前置条件校验: 不阻断启动 (代理本身可用), 但必须**如实告知** —— 否则用户会在
         # Hosts 模式下得到一个静默失效的 googlevideo (详见 check_preconditions 注释)
@@ -5327,6 +5421,65 @@ class MainWindow(QMainWindow):
                 detail += "；提权后若 IPv4 53 被代理占用, 会自动改用 IPv6 回环 ::1 共存"
             self.lbl_nrpt_status.setText(f"NRPT 暂不可用: {detail}")
             self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
+
+    # ------------------ PAC 免管理员方案 (2026-10-02) ------------------
+    def refresh_pac_status_label(self):
+        """刷新 PAC 后端状态 (它不写任何系统状态, 所以只能看进程内状态)"""
+        if not hasattr(self, "lbl_pac_status"):
+            return
+        try:
+            from redirect_manager import _PAC as _pac
+            st = _pac.status()
+        except Exception as e:
+            self.lbl_pac_status.setText(f"PAC 状态检测异常: {e}")
+            return
+        if st.get("running"):
+            self.lbl_pac_status.setText(
+                f"PAC 后端运行中: {st['exact_hosts']} 精确 + {st['wildcard_suffixes']} 通配域名, "
+                f"PAC 地址 {st['pac_url']}, 已建立 {st['tunnels']} 条隧道")
+            self.lbl_pac_status.setStyleSheet("color: #34D399;")
+        else:
+            self.lbl_pac_status.setText(
+                "PAC 后端未运行。它把通配交给 PAC 脚本, 免管理员即可让动态节点名生效; "
+                "点击右侧按钮会自动启动后端并以 PAC 方式打开浏览器。"
+                "注意: 需先完全退出已有浏览器实例, 进程级参数才会生效。")
+            self.lbl_pac_status.setStyleSheet("color: #FBBF24;")
+
+    def on_launch_pac_browser(self):
+        """启动 PAC 后端并以 --proxy-pac-url 打开浏览器 (免管理员方案的用户入口)"""
+        try:
+            from redirect_manager import _PAC as _pac, build_domain_targets
+        except Exception as e:
+            show_toast(self, f"PAC 模块加载失败: {e}", toast_type="warning", duration=4000)
+            return
+
+        cfg = load_config() or {}
+        services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
+        domains = sorted(build_domain_targets(services).keys())
+        if not domains:
+            show_toast(self, "没有需要重定向的域名（请先启用服务）",
+                       toast_type="warning", duration=3000)
+            return
+
+        ok, msg = _pac.start(domains)
+        if not ok:
+            show_toast(self, msg, toast_type="warning", duration=6000)
+            self.refresh_pac_status_label()
+            return
+
+        # 独立配置目录: 避免与用户正在使用的浏览器实例互相干扰
+        # (Chromium 的代理参数只在"冷启动"时被采纳, 复用已有实例时会静默失效)
+        try:
+            prof = Path(BASE_DIR) / "browser_profiles" / "pac"
+            prof.mkdir(parents=True, exist_ok=True)
+            profile_dir = str(prof)
+        except Exception:
+            profile_dir = ""
+        ok2, msg2, _cmd = launch_browser(_pac, url="https://www.youtube.com/",
+                                         profile_dir=profile_dir)
+        show_toast(self, msg2, toast_type="success" if ok2 else "warning",
+                   duration=6000 if ok2 else 8000)
+        self.refresh_pac_status_label()
 
     def on_redirect_mode_toggled(self, checked: bool):
         """切换加速域名的重定向后端, 加速运行中即刻迁移, 未运行则随下次启动生效"""

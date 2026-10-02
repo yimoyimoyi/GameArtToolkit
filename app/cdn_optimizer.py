@@ -93,6 +93,19 @@ def _upstream_server_opts() -> str:
     return f"max_fails={UPSTREAM_MAX_FAILS} fail_timeout={UPSTREAM_FAIL_TIMEOUT}"
 
 
+def _local_leg_server_opts() -> str:
+    """本地常驻上游 (h3 上游腿 / ECH 隧道) 的 server 行参数: **关闭熔断**
+
+    为什么不能用候选池那套 max_fails=3 / fail_timeout=30s (2026-10-02 审阅定因):
+    那是为"CDN 候选池里混有失活节点"设计的, 套在**单 server 的本地常驻进程**上会反噬 ——
+    通道抖动 3 次 ⇒ nginx 把 127.0.0.1:44411 标记 down ⇒ 整个 fail_timeout 窗口内**连试都不试**
+    ⇒ 直接 502, 而且该状态存在 nginx 共享内存里, 只有 reload 才清。
+    本地腿要么活着要么死了, "熔断"没有任何收益, 却把分钟级抖动放大成分钟级硬中断。
+    更一般的教训: **没有健康信号时, nginx 的熔断会替你做出决定, 而且做得更差。**
+    """
+    return "max_fails=0 fail_timeout=0s"
+
+
 @dataclass(frozen=True)
 class ProbeDefaults:
     """统一测速参数中心: 收敛全部探测预算/超时魔数 (按服务档位等比缩放)
@@ -1531,10 +1544,11 @@ class CDNOptimizer:
             if getattr(PROFILES_BY_ID.get(srv_id), "h3_upstream", False):
                 lines.append(f"upstream upstream_{srv_id} {{")
                 lines.append(f"    # 经本地 HTTP/3 上游腿直连真实节点 (port={h3_upstream.PORT})")
-                lines.append(f"    server 127.0.0.1:{h3_upstream.PORT} {_upstream_server_opts()};")
-                lines.append("    keepalive 32;")
-                lines.append("    keepalive_timeout 30;")
-                lines.append("    keepalive_requests 10000;")
+                # 本地常驻腿: 关闭熔断 (见 _local_leg_server_opts 注释)
+                lines.append(f"    server 127.0.0.1:{h3_upstream.PORT} {_local_leg_server_opts()};")
+                # keepalive 指令对本腿是**死的**: 腿每条响应后都 close_connection=True。
+                # 保留会让读者以为存在连接复用; 改为如实注明, 不做无根据的承诺。
+                lines.append("    # 注: 本腿每条响应后关闭连接 (close_connection=True), 故不声明 keepalive")
                 lines.append("}\n")
                 self.last_h3_services.add(srv_id)
                 continue
@@ -1542,7 +1556,7 @@ class CDNOptimizer:
                 if ech_tunnel.is_healthy():
                     lines.append(f"upstream upstream_{srv_id} {{")
                     lines.append(f"    # 经本地 ECH 隧道直连 Cloudflare (port={ech_tunnel.port})")
-                    lines.append(f"    server 127.0.0.1:{ech_tunnel.port} {_upstream_server_opts()};")
+                    lines.append(f"    server 127.0.0.1:{ech_tunnel.port} {_local_leg_server_opts()};")
                     lines.append("    keepalive 32;")
                     lines.append("    keepalive_timeout 30;")
                     lines.append("    keepalive_requests 10000;")

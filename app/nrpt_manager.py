@@ -54,6 +54,13 @@ _RULE_CACHE_TTL = 30.0
 _PORT_STATUS_CACHE_TTL = 30.0
 _PS_TIMEOUT = 15.0
 _PS_FAST_TIMEOUT = 5.0
+# 删除规则的专用超时。为什么必须比 _PS_TIMEOUT 宽得多 (2026-10-02 实测):
+#   一条 NRPT 规则可以携带 **550 个命名空间** (本项目按已启用服务的域名写入),
+#   `Get-DnsClientNrptRule` + `Remove-DnsClientNrptRule` 在这种规模下远超 15s。
+#   实测后果**很严重**: 超时 → 规则残留 → 那 550 个域名全部指向已退出的本机解析器
+#   (`::1:53`), **整机范围解析失败**, 而应用只回一句"清理失败"就结束。
+#   ⇒ 清理路径的预算必须按"最坏数据量"给, 不能沿用查询所用的短预算。
+_NRPT_REMOVE_TIMEOUT = 60.0
 
 # 域名白名单校验: 仅放行合法主机名, 从根上杜绝构建 PowerShell 脚本时的注入面
 _DOMAIN_RE = re.compile(
@@ -397,16 +404,42 @@ class NrptManager:
         if not self.is_supported():
             return True, "当前系统不支持 NRPT, 无需清理"
 
-        script = (
-            "$own = @(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like '" + self.display_prefix + "*' })\n"
-            "$n = $own.Count\n"
-            "foreach ($r in $own) { Remove-DnsClientNrptRule -Name $r.Name }\n"
-            "Write-Output ('GAMT_NRPT_REMOVED=' + $n)\n"
-        )
-        rc, out, err = self._run_ps(script, timeout=_PS_FAST_TIMEOUT if fast else _PS_TIMEOUT)
+        # `-Force -Confirm:$false`: 删除**必须非交互**。应用退出路径上不可能有人回答确认提示,
+        # 一旦 cmdlet 因确认而等待, 就会撞上超时并把规则留在机器上 (实测事故)。
+        def _script() -> str:
+            return (
+                "$own = @(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like '"
+                + self.display_prefix + "*' })\n"
+                "$n = $own.Count\n"
+                "foreach ($r in $own) { Remove-DnsClientNrptRule -Name $r.Name -Force"
+                " -Confirm:$false }\n"
+                "Write-Output ('GAMT_NRPT_REMOVED=' + $n)\n"
+            )
+
+        budget = _PS_FAST_TIMEOUT if fast else _NRPT_REMOVE_TIMEOUT
+        rc, out, err = self._run_ps(_script(), timeout=budget)
         self._invalidate_cache()
 
-        if rc != 0 or "GAMT_NRPT_REMOVED=" not in (out or ""):
+        ok = (rc == 0 and "GAMT_NRPT_REMOVED=" in (out or ""))
+        # ★ 复核 + 重试一次 (2026-10-02 实测新增): 只看命令返回码是不够的 ——
+        # 实测"命令超时"与"规则真的没了"是两回事, 而**规则残留会让整机解析失败**。
+        # 故删除后必须**回读确认**, 未清空则再给一次更宽的机会。
+        if not fast:
+            # 注意用 list_rules(force=True): `force` 是 list_rules 的形参,
+            # list_own_rules() 不接受参数 (第一版写成 list_own_rules(force=True) 会抛
+            # TypeError, 反而把"清理失败"变成"清理时崩溃" —— 比原缺陷更糟)。
+            left = self.list_rules(force=True) or []
+            if left:
+                rc2, out2, err2 = self._run_ps(_script(), timeout=_NRPT_REMOVE_TIMEOUT * 2)
+                self._invalidate_cache()
+                left = self.list_rules(force=True) or []
+                if left:
+                    return False, (f"NRPT 清理失败: 仍有 {len(left)} 条规则残留 "
+                                   f"(残留会把命中域名指向无人监听的解析器, 请以管理员"
+                                   f"身份手动执行 Remove-DnsClientNrptRule)。"
+                                   f" 详情: {(err2 or err or out2 or out or '')[:200]}")
+
+        if not ok:
             if fast:
                 return False, "NRPT 快速清理未完成"
             detail = (err or out or "未知错误").strip()

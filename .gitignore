@@ -158,6 +158,13 @@ scripts/probe_*.py
 scripts/audit_*.py
 scripts/test_*.py
 scripts/benchmark_*.py
+# 一次性排障 / 紧急清理助手 (与 probe_* 同类: 只在本机排查时用, 不上传)
+scripts/fix_ca_trust.py
+scripts/nrpt_emergency_clean.py
+scripts/nrpt_step.py
+scripts/hosts_step.py
+scripts/connect_forwarder.py
+scripts/clean_extra_root.py
 # tools 下的开发脚本 (运行时必需的 tools/ech_tunnel/ 不受影响: 只匹配 tools/*.py)
 tools/*.py
 scripts/*.json

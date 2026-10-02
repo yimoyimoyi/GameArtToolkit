@@ -30,6 +30,7 @@ GameArt Toolkit - HTTP/3 上游腿 (nginx 明文回环 → 本模块 → HTTP/3 
 """
 
 import asyncio
+import collections
 import concurrent.futures
 import queue
 import socket
@@ -37,9 +38,10 @@ import ssl
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 # 版本前置检查 (与 cert_manager / quic_probe 一致)
 if sys.version_info < (3, 10):
@@ -56,9 +58,40 @@ PORT = 44411
 
 DEFAULT_CONNECT_TIMEOUT = 8.0
 DEFAULT_IDLE_TIMEOUT = 20.0
+# 流式目标 (SABR / 大文件) 的逐读静默上限。为什么必须显著大于 20s:
+# SABR 服务端在"播放器缓冲已满"时**合法地长时间不发数据**, 这正是它节流的实现方式。
+# 按旧的 20s 逐读超时, 这种合法静默会被当成"流已结束", 响应以 200/206 **静默截断** ——
+# 与"通道被掐"完全无法区分。300s 覆盖实测可观测到的静默长度, 且仍能兜住真正卡死的连接。
+DEFAULT_STREAM_IDLE_READ = 300.0
 MAX_RESPONSE_QUEUE = 64          # 回压: 队列满时挂起 h3 读取, 不无限缓冲
 RESPONSE_FLUSH_BYTES = 256 * 1024   # 合并小包再交给 HTTP 层 (见 _forward 注释)
 MAX_REQUEST_BODY = 8 * 1024 * 1024
+EVENT_RING_MAX = 32              # 事件环长度 (有界, 见 _EventRing)
+TAP_RING_MAX = 64                # 请求级诊断 tap 长度 (有界, 见 _RequestTap)
+# 每个候选地址的额外重试次数。
+#
+# ⚠ 默认 **0 (关闭)**, 这是**实测**结论而非保守取值 (2026-10-02):
+#   E2 用同一实验对比过 retries=0 与 retries=1 (connect 档同为 8s):
+#     retries=0 → SABR POST 成功 7/10 = 70%
+#     retries=1 → SABR POST 成功 6/19 = 32%   (target_failed 事件 3 → 20)
+#   通道是**分钟级时变**的, 所以这个对比**不能**证明"重试让它变差";
+#   但同样**没有任何证据**说明重试有用, 而存在一条可信的反向机制:
+#   每次失败都要等满 connect 档 (8s), retries=1 + 重解析轮会让一个注定失败的请求
+#   最坏耗到 6×8=48s 才回 502 —— 对 **有状态、且播放器自带分段重试** 的 SABR,
+#   "快速失败让播放器自己重试" 优于 "在网关里盲等"。
+#   因此: 默认关闭, 并保留开关与 MAX_TOTAL_ATTEMPTS / RETRY_TIME_BUDGET 两道闸门,
+#   供将来在有**同刻交错对照**的条件下重新评估。
+DEFAULT_RETRY_SAME_NODE = 0
+# 单次请求允许的总尝试次数上限 —— 防止"重试 × 候选 × 两轮"叠加出不可控的长尾
+MAX_TOTAL_ATTEMPTS = 6
+# 额外尝试的**墙钟预算** (秒)。超过即不再重试, 直接 502。
+# 为什么必须有它: 仅靠"次数上限"挡不住长尾 —— 6 次 × 8s = 48s 仍然太久。
+# 流式/有状态协议需要的是"要么成功, 要么尽快失败"。
+RETRY_TIME_BUDGET = 12.0
+
+# 不允许携带消息体的状态码 (RFC 9110 §6.4.1 / §15.3.5 / §15.4.5):
+# 204 与 304 的头部之后就结束, **既不得带 Content-Length 也不得带 Transfer-Encoding**。
+BODYLESS_STATUSES = frozenset({204, 304})
 
 # 逐跳头 (RFC 9110 §7.6.1) —— 绝不能透传
 HOP_BY_HOP = {
@@ -67,10 +100,29 @@ HOP_BY_HOP = {
 }
 
 # 响应头白名单 —— 必须保住 206/content-range/accept-ranges (视频拖动的前提)
+#
+# ⚠ 2026-10-02 实测教训: **白名单本身就是个陷阱**。
+#   YouTube 播放器是用 `fetch()` **跨源**取 SABR 的 (origin=https://www.youtube.com,
+#   target=rr*.googlevideo.com)。白名单里原本一个 `access-control-*` 都没有, 于是
+#   gvs 回的 CORS 头被**悄悄丢掉** ⇒ 浏览器判 CORS 失败 ⇒ `net::ERR_FAILED` ⇒
+#   播放器永远停在 `player_state=3 / readyState=0`。
+#   当时的证据是浏览器控制台的原话 (CDP Log):
+#     "Access to fetch at 'https://rr1---sn-….googlevideo.com/videoplayback…'
+#      from origin 'https://www.youtube.com' has been blocked by CORS policy:
+#      No 'Access-Control-Allow-Origin' header is present on the …"
+#   **现象上它和"通道不通"几乎一样 (媒体永不就绪), 但根因在我们自己的转发层。**
+#   这就是"静默丢弃"的代价: 传输层明明成功 (tap 记录 200 + 1000+B), 却因为少了一个
+#   响应头而整体失败, 且失败现场完全不在我们的日志里。
+#   ⇒ 凡是被代理方可能用于**跨源读取**的头, 都必须显式列入白名单。
 RESPONSE_KEEP = {
     "content-type", "content-length", "content-range", "accept-ranges",
     "last-modified", "etag", "cache-control", "expires", "date", "age",
     "content-encoding", "content-disposition", "vary", "server",
+    # --- 跨源 (CORS) 族: 缺一个就可能让 fetch/MSE 整体失败 ---
+    "access-control-allow-origin", "access-control-allow-credentials",
+    "access-control-expose-headers", "access-control-allow-methods",
+    "access-control-allow-headers", "access-control-max-age",
+    "timing-allow-origin", "cross-origin-resource-policy",
 }
 
 _REASON = {
@@ -87,6 +139,203 @@ _REASON = {
 # ===========================================================================
 # 纯逻辑 (可离线单测, 不碰网络)
 # ===========================================================================
+@dataclass(frozen=True)
+class TimeoutBudget:
+    """一次请求-响应周期的超时预算 —— **三档拆开, 不再让一个数值身兼三职**
+
+    为什么必须拆 (2026-10-02 代码审阅定因): 原先 `DEFAULT_CONNECT_TIMEOUT = 8.0` 同时充当
+      (a) 建连超时、(b) 逐读空闲超时、(c) 外层 Future 上限 (`timeout×2+8` = 24 s)。
+    三者耦合的后果是**整条周期硬上限 24 秒** —— 而视频流必然是分钟级, 因此任何 SABR 实验
+    都会在 24 s 处抛 TimeoutError, 得到的是这个魔数的行为, 不是 SABR 的结论。
+    (既有的"5/5 通过"之所以没暴露它: 端到端用例是 200 KB 文件与 206 切片, 全在 24 s 内完成。)
+
+    三档语义 (与项目已有的"服务级覆盖全局"先例同形, 见 `ServiceProfile.probe_timeout`):
+      connect      仅建连 + 等首个响应头 (保持较小, 让失活节点快速交棒)
+      idle_read    两次数据之间允许的最大静默 (流式必须显著放大, 见 DEFAULT_STREAM_IDLE_READ)
+      max_duration 整个周期上限; **None = 不设上限** (流式服务的正确取值)
+    """
+    connect: float = DEFAULT_CONNECT_TIMEOUT
+    idle_read: float = DEFAULT_IDLE_TIMEOUT
+    max_duration: Optional[float] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"connect": self.connect, "idle_read": self.idle_read,
+                "max_duration": self.max_duration}
+
+
+def as_budget(value: "Optional[Union[float, TimeoutBudget]]",
+              idle_read: Optional[float] = None,
+              max_duration: Optional[float] = None) -> TimeoutBudget:
+    """把旧的 `timeout: float` 形式兼容成 TimeoutBudget
+
+    关键: 裸 float 只填 connect 与 idle_read, **max_duration 一律为 None** ——
+    这正是移除"24 秒硬天花板"的那一步。传 float 的既有调用者不会再有总时长上限。
+    """
+    if isinstance(value, TimeoutBudget):
+        return value
+    connect = DEFAULT_CONNECT_TIMEOUT if value is None else float(value)
+    return TimeoutBudget(connect=connect,
+                         idle_read=float(idle_read) if idle_read else connect,
+                         max_duration=max_duration)
+
+
+def read_request_body(headers_get, rfile, max_bytes: int = MAX_REQUEST_BODY,
+                      max_chunks: int = 1_000_000) -> Tuple[bytes, Optional[str]]:
+    """按 RFC 9112 读取请求体, 返回 (body, error)
+
+    为什么不能只看 Content-Length (2026-10-02 审阅定因, 两条静默失效路径):
+      1. `Transfer-Encoding: chunked` 的体**完全不被读取** → 向上游发出**空体 POST**,
+         上游回 400/403, 现象酷似"通道不通"。nginx 的 `proxy_request_buffering off`
+         会让分块体原样转发过来, 所以这不是理论情形。
+      2. 超过 max_bytes 时 `min(length, max_bytes)` **静默截断且不报错** → 上游收到错体;
+         若走 keep-alive, 残留字节还会让后续请求错位。
+    正确处理: chunked 自行解码; 超限返回错误(**由调用方回 413**), 绝不静默截断。
+    """
+    te = (headers_get("Transfer-Encoding") or "").lower()
+    if "chunked" in te:
+        body = bytearray()
+        for _ in range(max_chunks):
+            line = rfile.readline(64)
+            if not line:
+                return bytes(body), "chunked_body_truncated"
+            try:
+                size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+            except ValueError:
+                return bytes(body), "chunked_bad_size"
+            if size == 0:
+                # 吃掉 trailer 直到空行
+                while True:
+                    t = rfile.readline(256)
+                    if not t or t in (b"\r\n", b"\n"):
+                        break
+                return bytes(body), None
+            if len(body) + size > max_bytes:
+                return bytes(body), "body_too_large"
+            chunk = rfile.read(size)
+            if len(chunk) < size:
+                return bytes(body), "chunked_body_truncated"
+            body += chunk
+            rfile.readline(2)                      # CRLF
+        return bytes(body), "chunked_too_many_chunks"
+
+    try:
+        length = int(headers_get("Content-Length") or 0)
+    except ValueError:
+        return b"", "bad_content_length"
+    if length <= 0:
+        return b"", None
+    if length > max_bytes:
+        # 不读体, 直接报错 —— 由调用方回 413 并关闭连接
+        return b"", "body_too_large"
+    return rfile.read(length), None
+
+
+def plan_http1_response(status: Optional[int],
+                        headers: Sequence[Tuple[str, str]],
+                        method: str = "GET") -> Dict[str, Any]:
+    """决定回给 nginx 的 HTTP/1.1 响应如何封装 (RFC 9110) —— 纯函数, 可离线单测
+
+    为什么需要它 (2026-10-02 审阅定因): 原实现"没有 Content-Length 就一律补
+    `Transfer-Encoding: chunked`", 于是 204/304 会发出
+
+        HTTP/1.1 204 No Content
+        Transfer-Encoding: chunked
+
+    —— 而 RFC 9110 规定 204/304 **既不得带 Content-Length 也不得带 Transfer-Encoding**。
+    这解释了一个此前被记为"未解释的互操作现象"的差异: **curl 宽容** (拿到干净的 204),
+    **Chrome 不宽容** (报 ERR_ABORTED)。同类问题还有 `do_HEAD` 会带上正文。
+    意义: 该现象很可能不是独立谜题, 而与 SABR 阻塞共享根因 —— gvs 在 SABR 会话中**确实会回 204**
+    (UMP 的握手/确认), 届时这条违规会直接打断会话。
+
+    注: "Chrome 因此 abort" 属**高置信推测**, 需 E0-1 之后一次最小实验确认。
+    """
+    code = int(status or 0)
+    method = (method or "GET").upper()
+    has_cl = any(str(k).lower() == "content-length" for k, _v in headers or [])
+    bodyless = code in BODYLESS_STATUSES or 100 <= code < 200
+    if bodyless:
+        # 头部之后即结束: 不带 CL、不带 TE、不写正文
+        return {"allow_body": False, "use_content_length": False, "chunked": False,
+                "strip_length_headers": True}
+    if method == "HEAD":
+        # HEAD 可带 Content-Length (描述实体长度) 但**不得有正文**
+        return {"allow_body": False, "use_content_length": has_cl, "chunked": False,
+                "strip_length_headers": False}
+    if has_cl:
+        return {"allow_body": True, "use_content_length": True, "chunked": False,
+                "strip_length_headers": False}
+    return {"allow_body": True, "use_content_length": False, "chunked": True,
+            "strip_length_headers": False}
+
+
+class _RequestTap:
+    """请求级诊断 tap —— 回答"浏览器到底发了什么、gvs 怎么回的"
+
+    为什么需要 (2026-10-02, E2 的前提): 在此之前每一轮 googlevideo 实验都只能看到
+    "客户端拿到了什么", 看不到**浏览器实际发出的请求形态**。而 SABR 的判定恰恰在形态上
+    (POST + `application/vnd.yt-ump` + protobuf 体), 不在响应上。
+    有了它, "浏览器不播" 才能被拆成"根本没发 SABR 请求" / "发了但被拒" / "被拒的原因"。
+
+    记录字段 (文档规定的七项):
+      method, path_prefix (去掉查询串), body_len, status, first_byte_ms, total_ms, bytes
+    另附 SABR 线索: 请求头/响应头里是否出现 ump / sabr 关键字 (只看关键字, 不落全文)。
+    有界 (deque maxlen) —— 诊断数据不该无界增长, 也不该留存任何查询串内容 (含签名参数)。
+    """
+
+    def __init__(self, maxlen: int = TAP_RING_MAX):
+        self._dq: "collections.deque" = collections.deque(maxlen=maxlen)
+
+    def record(self, **kw) -> None:
+        kw.setdefault("t", round(time.time(), 2))
+        self._dq.append(kw)
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        return list(self._dq)
+
+    def reset(self) -> None:
+        self._dq.clear()
+
+
+def _path_prefix(path: str, limit: int = 48) -> str:
+    """只保留路径前缀 (丢掉查询串) —— 诊断不需要、也不该留存签名参数"""
+    return str(path or "").split("?", 1)[0][:limit]
+
+
+def _has_marker(text: str, *needles: str) -> bool:
+    t = str(text or "").lower()
+    return any(n in t for n in needles)
+
+
+class _EventRing:
+    """有界事件环 —— 腿的"盲区自陈" (P4 等价物)
+
+    为什么必须有: 腿的 `log_message` 是空实现, 对外**零可观测性**, 于是"视频转圈"无法归因。
+    而 `forwarder.stats` 只是单调计数器, 无法回答"刚刚发生了什么"。
+    这里记录**最后 N 条异常事件** (种类 + 摘要 + 时间), 经 `status()` 暴露,
+    零新增流量, 同时服务"诊断"与"健康信号"两个需求。
+
+    种类: resolve_failed / resolve_empty / upstream_no_response / body_too_large /
+          bad_content_length / chunked_body_truncated / target_failed / stream_cut /
+          invalid_status
+    """
+
+    def __init__(self, maxlen: int = EVENT_RING_MAX):
+        self._dq: "collections.deque" = collections.deque(maxlen=maxlen)
+
+    def add(self, kind: str, detail: str = "") -> None:
+        self._dq.append({"t": round(time.time(), 3), "kind": str(kind)[:40],
+                         "detail": str(detail)[:160]})
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        return list(self._dq)
+
+    def counts(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for e in self._dq:
+            out[e["kind"]] = out.get(e["kind"], 0) + 1
+        return out
+
+
 def node_name_from_host(host: str) -> str:
     """`rr1---sn-i3b7kns6.googlevideo.com` → `rr1---sn-i3b7kns6`"""
     h = strip_port(host).lower()
@@ -114,8 +363,23 @@ def filter_request_headers(headers: Sequence[Tuple[str, str]]) -> List[Tuple[str
     return out
 
 
+def cors_headers_present(headers: Sequence[Tuple[bytes, bytes]]) -> bool:
+    """上游响应里是否**真的**带了跨源头 (用于区分"被我们丢了"与"上游本就没发")
+
+    为什么要单独判一次: 实测 CORS 缺失导致的失败现象与"通道不通"几乎一样,
+    所以必须能回答"是白名单丢的, 还是 gvs 压根没发" —— 这决定了修法是
+    "补白名单" 还是 "兜底注入"。
+    """
+    return any(k.decode("latin-1").lower().startswith("access-control-")
+               for k, _v in headers or [])
+
+
 def filter_response_headers(headers: Sequence[Tuple[bytes, bytes]]) -> List[Tuple[str, str]]:
-    """HTTP/3 响应头 → HTTP/1.1 响应头 (白名单保留, 保证 206/content-range 不丢)"""
+    """HTTP/3 响应头 → HTTP/1.1 响应头 (白名单保留, 保证 206/content-range/CORS 不丢)
+
+    ⚠ 白名单的教训见 RESPONSE_KEEP 上方注释: 曾因缺 `access-control-*` 而让
+    SABR 传输明明成功、播放器却永远就绪不了。
+    """
     out: List[Tuple[str, str]] = []
     for k, v in headers:
         ks = k.decode("latin-1").lower()
@@ -248,17 +512,21 @@ class H3Forwarder:
                  sni_for: Optional[Callable[[str], str]] = None,
                  connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
                  idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
-                 target_port: int = 443):
+                 target_port: int = 443,
+                 retries: int = DEFAULT_RETRY_SAME_NODE):
         self.resolver = resolver
         self.sni_for = sni_for or (lambda h: h)
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
         self.target_port = target_port      # 可注入: 单测指向本地 h3 源站, 不依赖外网
+        self.retries = int(retries)         # 同节点重试次数 (见 DEFAULT_RETRY_SAME_NODE)
         self._bridge = _LoopBridge()
         self._pool: Dict[Tuple[str, str], Any] = {}
         self._pool_lock = threading.Lock()
         self._conn_lock: Optional["asyncio.Lock"] = None   # 惰性创建 (必须在事件循环内)
         self.stats = {"requests": 0, "reused": 0, "new_conn": 0, "errors": 0}
+        self.events = _EventRing()          # 有界事件环 (盲区自陈, 见 _EventRing)
+        self.tap = _RequestTap()            # 请求级诊断 tap (见 _RequestTap)
 
     async def _get_conn(self, ip: str, sni: str):
         from aioquic.asyncio.client import connect
@@ -285,7 +553,10 @@ class H3Forwarder:
             cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN,
                                     verify_mode=ssl.CERT_NONE)
             cfg.server_name = sni
-            cfg.idle_timeout = max(5.0, min(float(self.idle_timeout), 60.0))
+            # QUIC 层的空闲超时也由 idle_timeout 驱动。上限从 60s 放宽到 600s:
+            # 流式目标 (SABR) 的服务端静默**可以超过 60s** (服务端节流的实现方式),
+            # 若仍卡在 60s, 上层把逐读预算放大到 300s 也没用 —— 连接会先被 QUIC 关掉。
+            cfg.idle_timeout = max(5.0, min(float(self.idle_timeout), 600.0))
             # 放大流控窗口 —— 否则大文件吞吐会被 aioquic 默认窗口卡死
             cfg.max_data = 16 * 1024 * 1024
             cfg.max_stream_data = 8 * 1024 * 1024
@@ -304,7 +575,7 @@ class H3Forwarder:
 
     async def _forward(self, ip: str, sni: str, authority: str, method: str, path: str,
                        headers: Sequence[Tuple[str, str]], body: bytes,
-                       out: "queue.Queue", timeout: float) -> None:
+                       out: "queue.Queue", budget: TimeoutBudget) -> None:
         from aioquic.h3.events import DataReceived, HeadersReceived
 
         loop = asyncio.get_running_loop()
@@ -320,8 +591,14 @@ class H3Forwarder:
         # 若在这里吞掉, forward() 会以为"这次调用成功了"而直接返回 ——
         # 实测后果: unpkg 的首个候选是 Cloudflare IPv6 (本机不可达), 请求直接失败,
         # 而后面明明有可用的 IPv4 却永远不会被尝试。
+        #
+        # ⚠ 建连必须**用自己的 connect 档**设上限, 不能依赖 QUIC 的 idle_timeout:
+        #   UDP 没有 "connection refused", 打到死端口只会静默丢包; 若把 idle_timeout 放大到
+        #   流式所需的 300s (见 _get_conn), 建连就会等满 300s —— 实测这正是让
+        #   "候选不可达 → 换下一个" 那三条回归用例挂住的原因。
+        #   两件事必须分开: **握手**用 connect 档限时, **已建连后的静默**用 idle_read 档。
         try:
-            proto = await self._get_conn(ip, sni)
+            proto = await asyncio.wait_for(self._get_conn(ip, sni), timeout=budget.connect)
         except Exception:
             self.stats["errors"] += 1
             raise
@@ -342,13 +619,16 @@ class H3Forwarder:
                     proto.h3.send_data(sid, body, end_stream=True)
                 proto.transmit()
 
-                deadline = time.perf_counter() + timeout
+                # 等首个响应头: 用 connect 档 (保持较小, 失活节点快速交棒)。
+                # **不再**用同一个数值兼作整周期上限 —— 见 TimeoutBudget 注释。
+                deadline = time.perf_counter() + budget.connect
                 status: Optional[int] = None
                 resp_headers: List[Tuple[bytes, bytes]] = []
                 while status is None:
                     if time.perf_counter() > deadline or proto.terminated.is_set():
                         # 还没写任何东西 → 抛出去让 forward() 换下一个节点
                         self.stats["errors"] += 1
+                        self.events.add("upstream_no_response", f"{ip} {path.split('?')[0][:40]}")
                         raise ConnectionError(f"{ip}: upstream_no_response")
                     try:
                         ev = await asyncio.wait_for(q.get(), timeout=0.5)
@@ -366,18 +646,34 @@ class H3Forwarder:
                             pass
 
                 await emit(("headers", status, filter_response_headers(resp_headers)))
+                # CORS 归因探针: 记下上游**原始**头里有没有跨源头。
+                # 这决定修法是"补白名单"(上游有、我们丢了) 还是"兜底注入"(上游没发)。
+                if cors_headers_present(resp_headers):
+                    self.stats["cors_upstream"] = self.stats.get("cors_upstream", 0) + 1
+                else:
+                    self.stats["cors_missing_upstream"] = \
+                        self.stats.get("cors_missing_upstream", 0) + 1
+                    self.events.add("no_cors_upstream",
+                                    f"{ip} {path.split('?')[0][:28]} 上游未带 access-control-*")
                 # 正文: 流式推送, 直到 stream_ended
                 #
                 # 必须**合并小包**: aioquic 每个 DataReceived 只有 ~1.2KB, 若逐包入队再逐个
                 # 写到 HTTP/1.1 socket, 队列与系统调用开销会主导耗时 ——
                 # 实测逐包写法取 1.27MB 要 15~20s, 合并到 256KB 后恢复到正常量级。
+                #
+                # 逐读超时用 **idle_read 档**(默认对流式目标已放大到 300s):
+                # 服务端"缓冲已满"时的合法静默不得被当成流结束 —— 否则响应会以 200/206
+                # **静默截断**, 且与"通道被掐"无法区分。截断时记事件环, 不再无声无息。
                 buf = bytearray()
                 while True:
                     if proto.terminated.is_set():
+                        self.events.add("stream_cut", f"{ip} connection_terminated")
                         break
                     try:
-                        ev = await asyncio.wait_for(q.get(), timeout=timeout)
+                        ev = await asyncio.wait_for(q.get(), timeout=budget.idle_read)
                     except asyncio.TimeoutError:
+                        self.events.add("stream_cut",
+                                        f"{ip} idle>{budget.idle_read:g}s 静默超限 (已发 {len(buf)}B 未刷)")
                         break
                     if not isinstance(ev, DataReceived):
                         continue
@@ -411,39 +707,140 @@ class H3Forwarder:
 
     def forward(self, host: str, method: str, path: str,
                 headers: Sequence[Tuple[str, str]], body: bytes,
-                out: "queue.Queue", timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
-        """同步入口 (供 HTTP 线程调用): 解析目标 → 逐个候选地址尝试
+                out: "queue.Queue",
+                timeout: "Optional[Union[float, TimeoutBudget]]" = DEFAULT_CONNECT_TIMEOUT,
+                idle_read: Optional[float] = None,
+                max_duration: Optional[float] = None,
+                retries: Optional[int] = None) -> None:
+        """同步入口 (供 HTTP 线程调用): 解析目标 → 逐个候选地址尝试 → (必要时)重解析再试
 
-        重试语义: 只要**尚未写入任何东西**, 就换下一个候选地址重试。
+        重试语义: 只要**尚未写入任何东西**, 就可以再试。
         这对本场景很关键 —— 同一域名常常同时解析出 IPv6 与 IPv4, 而两者的可达性
         在不同目标上恰好相反 (googlevideo 只有 v6 通; Cloudflare/Fastly 本机只有 v4 通)。
         实测反例: 修复前 unpkg 因首个候选是 CF IPv6 而整单失败, 后面可用的 v4 从未被尝试。
+
+        **2026-10-02 E2 实测新增的两条重试 (为什么必须有)**:
+        E2 用 CDP 驱动真实浏览器时, 10 个真实 SABR POST 里 7 个成功、**3 个失败**,
+        且失败全是同一个 IPv6 节点在 connect 档(8s)内 `upstream_no_response`。
+        事后核对发现两件事, 各自对应一条修复:
+          ① **同一个节点名在别的请求里是成功的** (rr…1486 一次 200、一次失败)
+             ⇒ 这是**抖动**, 不是"该节点坏" ⇒ 值得**对同一节点重试**(原先只换候选, 见 retries);
+          ② 失败时事件环记的 IP 与事后解析出的答案**不是同一个**
+             ⇒ 候选集**时变**, 某些时刻只落到单个候选, 此时没有 v4 兜底、也没有第二次机会
+             ⇒ 需要**重解析再试一遍**(见下方第二轮)。
+        这两条都不依赖 DNS 稳定, 因此对"通道分钟级时变"是正向收益。
+
+        超时: `timeout` 兼容旧的裸 float; 三档预算见 TimeoutBudget。
+        **裸 float 不再产生"整周期硬上限"** —— max_duration 默认 None。
         """
+        budget = as_budget(timeout, idle_read=idle_read, max_duration=max_duration)
+        retries = self.retries if retries is None else int(retries)
         authority = strip_port(host)
         sni = self.sni_for(authority)
         self.stats["requests"] += 1
         try:
             ips = self.resolver(authority)
         except Exception as e:
+            self.events.add("resolve_failed", f"{authority}: {type(e).__name__}")
             out.put(("error", f"resolve_failed: {type(e).__name__}"))
             return
         if not ips:
+            self.events.add("resolve_empty", authority)
             out.put(("error", "resolve_empty"))
             return
+
         last_err = "all_targets_failed"
-        for ip in attempt_order(ips):
-            try:
-                self._bridge.call(
-                    self._forward(ip, sni, authority, method, path, headers, body,
-                                  out, timeout),
-                    timeout=timeout * 2 + 8)
-                return
-            except Exception as e:                 # 未写入任何内容 -> 换下一个节点
-                last_err = f"{type(e).__name__}: {e}".strip().rstrip(":")
-                with self._pool_lock:
-                    self._pool.pop((ip, sni), None)
-                continue
+        tried: List[str] = []
+        attempts = 0
+        t_start = time.perf_counter()
+        # 两轮: 第 0 轮用初始候选, 第 1 轮**重解析**(DoH 答案时变, 单候选时尤其需要)
+        for rnd in range(2):
+            if rnd == 0:
+                cands = [ip for ip in attempt_order(ips) if ip not in tried]
+            else:
+                # 重解析本身也要受预算约束: DoH 最坏可能串行花掉几十秒, 若在失败路径上
+                # 无约束地再来一次, 502 会被推得比不重试还晚 —— 与设 RETRY_TIME_BUDGET 的
+                # 理由完全相同。
+                if (time.perf_counter() - t_start) > RETRY_TIME_BUDGET:
+                    self.events.add("retry_budget_exhausted",
+                                    f"{authority} 预算用尽, 跳过重解析")
+                    break
+                cands = [ip for ip in attempt_order(self._reresolve(authority))
+                         if ip not in tried]
+                if not cands:
+                    break
+            for ip in cands:
+                for attempt in range(retries + 1):
+                    # 两道闸门 (见 RETRY_TIME_BUDGET 注释): 次数上限 + 墙钟预算。
+                    # 只靠次数挡不住长尾 —— 6×8s=48s 仍太久; 流式协议要的是
+                    # "要么成功, 要么尽快失败", 让播放器用**它自己的**分段重试去补。
+                    if attempts >= MAX_TOTAL_ATTEMPTS:
+                        self.events.add(
+                            "attempts_exhausted",
+                            f"{authority} 已尝试 {attempts} 次 (上限 {MAX_TOTAL_ATTEMPTS})")
+                        out.put(("error", last_err))
+                        return
+                    if attempts and (time.perf_counter() - t_start) > RETRY_TIME_BUDGET:
+                        self.events.add(
+                            "retry_budget_exhausted",
+                            f"{authority} 重试预算 {RETRY_TIME_BUDGET:g}s 用尽 (已试 {attempts} 次)")
+                        out.put(("error", last_err))
+                        return
+                    attempts += 1
+                    tried.append(ip)
+                    # 用 submit 拿 Future 而不是 call(): 超时/失败时必须能**取消协程**。
+                    # 为什么关键 (2026-10-02 审阅定因): 原先 `call(..., timeout×2+8)` 超时后
+                    # 直接 continue, 而 _forward 协程**没有被取消** —— 它继续向**同一个** out
+                    # 推事件: ① HTTP 线程正在 out.get(), 拿到第二个 ("headers", …) 会因
+                    # "不是 data"而 break ⇒ 流被提前掐断; ② 被遗弃的协程在队列满 64 后, 经
+                    # run_in_executor(None, out.put, item) **永久阻塞** ⇒ 吃掉线程池线程。
+                    fut = self._bridge.submit(self._forward(
+                        ip, sni, authority, method, path, headers, body, out, budget))
+                    try:
+                        fut.result(budget.max_duration)
+                        if attempts > 1:
+                            self.events.add("recovered",
+                                            f"{authority} 第 {attempts} 次尝试成功 ({ip})")
+                        return
+                    except Exception as e:         # 未写入任何内容 -> 可以再试
+                        last_err = f"{type(e).__name__}: {e}".strip().rstrip(":")
+                        self.events.add(
+                            "target_failed",
+                            f"{ip} try{attempt + 1}/{retries + 1} rnd{rnd} {last_err}")
+                        try:
+                            fut.cancel()           # 让 _forward 在 await 点收到 CancelledError
+                        except Exception:
+                            pass
+                        self._drain(out)           # 丢弃半成品, 避免污染下一次
+                        with self._pool_lock:
+                            self._pool.pop((ip, sni), None)
         out.put(("error", last_err))
+
+    def _reresolve(self, authority: str) -> List[str]:
+        """重解析一次 (返回空列表表示拿不到新答案)
+
+        为什么要单独一步: 实测候选集**时变** —— 同一次实验里失败请求记下的 IP
+        与事后解析出的答案不是同一个, 且某些时刻只落到**单个**不可响应的 IPv6。
+        全失败后立刻重解析, 往往能得到另一个节点或 v4 兜底。
+        """
+        try:
+            fresh = list(self.resolver(authority) or [])
+        except Exception as e:
+            self.events.add("reresolve_failed", f"{authority}: {type(e).__name__}")
+            return []
+        fresh = [ip for ip in fresh if ip]
+        if fresh:
+            self.events.add("reresolve", f"{authority} 得到 {len(fresh)} 个候选")
+        return fresh
+
+    @staticmethod
+    def _drain(q: "queue.Queue") -> None:
+        """清空队列 (被取消的协程可能已推入 headers/半截 data)"""
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
 
     def close(self):
         with self._pool_lock:
@@ -493,58 +890,158 @@ def make_handler(forwarder: H3Forwarder, timeout: float):
         def log_message(self, fmt, *args):     # 不打访问日志 (与全局 access_log off 一致)
             pass
 
+        def _cors_for_error(self):
+            """错误响应也必须带 CORS 头
+
+            为什么: 播放器用 fetch() **跨源**取 SABR。腿因上游不可达而回 502 时,
+            若该响应没有 CORS 头, 浏览器报的是 "blocked by CORS policy" 而**不是** 502
+            —— 真实原因(节点可用性)被掩盖, 播放器也无法按状态码退避重试。
+            实测: 正式方案的一次验收里 32 条 CORS 错误, 逐条追下去全是 502 的次生症状。
+            """
+            origin = self.headers.get("Origin")
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Expose-Headers",
+                                 "X-H3-Upstream-Error, Content-Length, Content-Range")
+                self.send_header("Vary", "Origin")
+
         def _relay(self):
             host = self.headers.get("Host", "")
             if not host:
                 self.send_error(400, "missing host")
                 return
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            body = self.rfile.read(min(length, MAX_REQUEST_BODY)) if length > 0 else b""
+            t_req = time.perf_counter()
+            # 请求体: 支持 chunked, 且超限时报错而**不静默截断** (见 read_request_body)
+            body, berr = read_request_body(self.headers.get, self.rfile)
+            if berr:
+                forwarder.events.add(berr, f"{self.command} {_path_prefix(self.path)}")
+                forwarder.tap.record(method=self.command, path_prefix=_path_prefix(self.path),
+                                     host=host, body_len=len(body), status=None,
+                                     first_byte_ms=None,
+                                     total_ms=round((time.perf_counter() - t_req) * 1000, 1),
+                                     bytes=0, err=berr)
+                code = 413 if berr == "body_too_large" else 400
+                msg = f"h3 upstream: {berr}".encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(msg)))
+                self.send_header("X-H3-Upstream-Error", berr)
+                self._cors_for_error()
+                self.end_headers()
+                # ⚠ 这段回写也必须容错: 实测 (播放诊断) 浏览器会**在 502 返回前就取消**请求
+                # (播放器放弃该分段时会 abort), 于是这里抛 ConnectionAbortedError
+                # (WinError 10053) 并打出一整段回溯。502 分支与正文分支是**两处**独立的
+                # 写入点, 之前只给正文分支加了容错, 漏了这里 —— 又一次"只修了看得到的那处"。
+                try:
+                    if self.command != "HEAD":
+                        self.wfile.write(msg)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                        TimeoutError, OSError):
+                    pass
+                self.close_connection = True
+                return
+
+            # SABR 线索: 请求侧 (Content-Type / 体长) —— 只看关键字, 不落全文
+            req_ctype = self.headers.get("Content-Type", "")
+            req_sabr = _has_marker(req_ctype, "yt-ump", "ump", "sabr")
 
             out: "queue.Queue" = queue.Queue(maxsize=MAX_RESPONSE_QUEUE)
             threading.Thread(
                 target=forwarder.forward,
+                # 逐读静默与整周期上限从 forwarder 读 (生产路径按流式配置, 见 proxy.__init__):
+                # 不再把一个 timeout 同时当建连/逐读/整周期三种角色用。
                 args=(host, self.command, self.path, list(self.headers.items()),
-                      body, out, timeout),
+                      body, out, timeout,
+                      getattr(forwarder, "idle_timeout", None),
+                      getattr(forwarder, "max_duration", None)),
                 daemon=True).start()
 
             first = out.get()
+            t_first = time.perf_counter()
             if first[0] == "error":
+                forwarder.tap.record(method=self.command, path_prefix=_path_prefix(self.path),
+                                     host=host, body_len=len(body), status=None,
+                                     first_byte_ms=round((t_first - t_req) * 1000, 1),
+                                     total_ms=round((t_first - t_req) * 1000, 1),
+                                     bytes=0, req_ctype=req_ctype, err=str(first[1])[:80])
                 msg = f"h3 upstream error: {first[1]}".encode()
                 self.send_response(502)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(msg)))
                 self.send_header("X-H3-Upstream-Error", str(first[1])[:120])
+                self._cors_for_error()
                 self.end_headers()
-                self.wfile.write(msg)
+                # ⚠ 本回写也必须容错。实测(播放诊断)浏览器会在 502 返回前就取消请求,
+                # 这里抛 ConnectionAbortedError (WinError 10053) 并打出整段回溯。
+                # 注意: 这是**第三处**写入点 —— 此前给"正文循环"与"body-error 分支"都加了
+                # 容错, 却**漏了这一处**, 而且我还一度以为已经修过它 (实际改的是相邻分支)。
+                # 教训: 多处同类写入点不能靠"看到哪修哪", 应逐点列清 (见审计脚本)。
+                try:
+                    if self.command != "HEAD":
+                        self.wfile.write(msg)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                        TimeoutError, OSError):
+                    pass
                 self.close_connection = True
                 return
 
             _kind, code, headers = first
-            has_len = any(k.lower() == "content-length" for k, _v in headers)
+            resp_ctype = next((v for k, v in headers if str(k).lower() == "content-type"), "")
+            resp_sabr = _has_marker(resp_ctype, "yt-ump", "ump", "sabr")
+            # 封装规划是纯函数 (可离线单测), 见 plan_http1_response 的注释:
+            # 204/304 既不得带 Content-Length 也不得带 Transfer-Encoding; HEAD 不得有正文。
+            plan = plan_http1_response(code, headers, self.command)
+            if not code:
+                forwarder.events.add("invalid_status", self.path.split("?")[0][:60])
             self.send_response_only(code)
             for k, v in headers:
+                if plan["strip_length_headers"] and str(k).lower() in (
+                        "content-length", "transfer-encoding"):
+                    continue
                 self.send_header(k, v)
-            if not has_len:
+            if plan["chunked"]:
                 self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            bytes_out = [0]
             try:
+                if not plan["allow_body"]:
+                    # 无正文响应: 不写任何字节, 但要把队列读干净, 避免遗弃协程继续往里推
+                    while True:
+                        kind, _payload = out.get()
+                        if kind != "data":
+                            break
+                    return
                 while True:
                     kind, payload = out.get()
                     if kind == "data":
-                        if has_len:
-                            self.wfile.write(payload)
-                        else:
+                        bytes_out[0] += len(payload)
+                        if plan["chunked"]:
                             self.wfile.write(b"%X\r\n%s\r\n" % (len(payload), payload))
+                        else:
+                            self.wfile.write(payload)
                     else:                       # end / error
                         break
-                if not has_len:
+                if plan["chunked"]:
                     self.wfile.write(b"0\r\n\r\n")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                    TimeoutError, OSError):
+                # Windows 上客户端中断常抛 ConnectionAbortedError (WinError 10053) 或裸
+                # OSError, 都不在 BrokenPipe/ConnectionReset 里 —— 实测漏网时会在 stderr
+                # 打一整段回溯 (E2 的 CDP 运行里就出现过), 把真正的诊断输出淹没。
+                # 这类中断是**正常事件** (浏览器取消分段请求), 静默收尾即可。
                 pass
+            finally:
+                # 诊断 tap: 文档规定的七项字段 (见 _RequestTap)。放 finally 里, 保证
+                # "无正文提前 return" 与异常路径同样留下记录 —— 否则最需要看的那几类
+                # (204/304、断流) 恰恰不会出现在诊断数据里。
+                forwarder.tap.record(
+                    method=self.command, path_prefix=_path_prefix(self.path), host=host,
+                    body_len=len(body), status=code,
+                    first_byte_ms=round((t_first - t_req) * 1000, 1),
+                    total_ms=round((time.perf_counter() - t_req) * 1000, 1),
+                    bytes=bytes_out[0], req_ctype=req_ctype[:48],
+                    req_sabr=req_sabr, resp_ctype=resp_ctype[:48], resp_sabr=resp_sabr,
+                    err="")
             self.close_connection = True
 
         do_GET = _relay
@@ -564,13 +1061,24 @@ class H3UpstreamProxy:
                  sni_for: Optional[Callable[[str], str]] = None,
                  host: str = "127.0.0.1",
                  timeout: float = DEFAULT_CONNECT_TIMEOUT,
-                 target_port: int = 443):
+                 target_port: int = 443,
+                 idle_read: float = DEFAULT_STREAM_IDLE_READ,
+                 max_duration: Optional[float] = None,
+                 retries: int = DEFAULT_RETRY_SAME_NODE):
         self.port = port
         self.host = host
         self.timeout = timeout
         self.target_port = target_port      # 可注入: 单测指向本地 h3 源站
+        # 生产路径按**流式**配置: 逐读静默放宽到 300s、整周期不设上限。
+        # 这是移除"24 秒硬天花板"的那一步 —— 视频流必然分钟级, 有上限就必然失败。
+        self.idle_read = idle_read
+        self.max_duration = max_duration
+        self.retries = int(retries)
         self.forwarder = H3Forwarder(resolver or default_resolver, sni_for, timeout,
-                                    target_port=target_port)
+                                     idle_timeout=idle_read,
+                                     target_port=target_port, retries=retries)
+        # QUIC 自身的 idle_timeout 也必须跟上逐读预算, 否则连接会先被 QUIC 关掉
+        self.forwarder.max_duration = max_duration
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -654,12 +1162,22 @@ class H3UpstreamManager:
     def status(self) -> Dict[str, Any]:
         with self._lock:
             proxy = self._proxy
+        fwd = proxy.forwarder if proxy is not None else None
         return {
             "running": self.is_running(),
             "listening": self.is_listening(),
             "healthy": self.is_healthy(),
             "port": self.port,
-            "stats": dict(proxy.forwarder.stats) if proxy is not None else {},
+            "stats": dict(fwd.stats) if fwd is not None else {},
+            # 盲区自陈 (P4 等价物): 最近 N 条异常事件 + 分类计数。
+            # 没有它, "视频转圈"无从归因 —— 腿的 log_message 是空实现, 对外零可观测性。
+            "events": fwd.events.snapshot() if fwd is not None else [],
+            "event_counts": fwd.events.counts() if fwd is not None else {},
+            # 请求级诊断 tap (E2 的观测面): 浏览器实际发了什么、gvs 怎么回的
+            "tap": fwd.tap.snapshot() if fwd is not None else [],
+            "timeouts": {"idle_read": getattr(fwd, "idle_timeout", None),
+                         "max_duration": getattr(fwd, "max_duration", None)}
+            if fwd is not None else {},
         }
 
     # ---------------------------------------------------------------- 生命周期
@@ -709,6 +1227,58 @@ h3_proxy = H3UpstreamManager()
 # ===========================================================================
 # 启用前置条件校验 (把"会静默失效"的配置显式暴露出来)
 # ===========================================================================
+def wildcard_capable(redirect_mode: str) -> bool:
+    """该解析后端能否下发**通配**域名 (纯函数, 可离线单测)
+
+    为什么要抽象成"通配能力"而不是写死"必须是 NRPT":
+      - Hosts 文件**不支持通配**, 只能逐个登记;
+      - NRPT 命名空间**支持后缀匹配** (见 nrpt_manager) —— 但它**需要管理员 + 独占 53**;
+      - **PAC + 本地 CONNECT 转发** 把通配表达在 PAC 的 JS 里 (`host.endsWith('.x')`),
+        因此**不需要 DNS 具备任何通配能力**, 也不需要管理员
+        (见 app/pac_redirect.py; 实测完整域名表 553 条, 播放成功)。
+    判据写成能力查询, 新增后端时这里只需加一条, 不必改调用方。
+    """
+    return str(redirect_mode or "").strip().lower() in ("nrpt", "pac", "pac_auto")
+
+
+def needs_wildcard_resolution(profile) -> bool:
+    """该画像是否**依赖通配解析下发**
+
+    判据: 需要本机 DNS 下发 (requires_dns_backend) **且** 域名里含 `*.` 通配。
+    googlevideo 正是如此 (domains=["*.googlevideo.com"]): 它的节点名是动态且海量的
+    (rr1---sn-xxxx.googlevideo.com), 逐个登记既不可能也不该做。
+    """
+    if not getattr(profile, "requires_dns_backend", False):
+        return False
+    return any(str(d).startswith("*.") for d in (getattr(profile, "domains", None) or []))
+
+
+def blocked_services(services, redirect_mode: str, profiles_by_id=None) -> Dict[str, str]:
+    """在给定解析后端下**无法生效**的服务 → 原因
+
+    用途 (与 check_preconditions 的分工):
+      - check_preconditions: 面向"腿"的整体前置条件, 用于启动时的告警;
+      - 本函数: 面向"具体服务", 用于**启用边界硬门槛**与**应用重定向前剔除**。
+    为什么两处都要: 只在启动时告警 = 门装错了位置。用户在 Hosts 模式下开启 googlevideo
+    会得到一个"页面能开而视频永远转圈"的假可用, 而那一刻他就在界面上, 正是该拦住他的时候。
+    另外, 若用户手改配置文件绕过界面, 应用重定向前也必须剔除, 不能让它静默失效。
+    """
+    if profiles_by_id is None:
+        from service_profile import PROFILES_BY_ID as profiles_by_id  # 延迟导入避免环
+    out: Dict[str, str] = {}
+    if wildcard_capable(redirect_mode):
+        return out
+    for sid in services or []:
+        p = profiles_by_id.get(sid)
+        if p is not None and needs_wildcard_resolution(p):
+            out[sid] = (
+                f"[{getattr(p, 'name', sid)}] 依赖动态节点名的**通配**解析下发 "
+                f"({'/'.join(getattr(p, 'domains', None) or [])})，"
+                f"而当前解析后端 (Hosts) 不支持通配 —— 节点名不会被劫持，"
+                f"会表现为「页面能开而视频永远转圈」。请改用 NRPT 后端。")
+    return out
+
+
 def check_preconditions(redirect_mode: str) -> List[str]:
     """返回使用 HTTP/3 上游腿的**阻塞项** (空列表 = 前置条件满足)
 
@@ -718,11 +1288,10 @@ def check_preconditions(redirect_mode: str) -> List[str]:
       - googlevideo 的节点名是动态且海量的 (rr1---sn-xxxx.googlevideo.com);
       - 结果: 只有 apex 被劫持, 真实节点名仍走被封锁的系统解析 →
         表现为"页面能开而视频永远转圈"的假可用。
-    这里把该判断做成纯函数, 由启动流程调用并如实告知, 而不是让它静默失效。
+    这里把该判断做成纯函数, 由**启用边界**与启动流程共同调用, 而不是让它静默失效。
     """
     blockers: List[str] = []
-    mode = str(redirect_mode or "hosts").strip().lower()
-    if mode != "nrpt":
+    if not wildcard_capable(redirect_mode):
         blockers.append(
             "当前解析后端为 Hosts, 但使用 HTTP/3 上游腿的服务依赖**动态节点名**"
             "(如 rr1---sn-xxxx.googlevideo.com), Hosts 不支持通配 → 节点名不会被劫持, "
@@ -753,9 +1322,18 @@ ALIAS_SUFFIXES = ("gvt1.com", "snap.gvt1.com", "bdn.dev", "gcpcdn.gvt1.com")
 _DNS_POISON_PREFIX = ("157.240.", "31.13.", "2a03:2880", "162.125.", "65.49.",
                       "104.244.", "108.160.", "59.24.",
                       # —— 2026-10-02 实测补入 ——
+                      # ⚠ 下面四条刻意写成**整个 /16**, 而不是实测到的那个 /24。
+                      # 第二次实测 (node_reach_measure.py, 同一批节点名重查) 拿到的是
+                      # **同段内的另一个取值**: 128.242.245.157 / 199.96.63.177 /
+                      # 199.59.148.247 / 185.60.216.169 —— 而当时表里写的是
+                      # 128.242.240. / 199.96.62. / 199.59.149. / (无), 于是**四条全部漏过**,
+                      # 其中 rr2---sn-i3b7kns1 因此被解析到 Facebook 地址并白烧 71.9s。
+                      # 投毒取值在段内轮换, 按 /24 精确拉黑等于每轮换一次就漏一次。
+                      # 与 cdn_optimizer.POLLUTED_IP_PREFIXES 的粒度保持一致 (那边本来就是 /16)。
+                      "128.242.", "199.96.", "199.59.", "185.60.216.",
                       "2001::1", "2001:0:",
-                      "185.45.", "174.132.", "128.242.240.", "192.133.77.",
-                      "199.96.62.", "69.171.235.", "199.59.149.")
+                      "185.45.", "174.132.", "192.133.77.",
+                      "69.171.235.")
 
 # Google 自有网段 (公开段 + 本次实测用到的段)。用途不是"硬门槛"而是**优先信号**:
 # 投毒应答的取值是无穷的, 逐个拉黑是打地鼠; 而"真 Google 边缘必然落在 Google 段内"
@@ -806,8 +1384,65 @@ def prefer_google(ips: List[str]) -> List[str]:
     return good if good else ips
 
 
+# 只能整段拉黑的投毒取值所在网段 (与具体取值无关)
+_POISON_NET_CIDRS = ("2001::/32",)      # Teredo: 真 CDN 永远不会用隧道段
+_POISON_NETS = None
+
+
+def _poison_nets():
+    global _POISON_NETS
+    if _POISON_NETS is None:
+        import ipaddress
+        nets = []
+        for c in _POISON_NET_CIDRS:
+            try:
+                nets.append(ipaddress.ip_network(c))
+            except Exception:
+                pass
+        _POISON_NETS = nets
+    return _POISON_NETS
+
+
+# googlevideo 节点家族的名字域 (含实测用到的**别名域** —— 节点名在别名域上解析最干净)
+_GVS_FAMILY_SUFFIXES = (".googlevideo.com", ".gvt1.com", ".bdn.dev",
+                        ".c.youtube.com")
+# 节点名形态: rr1---sn-i3b7kns6 / rr5---sn-ajaig5-5h (也接受 rr1.sn-… 这类写法)
+_GVS_NODE_RE = None
+
+
+def is_gvs_family_host(host: str) -> bool:
+    """该请求目标是否属于 googlevideo 节点家族 —— 是则解析结果**必须**落在 Google 段
+
+    为什么必须与普通 h3 目标分开处理 (2026-10-02 节点测量定因):
+      对普通 h3 目标 (Cloudflare / Fastly / unpkg 自测) 非 Google 地址是**正常**的,
+      套上"必须 Google 段"会把它整个弄坏;
+      而 GVS 节点是 Google **自建**边缘, 不存在第三方承载 —— 因此对这类名字,
+      任何非 Google 段的应答都**必然**是投毒注入, 可以放心硬淘汰。
+    实测依据: 9 个节点名 × 5 个来源, 4 个别名域对 8/9 个节点一致返回 Google 段地址,
+    唯一例外 (rr2---sn-i3b7kns1) 是别名域全部为空、只剩被投毒的 apex 应答。
+    """
+    global _GVS_NODE_RE
+    import re
+    h = strip_port(host).lower().rstrip(".")
+    if h.endswith(_GVS_FAMILY_SUFFIXES):
+        return True
+    if _GVS_NODE_RE is None:
+        _GVS_NODE_RE = re.compile(r"^rr\d+[.-]+sn-[a-z0-9-]+$")
+    return bool(_GVS_NODE_RE.match(h.split(".", 1)[0]))
+
+
 def is_poisoned(ip: str) -> bool:
-    return "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX)
+    if "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX):
+        return True
+    # Teredo 隧道段 2001::/32: 实测两个投毒取值 2001::1 与 2001::67d6:a86a 都落在段内。
+    # 必须按**段**判定, 不能用字面前缀: 写 "2001::1" 挡不住同段其他取值 (实测漏掉
+    # 2001::67d6:a86a), 而写泛化的 "2001:" 又会误杀 Google 真实的 2001:4860::/32。
+    try:
+        import ipaddress
+        a = ipaddress.ip_address(str(ip).strip())
+        return any(a.version == n.version and a in n for n in _poison_nets())
+    except Exception:
+        return False
 
 
 def _doh(name: str, qtype: str, timeout: float = 4.0) -> List[str]:
@@ -857,11 +1492,17 @@ def default_resolver(host: str) -> List[str]:
       - 而 Cloudflare 等目标反过来常常只有 IPv4 可达 (本机实测 CF 的 IPv6 全超时)。
     两者都返回, 由调用方按序尝试 —— 这样同一个上游腿既能服务 googlevideo,
     也能服务普通 h3 目标 (自测/对照用)。
+
+    **GVS 节点家族走"必须 Google 段"的硬判据** (见 is_gvs_family_host):
+    这类名字的非 Google 应答必然是投毒, 留着它只会让腿把 connect 预算烧在一个
+    永远不答的地址上 (实测 rr2---sn-i3b7kns1 拿到 Facebook 地址 → 3/3 失败,
+    71.9s 纯白烧)。宁可返回空、让上层**快速如实失败**, 也不要拿投毒地址去试。
     """
     node = node_name_from_host(host)
     if not node:
         return []
     target = strip_port(host)
+    strict = is_gvs_family_host(target)
     if target.endswith(ALIAS_SUFFIXES):
         names = [target]
     else:
@@ -874,10 +1515,18 @@ def default_resolver(host: str) -> List[str]:
             v6 = _doh(name, "AAAA")
         if not v4:
             v4 = _doh(name, "A")
-        if v6 or v4:
+        if strict:
+            # 只有**真的**拿到 Google 段地址才收工。否则继续换下一个名字 ——
+            # 若在这里按"有应答就 break", 一个投毒应答就会把后面的别名域/apex 全部截断。
+            if any(is_google_edge_ip(ip) for ip in v6 + v4):
+                break
+        elif v6 or v4:
             break
     if v6 or v4:
-        return v6 + v4
+        cand = v6 + v4
+        if strict:
+            cand = [ip for ip in cand if is_google_edge_ip(ip)]
+        return cand
 
     # 兜底: 系统解析 (可能被投毒, 已过滤), 同样 IPv6 优先
     try:
@@ -890,9 +1539,11 @@ def default_resolver(host: str) -> List[str]:
                         bucket.append(ip)
             except Exception:
                 continue
-        # 系统解析最容易拿到投毒应答, 因此这一路更要把 Google 段排到前面
-        # (2026-10-02 实测: 未排序时 www.youtube.com 拿到 2001::1 + 174.132.167.252 两个投毒值)
-        return prefer_google(list(dict.fromkeys(out6))) + prefer_google(list(dict.fromkeys(out4)))
+        out = (prefer_google(list(dict.fromkeys(out6)))
+               + prefer_google(list(dict.fromkeys(out4))))
+        if strict:
+            out = [ip for ip in out if is_google_edge_ip(ip)]
+        return out
     except Exception:
         return []
 

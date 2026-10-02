@@ -877,7 +877,7 @@ PROFILES: List[ServiceProfile] = [
             "scholar.google.com", "books.google.com", "meet.google.com", "keep.google.com",
             "sites.google.com", "groups.google.com", "myactivity.google.com",
             "adssettings.google.com", "support.google.com", "workspace.google.com",
-            "cloud.google.com", "gemini.google.com", "notebooklm.google.com",
+            "cloud.google.com",
             "takeout.google.com", "earth.google.com",
             # ------------------------------------------------------------------
             # Google 国家/地区域名 (2026-10-02 补全, 起因: 用户给出的
@@ -1037,6 +1037,92 @@ PROFILES: List[ServiceProfile] = [
         candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
                        "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"]
     ),
+    # ==========================================================================
+    # Gemini (Google AI) —— 2026-10-02 实测新增
+    #
+    # 实测结论 (经本机 nginx + relay, 逐域 curl --resolve):
+    #   · `gemini.google.com/` 与 `/app` 均 **HTTP 200 / ~855 KB 完整页面**
+    #     —— 即**网页版在现有链路上本来就能开**, 此前它挂在 google_web 的域名表里。
+    #   · `bard.google.com` / `aistudio.google.com` 实测 **400 "Invalid URL"**:
+    #     它们能**后缀命中** google_web 画像 (会被解析到 127.0.0.1), 但 **nginx 里没有站点**
+    #     ⇒ 落到默认 server 而失败。
+    #     这是一类必须警惕的**假覆盖**: "能反查到画像" ≠ "nginx 有 server_name"。
+    #     判据必须查**显式域名表**, 不能只信后缀匹配 (见 §下方 domains 注释)。
+    #   · `generativelanguage.googleapis.com` 未登记 ⇒ 落默认 server (预期)。
+    #
+    # 故单独成画像: 这些域与"Google 搜索/账号"是不同的使用场景, 用户需要能单独开关;
+    # 且把 gemini.google.com 从 google_web 移出, 避免同一域名被两处登记
+    # (PROFILES_BY_DOMAIN 是 dict, 重复登记只会静默保留其一)。
+    # ==========================================================================
+    ServiceProfile(
+        id="gemini",
+        group="dev",
+        name="Gemini (Google AI)",
+        desc="Gemini 网页版 / AI Studio / 生成式语言 API (经本机 nginx + g.cn 掩护 SNI)",
+        domains=[
+            # —— 应用本体 (实测 200; bard 为旧域, 实测应 301 到 gemini) ——
+            "gemini.google.com",
+            "bard.google.com",
+            "aistudio.google.com",
+            # NotebookLM: 同族 AI 服务 (2026-10-02 从 google_web 移入, 与 Gemini 同类场景)
+            "notebooklm.google.com",
+            # ★ gemini.gstatic.com —— 实测**页面有 18 处引用**它, 而它不在劫持集合里:
+            #   浏览器走真实 IP ⇒ `islands-bootstrap-runtime-*.js` / `islands-*.js`
+            #   报 net::ERR_CONNECTION_TIMED_OUT, 页面靠这些分片渲染, 于是界面残缺。
+            #   这是"资源主机必须逐个登记"的又一例 —— 与模型 API 不同, 它藏在
+            #   HTML 的 script src 里, 不抓页面就发现不了。
+            "gemini.gstatic.com",
+            # 同上: 岛屿(island)静态资源主机的**分片子域** (njl0.static.usercontent.goog 等),
+            # 用一层通配覆盖, 避免逐分片登记
+            "*.static.usercontent.goog",
+            # —— 模型 API (AI Studio / SDK 直连) ——
+            # 注意: 这些域未登记时会被解析到 127.0.0.1 却落到默认 server (400),
+            # 属"看着像通了"的失败, 故必须显式登记。
+            "generativelanguage.googleapis.com",
+            "aiplatform.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            # —— Google 前端辅助服务 (多个 Google 网页应用的通用依赖) ——
+            #   `*.clients6.google.com`: 实测页面引用 waa-pa / ogads-pa.clients6.google.com;
+            #   google_web 只登记了 apex, 子域会漏 ⇒ 用通配补齐。
+            "*.clients6.google.com",
+            "notifications-pa.googleapis.com",
+            "people-pa.googleapis.com",
+            "signaler-pa.googleapis.com",
+            "jnn-pa.googleapis.com",
+            "play.googleapis.com",
+            "csp.withgoogle.com",
+            "content-autofill.googleapis.com",
+            # —— 官方入口站 ——
+            "labs.google",
+            "deepmind.google",
+            # ⚠ 刻意**未登记**:
+            #   · recaptcha.net / www.recaptcha.net —— 被大量非 Google 站点共用, 无直接证据
+            #     前不扩大劫持面 (与 gvt1 家族同一口径);
+            #   · www.googletagmanager.com —— 纯统计脚本 (GTM), 实测页面缺它也能正常渲染,
+            #     登记它等于把统计流量也卷进中继, 无收益。
+        ],
+        icon="sparkles",
+        mode=ServiceMode.L7_NGINX,
+        # 掩护 SNI 必须与厂商声明配套: 测试会断言"用了掩护 SNI 的画像, 其厂商必须在
+        # 受支持名单内", 漏掉 cdn_vendor 会直接被拦下 (实测就是这条把我拦住的)。
+        cdn_vendor="google",
+        # ⚠ upstream_name 必须显式给: 留空会生成 `proxy_pass https://;` —— 非法配置,
+        #    让 nginx **整体拒载**(实测 "no host in upstream \"\""), 全部服务一起挂。
+        #    生成器现已加静态 IP 回落 + 缺配即报错 (见 nginx_generator._static_fallback_upstream),
+        #    但正确定义仍是第一道防线。
+        upstream_name="upstream_gemini",
+        enable_cache=False,
+        # ⚠ 必须与 google_web **同一条中继路径**: 那个成功的 200/~855KB 请求本来就是
+        #    经 google_web 的 server 块与中继 IP 拿到的 (当时 gemini.google.com 还在它的
+        #    域名表里), 故复用同一批 IP 与同一个掩护 SNI 是**据实**而非猜测。
+        #    漏掉这两项的直接后果实测过: candidate_ips 为空 -> 生成的 upstream 为空 ->
+        #    `nginx -t` 直接报 "no host in upstream" 拒绝重载。
+        candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
+                       "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"],
+        ssl_sni_mode="g.cn",
+        # 根路径有文档 (实测 200 且 ~855 KB), 故用默认放行状态
+        probe_domains=("gemini.google.com",),
+    ),
     ServiceProfile(
         id="youtube_web",
         group="dev",
@@ -1088,11 +1174,23 @@ PROFILES: List[ServiceProfile] = [
     #    **本画像登记的是"通道", 不是"播放可用"** —— 故默认**不启用** (见 requires_dns_backend),
     #    由用户显式开启, 且描述里写清"播放尚未验证", 不做假可用。
     #
-    # ③ 为什么必须 requires_dns_backend:
+    #    ★ 2026-10-02 更新: **播放已实测成功** (player_state=PLAYING, currentTime=35s, 见
+    #    docs/googlevideo-sabr-analysis.md §13.3.6)。真因曾长期被掩盖 —— 不是通道问题, 而是
+    #    本模块的响应头白名单丢掉了 `access-control-*`: 播放器用 fetch() **跨源**取 SABR,
+    #    CORS 头被静默丢弃后浏览器直接判失败, 现象上与"通道不通"无法区分。
+    #    仍未解决的是**节点可用性** (实测 20 条 SABR POST 里 11 条 upstream_no_response),
+    #    表现为卡顿/降码率, 故仍保持默认不启用。
+    #
+    # ③ 为什么必须 requires_dns_backend, 以及它现在**被真正强制**:
     #    节点名是动态且海量的 (rr1---sn-xxxx.googlevideo.com), 而 **Windows hosts 文件不支持通配**,
     #    Hosts 后端无法把 *.googlevideo.com 劫持到本机 → 浏览器会走污染解析, 表现为
-    #    "页面能开而视频永远转圈"。只有 NRPT 的后缀匹配能覆盖 (app/h3_upstream.check_preconditions
-    #    会在 Hosts 后端下明确警告这一点)。
+    #    "页面能开而视频永远转圈"。只有 NRPT 的后缀匹配能覆盖。
+    #    该标记**原先只被 ip_pool 用于"排除默认启用", 并未强制** —— 用户仍可在 Hosts 后端下
+    #    手动开启, 得到一个静默假可用。现已做成**两道闸门** (2026-10-02):
+    #      · 启用边界: app/pyside_app.py 的 on_service_toggled 直接拒绝开启并回弹开关;
+    #      · 下发规则前: _apply_redirect 再剔除一次 (挡住手改 config.json 这一路)。
+    #    判据是"解析后端是否具备**通配能力**"(h3_upstream.wildcard_capable),
+    #    而不是写死"必须是 NRPT" —— 将来新增浏览器 DoH 后端时无需改调用方。
     #    注: 本轮验证时用"用户级 Chrome DoH 策略"绕开了管理员权限要求 (见
     #    docs/googlevideo-other-methods.md §6.2), 生产上仍是 NRPT 或等效的解析下发路径。
     #
@@ -1101,15 +1199,46 @@ PROFILES: List[ServiceProfile] = [
     #    通配形式 (nginx server_name 支持 *.example.com; win_utils 也认这种写法)。
     #    **不要逐个登记节点名**: 节点名动态且海量。
     #
-    # 复现与证据: docs/googlevideo-other-methods.md (方法 A/B 全链实测) +
-    #             docs/googlevideo-quic-channel.md (SABR 定因与逐条排除表)
+    # ⑤ **代码审阅 (2026-10-02) 更正了一处架构结论, 并查出 4 条传输层阻塞 —— 均已修 (E0)。**
+    #    被更正的结论: 原文说"`L7 + h3 上游腿` 这个形态**原理上无法**载 SABR"。
+    #    那是把"腿**不会说** SABR"错当成了"腿**载不了** SABR" —— 腿是传输层, 方法与载荷无关。
+    #    4 条阻塞 (原先任何 SABR 实验都会因它们得到假阴性, 与 SABR 本身无关):
+    #      1) 整周期硬上限 24s (timeout×2+8) ⇒ 分钟级流必然失败
+    #      2) 超时后不取消协程即换节点 ⇒ 重复响应头 / 流被掐断 / 线程池泄漏
+    #      3) 每 8s 无数据即判流结束 ⇒ 服务端合法静默被当成流结束, 静默截断
+    #      4) 请求体只认 Content-Length 且 >8MiB 静默截断 ⇒ chunked 体变空体
+    #    另修: 204/304 曾错误携带 `Transfer-Encoding: chunked` (违反 RFC 9110) ——
+    #    这很可能就是此前记为"未解释的互操作现象"的 Chrome `ERR_ABORTED` 的根因
+    #    (curl 宽容, Chrome 不宽容)。**该现象与 SABR 阻塞很可能共享根因。**
+    #    E1 长流压测已通过: 静默 70s / 整周期 110s 不被任何一层掐断 (scripts/probe_sabr_carry.py)。
+    #
+    # 复现与证据: docs/googlevideo-sabr-analysis.md (基础文档: 定因/缺陷清单/实施路径) +
+    #             docs/googlevideo-other-methods.md (方法 A/B 全链实测) +
+    #             docs/googlevideo-quic-channel.md §5.6 (已更正的逐条排除表)
     # --------------------------------------------------------------------------
     ServiceProfile(
         id="googlevideo",
         group="dev",
         name="YouTube 视频流 (HTTP/3 上游腿)",
-        desc="经本机 HTTP/3 上游腿直连真实视频节点 (通道已实测; SABR 播放尚未验证, 默认不启用)",
-        domains=["*.googlevideo.com"],
+        desc="经本机 HTTP/3 上游腿直连真实视频节点 (通道已实测, 浏览器实测可播放; 默认不启用)",
+        # ⚠ 域名集合为什么**不能只写 *.googlevideo.com** (2026-10-02 NRPT 实测):
+        #   1) 播放器除了 googlevideo 主域, 还会请求**别名域家族**。实测失败主机名是
+        #      `rr1---sn-p5qs7nd7.c.youtube.com` (16 次 ERR_CERT_COMMON_NAME_INVALID):
+        #      该域**不在**劫持集合里 → 浏览器走真实(被投毒的)解析 → 连到投毒 IP →
+        #      拿到不匹配的证书 → 播放链断掉。
+        #      注意: 腿的解析器**本来就在用这批别名域**规避投毒 (h3_upstream.ALIAS_SUFFIXES),
+        #      即项目早已承认它们重要, 只是没登记进画像 —— 这是"两处各算一套"的典型。
+        #   2) **nginx 的 `*.googlevideo.com` 只匹配一层标签**。而真实 GVS 证书覆盖
+        #      `*.c.googlevideo.com` / `*.a1.googlevideo.com` —— 这类**两层**主机名匹配不上
+        #      → 落到默认 server → 同样是不匹配的证书。故必须显式登记这两条。
+        #   未登记 gvt1 家族: 它们只被腿当作**解析别名**使用, 未见播放器直接请求;
+        #   在无实测证据前不扩大劫持面 (与"不做假可用"一致)。
+        domains=[
+            "*.googlevideo.com",     # 主域
+            "*.c.googlevideo.com",   # 别名家族 (真实证书覆盖; nginx 单层通配匹配不到)
+            "*.a1.googlevideo.com",  # 同上
+            "*.c.youtube.com",       # ★ 实测失败主机名所在家族
+        ],
         icon="video",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_googlevideo",
