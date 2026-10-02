@@ -374,11 +374,24 @@ class NrptManager:
             script = (
                 "$ns = @(Get-Content -LiteralPath '" + str(ns_file) + "' -Encoding UTF8 | Where-Object { $_.Trim() -ne '' })\n"
                 "if ($ns.Count -eq 0) { throw '空命名空间列表' }\n"
-                "$own = @(Get-DnsClientNrptRule | Where-Object { $_.DisplayName -like '" + self.display_prefix + "*' })\n"
-                "foreach ($r in $own) { Remove-DnsClientNrptRule -Name $r.Name }\n"
+                # ⚠ 清理既有规则必须**容错** (2026-10-02 用户实测: 这一步抛过
+                #   `$_cmdletization_objectModelWrapper.EndProcessing()` NullReferenceException
+                #   —— CDXML 包装层的崩溃, 不是权限问题, 重试无用)。
+                #   该循环只是"删掉本程序自己的旧规则", 属于**尽力而为的清理**:
+                #   它失败不该让整次写入失败, 更不该把用户推回 Hosts (Hosts 表达不了通配,
+                #   会让 googlevideo 直接被硬拦)。因此: 逐条容错 + 不因它中断。
+                "$own = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.DisplayName -like '" + self.display_prefix + "*' })\n"
+                "foreach ($r in $own) { try { Remove-DnsClientNrptRule -Name $r.Name "
+                "-ErrorAction SilentlyContinue -ErrorVariable +rmErr | Out-Null } catch { } }\n"
                 "Add-DnsClientNrptRule -Namespace $ns -NameServers '" + name_server + "' "
                 "-DisplayName '" + self.display_name + "' -Comment '" + NRPT_COMMENT + "' | Out-Null\n"
                 "Write-Output ('GAMT_NRPT_APPLIED=' + $ns.Count)\n"
+                # 回读确认: 不把"命令没报错"当成功 —— 实测 certutil/部分 cmdlet 会
+                # 返回 0 却什么都没做, 本项目为此栽过多次。
+                "$chk = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.DisplayName -like '" + self.display_prefix + "*' })\n"
+                "Write-Output ('GAMT_NRPT_RULES=' + $chk.Count)\n"
             )
             rc, out, err = self._run_ps(script)
             if rc != 0 or "GAMT_NRPT_APPLIED=" not in (out or ""):
@@ -386,6 +399,10 @@ class NrptManager:
                 if _is_elevation_error(detail):
                     return False, "NRPT 写入失败: 未检测到管理员权限, 请以管理员身份运行本程序。"
                 return False, f"NRPT 写入失败: {detail}"
+            # 回读校验: 至少要有 1 条本程序规则, 否则这次"成功"是假的
+            if "GAMT_NRPT_RULES=0" in (out or ""):
+                return False, ("NRPT 写入失败: 命令未报错, 但回读发现**没有任何本程序规则** "
+                               "(写入未真正生效)。")
         except Exception as e:
             return False, f"NRPT 写入异常: {e}"
         finally:

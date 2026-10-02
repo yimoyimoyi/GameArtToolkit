@@ -413,6 +413,13 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     if not (applied_hosts or applied_nrpt):
         return {"cleaned": False, "detail": "无残留"}
 
+    # ⚠ `detail` 必须**先**初始化 (2026-10-02 单测抓到): 下面 try/except 的两条分支都写成
+    #   `f"{detail}; ..." if detail else ...`, 而 detail 只在**这两行**里被赋值 ——
+    #   于是 restore_system_proxy_if_needed() 一旦抛异常, 走 except 分支时 detail 尚未绑定
+    #   ⇒ UnboundLocalError。而这是**启动路径**(孤儿残留清理), 一炸就整段清理中断,
+    #   用户看到的是"上一会话残留没清掉"而不是真正的异常原因。
+    detail = ""
+
     # ★ 启动时也要还原**系统代理**: 上一次进程被强杀时无法执行清理, 而 pac_auto 改的是
     #   用户的系统代理设置 —— 若不在启动时还原, 用户的浏览器会把所有流量送进一个
     #   可能已不存在的本地代理, 等于全网上不了。落盘备份使这一步可恢复。

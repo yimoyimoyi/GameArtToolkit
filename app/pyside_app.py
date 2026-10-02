@@ -5505,6 +5505,32 @@ class MainWindow(QMainWindow):
             self.lbl_nrpt_status.setText(f"NRPT 状态检测异常: {e}")
             return
 
+        # ★ **实际生效的后端**优先于"前置条件" (2026-10-02 用户实测反馈, 三处说法互相矛盾):
+        #   原先这里只报"前置条件已满足, 可直接启用"。而用户遇到的是 NRPT 写入失败、
+        #   已回退 Hosts —— 于是界面上: 开关显示 ON、状态显示"可直接启用"、
+        #   但实际跑的是 Hosts ⇒ googlevideo 在 Hosts 下被硬拦 ⇒ 又提示"要开 NRPT"。
+        #   实际生效的后端只有一个可靠来源: REDIRECT_STATE (由 apply_redirect 写入)。
+        #   前置条件只是"能不能用", 与"现在用的是哪个"是两件事, 不能拿前者顶替后者。
+        try:
+            _st = REDIRECT_STATE or {}
+        except Exception:
+            _st = {}
+        _eff = _st.get("backend")
+        if _eff:
+            if _eff == MODE_NRPT and not _st.get("fell_back"):
+                self.lbl_nrpt_status.setText(
+                    f"✔ 当前实际生效: NRPT 策略表 "
+                    f"({_st.get('domain_count', 0)} 个域名定向本机 {_st.get('mode') or ''})")
+                self.lbl_nrpt_status.setStyleSheet("color: #34D399;")
+                return
+            _note = _st.get("note") or "未给出原因"
+            self.lbl_nrpt_status.setText(
+                f"⚠ 当前实际生效: {_eff}"
+                + (f"; NRPT 未生效, 已回退 —— {_note}" if _st.get("fell_back") else "")
+                + "。可重试 NRPT, 或改用 PAC 后端 (免管理员且支持通配)。")
+            self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
+            return
+
         if caps.get("ready"):
             port = caps.get("port53") or {}
             ns = caps.get("name_server") or "127.0.0.1"
