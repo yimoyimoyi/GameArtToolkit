@@ -1376,6 +1376,48 @@ def needs_wildcard_resolution(profile) -> bool:
     return any(str(d).startswith("*.") for d in (getattr(profile, "domains", None) or []))
 
 
+def wildcard_domains(profile) -> List[str]:
+    """画像里以 `*.` 开头的域名 (通配项), 保序"""
+    return [str(d) for d in (getattr(profile, "domains", None) or [])
+            if str(d).startswith("*.")]
+
+
+def wildcard_gap_warnings(services, redirect_mode: str, profiles_by_id=None
+                          ) -> Dict[str, List[str]]:
+    """当前解析后端**表达不了**的通配域 → 受影响的服务 (软告警, 不拦截)
+
+    与 blocked_services 的分工 (两者判据不同, 别混用):
+      · blocked_services: 服务**整体**依赖通配 (googlevideo 的域名全是 `*.`) ⇒ **硬拦**,
+        因为在 Hosts 下它 100% 不能用;
+      · 本函数: 服务里**只有部分**域名是通配 (gemini 的 `*.clients6.google.com`) ⇒ 只能**软告警**
+        —— 拦掉它比现在的半可用状态**更糟** (那个画像其余 17 个具体域在 Hosts 下是好的)。
+
+    为什么必须有这个软告警 (2026-10-02 用户控制台实测):
+      Hosts 文件不支持通配, 但 `build_domain_targets` 会把 `*.clients6.google.com`
+      **原样**写进 Hosts (`127.0.0.1 *.clients6.google.com`) —— 那一行匹配不到任何真实主机名。
+      于是该通配覆盖的主机照旧走真实解析 (被墙), 而**启用边界对它毫无提示**:
+      实测 `geminiweb-pa.clients6.google.com/v1/processSession` (WebChannel 会话端点) 与
+      `waa-pa.clients6.google.com/$rpc/...` 双双 ERR_CONNECTION_TIMED_OUT,
+      表现为"页面外壳能开、对话完全不通"。
+      这正是本项目反复强调的"假可用"—— 所以哪怕不拦, 也必须**说出来**。
+    """
+    if profiles_by_id is None:
+        from service_profile import PROFILES_BY_ID as profiles_by_id  # 延迟导入避免环
+    out: Dict[str, List[str]] = {}
+    if wildcard_capable(redirect_mode):
+        return out
+    for sid in services or []:
+        p = profiles_by_id.get(sid)
+        if p is None:
+            continue
+        wild = wildcard_domains(p)
+        # 已经被硬拦的服务不再重复软告警 —— 两者结果集刻意保持**不相交**,
+        # 调用方可以放心把两类消息拼在一起展示。
+        if wild and not needs_wildcard_resolution(p):
+            out[sid] = wild
+    return out
+
+
 def blocked_services(services, redirect_mode: str, profiles_by_id=None) -> Dict[str, str]:
     """在给定解析后端下**无法生效**的服务 → 原因
 

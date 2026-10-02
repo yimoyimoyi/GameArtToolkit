@@ -1962,6 +1962,17 @@ class MainWindow(QMainWindow):
                 show_toast(self, f"无法开启 [{_name}]: {_blocked[service_id]}",
                            toast_type="warning", duration=6000)
                 return
+            # 软告警 (不阻断): 该服务有"当前后端表达不了"的通配域时, **当场**告知 ——
+            # 这类失败很隐蔽 (页面外壳能开、只有个别子域超时), 等用户自己去翻控制台太晚。
+            _gaps = self._wildcard_gaps([service_id])
+            if _gaps:
+                _name = (_profile or {}).get("name", service_id)
+                show_toast(
+                    self,
+                    f"[{_name}] 已开启, 但 Hosts 后端劫持不到它的通配域名 "
+                    f"({'/'.join(_gaps[service_id])}) —— 页面可开, 而这些子域仍会走真实解析"
+                    f"(可能超时, 如 Gemini 的会话端点)。改用 PAC / NRPT 后端可完整覆盖。",
+                    toast_type="warning", duration=9000)
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -5033,6 +5044,36 @@ class MainWindow(QMainWindow):
             except Exception:
                 return False
 
+    @staticmethod
+    def _wildcard_gaps(services) -> Dict[str, List[str]]:
+        """当前解析后端**表达不了**的通配域 → 受影响服务 (软告警, 不拦截)
+
+        为什么不拦: 这类画像只是**部分**域名是通配 (gemini 的 `*.clients6.google.com`),
+        其余具体域在 Hosts 下是好的 —— 拦掉它比"半可用"更糟。
+        但**必须说出来**, 否则就是本项目一直在打击的"假可用":
+        实测 `geminiweb-pa.clients6.google.com/v1/processSession` (WebChannel 会话端点)
+        只被该通配覆盖, Hosts 又不支持通配 ⇒ 页面外壳能开、对话完全不通。
+
+        与 `blocked_services` 的分工: 那个是**硬拦**(整服务都依赖通配, 如 googlevideo),
+        这里是**软告警**; 两者的结果集按构造**不相交** (见 h3_upstream 的注释与测试)。
+        """
+        try:
+            from h3_upstream import wildcard_gap_warnings
+            mode = (load_config() or {}).get("redirect_mode", "hosts")
+            return wildcard_gap_warnings(list(services or []), mode)
+        except Exception as e:
+            print(f"[Redirect] 通配缺口检查失败 (忽略): {e}")
+            return {}
+
+    @staticmethod
+    def _format_gap_note(gaps) -> str:
+        """`{服务ID: [通配域]}` → 一行可读文案"""
+        parts = []
+        for sid, domains in sorted((gaps or {}).items()):
+            name = (SERVICES_BY_ID.get(sid) or {}).get("name", sid)
+            parts.append(f"{name}({'/'.join(domains)})")
+        return "；".join(parts)
+
     def _apply_redirect(self, services: List[str]) -> Tuple[bool, str]:
         """按 redirect_mode 应用域名重定向, 前置条件不足时自动回退 Hosts
 
@@ -5054,6 +5095,12 @@ class MainWindow(QMainWindow):
             self._blocked_services_note = _blocked
         else:
             self._blocked_services_note = {}
+        # 软告警 (不剔除): 部分通配的服务记下来交给界面展示。
+        # ⚠ 必须在**剔除之后**再算 —— 被硬拦的服务不该同时出现在软告警里 (两者刻意不相交)。
+        self._wildcard_gap_note = self._wildcard_gaps(services)
+        if self._wildcard_gap_note:
+            print(f"[Redirect] 当前后端无法劫持 {len(self._wildcard_gap_note)} 个服务的通配域: "
+                  f"{self._format_gap_note(self._wildcard_gap_note)}")
         return apply_redirect(load_config(), services, hosts_mgr, nrpt_mgr,
                               local_dns_server, REDIRECT_STATE)
 
@@ -5224,6 +5271,24 @@ class MainWindow(QMainWindow):
                 extra += f" | ⚠ ECH: {result.get('ech_msg', '')}"
             show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}",
                        toast_type="success", duration=2500)
+
+        # 两道闸门的**结果必须都说出来** —— 否则等于没装:
+        #   · 硬拦 (blocked): 这些服务已被剔除, 用户会疑惑"我明明开了它"
+        #   · 软告警 (gaps): 这些服务开着了, 但通配覆盖的子域劫持不到 (假可用)
+        # ⚠ 实测教训: `_blocked_services_note` 此前**只被写入、从没被读取** —— 写了个寂寞。
+        _blocked_note = getattr(self, "_blocked_services_note", None) or {}
+        if _blocked_note:
+            show_toast(self,
+                       f"已跳过 {len(_blocked_note)} 个在当前后端下无法生效的服务: "
+                       f"{'；'.join(f'{k}' for k in sorted(_blocked_note))}",
+                       toast_type="warning", duration=8000)
+        _gap_note = getattr(self, "_wildcard_gap_note", None) or {}
+        if _gap_note:
+            show_toast(self,
+                       f"⚠ 当前 Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域名: "
+                       f"{self._format_gap_note(_gap_note)} —— 这些子域仍走真实解析, "
+                       f"相关功能可能超时。改用 PAC / NRPT 后端可完整覆盖。",
+                       toast_type="warning", duration=10000)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()

@@ -304,6 +304,22 @@ class HostsManager:
             for d in quic_domains:
                 domain_ip_map.pop(d, None)
 
+            # 通配域名同样必须排除在 Hosts 之外 —— 原因与 QUIC 那条不同, 但后果更隐蔽:
+            # Hosts **不支持通配**, 原样写进去只会得到一行匹配不到任何真实主机名的垃圾
+            # (`127.0.0.1 *.clients6.google.com`)。于是该通配覆盖的真实主机照旧走真实解析
+            # (被墙) → ERR_CONNECTION_TIMED_OUT。
+            # 实测 (2026-10-02 用户控制台): Gemini 的
+            # `geminiweb-pa.clients6.google.com/v1/processSession` **正是 WebChannel 会话端点**
+            # 而它只被 `*.clients6.google.com` 覆盖 ⇒ 表现为"页面外壳能开、对话完全不通"。
+            # ⚠ 只能在**写 Hosts 这一步**剔除, 绝不能改 build_domain_targets ——
+            #   NRPT / PAC 后端都从它取域名表, 而通配项对它们**是有意义的**
+            #   (PAC 用 `host.endsWith()` 表达)。
+            # 覆盖该通配的办法: ① 把实测到的具体主机显式登记进画像 (如 gemini 的
+            #   waa-pa / geminiweb-pa); ② 换成具备通配能力的后端。
+            # 残留缺口由 h3_upstream.wildcard_gap_warnings() 负责**说出来**。
+            for d in [k for k in domain_ip_map if str(k).startswith("*.")]:
+                domain_ip_map.pop(d, None)
+
             if not domain_ip_map:
                 self._safe_write_hosts(base_content)
                 self.flush_dns()

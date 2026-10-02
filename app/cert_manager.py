@@ -586,23 +586,36 @@ class CertManager:
         self._cached_installed = False
         return False
 
+    def _prune_after_install(self) -> None:
+        """安装**成功之后**才清理历史代际残留 (只保留仍在使用的根)
+
+        ⚠ 顺序是安全属性, 不是风格问题 (2026-10-02 定因):
+        原先 `install_cert` 是在**安装之前**就 prune —— 于是先删掉旧根、再去尝试装新根,
+        中间存在"一个受信任的程序根都没有"的窗口。若随后的安装失败
+        (非提权 / PowerShell 被策略拦下 / 5s 超时), 机器就被留在**零信任**状态:
+        **所有**走本地 CA 的服务一起 net::ERR_CERT_AUTHORITY_INVALID。
+        信任只能"先增后减": 新的装好了, 才轮到清理旧的。
+        """
+        try:
+            prune = self.prune_stale_trust_roots()
+            if prune.get("removed"):
+                print(f"[Cert] 已清理历史根证书 {len(prune['removed'])} 个")
+            if prune.get("protected"):
+                print(f"[Cert] 保留仍在使用的根 {len(prune['protected'])} 个 "
+                      f"(未被当陈旧清理)")
+            if prune.get("failed"):
+                print(f"[Cert] 历史根证书清理未完成: {prune.get('message')}")
+        except Exception as e:
+            print(f"[Cert] 历史根证书清理跳过: {e}")
+
     def install_cert(self) -> Tuple[bool, str]:
         """静默安装证书到系统与当前用户受信任根证书存储区 (全静默无黑框，前置确保自生成就绪)"""
         self.ensure_certificates()
         if not self.cer_path.exists():
             return False, f"证书文件不存在: {self.cer_path}"
 
-        # 0. 安装前先清理历史代际残留: 只保留当前活跃 CA。
-        #    若不做这一步, 每次 CA 重新生成都会在受信任根里新增一个永不回收的根证书
-        #    (实测曾累积到 53 个), 每个都能签发任意站点证书, 属持续扩大的攻击面。
-        try:
-            prune = self.prune_stale_trust_roots()
-            if prune.get("removed"):
-                print(f"[Cert] 已清理历史根证书 {len(prune['removed'])} 个")
-            elif prune.get("failed"):
-                print(f"[Cert] 历史根证书清理未完成: {prune.get('message')}")
-        except Exception as e:
-            print(f"[Cert] 历史根证书清理跳过: {e}")
+        # ⚠ 这里**不再**先 prune —— 见 _prune_after_install 的顺序说明。
+        # 安装成功后才清理, 保证信任集合"先增后减", 失败时宁可留残留也不留零信任。
 
         # 1. 优先使用 PowerShell Import-Certificate (系统级，静默无弹窗)
         ps_cmd = f"Import-Certificate -FilePath '{self.cer_path}' -CertStoreLocation Cert:\\LocalMachine\\Root"
@@ -612,6 +625,7 @@ class CertManager:
                 capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
             )
             if self.is_cert_installed(force_refresh=True):
+                self._prune_after_install()
                 return True, "根证书已成功安装到系统受信任根证书存储区！"
         except Exception:
             pass
@@ -635,6 +649,7 @@ class CertManager:
                         )
                     except Exception:
                         pass
+                    self._prune_after_install()
                     return True, f"根证书已成功安装到{target_desc}！"
             except Exception:
                 continue
@@ -651,35 +666,40 @@ class CertManager:
         return False, "未能成功导入根证书，请以管理员身份运行本程序以完成受信任授权。"
 
     def uninstall_cert(self) -> Tuple[bool, str]:
-        """从系统和用户根证书库中安全卸载 (全静默无黑框，同时兼容清理旧版根证书)"""
-        thumbprint = self.get_cert_thumbprint()
+        """从系统与用户根证书库中卸载**本程序的**根证书 (crypt32 原生 + 复查)
 
-        try:
-            if thumbprint:
-                subprocess.run(
-                    ["certutil", "-delstore", "ROOT", thumbprint],
-                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-                )
-                subprocess.run(
-                    ["certutil", "-delstore", "-user", "ROOT", thumbprint],
-                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-                )
-            
-            # 同时尝试根据 Common Name 清理
-            for cn_name in ["GameArt Toolkit Universal Root CA", "PixivToolkit Universal Root CA"]:
-                subprocess.run(
-                    ["certutil", "-delstore", "ROOT", cn_name],
-                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-                )
-                subprocess.run(
-                    ["certutil", "-delstore", "-user", "ROOT", cn_name],
-                    capture_output=True, timeout=5, shell=False, **get_silent_startup_kwargs()
-                )
+        ⚠ 这里原先用的是 `certutil -delstore`, **而且按 CN 名字删** —— 两条都是本项目
+        自己已经定过案的错误做法 (2026-10-02 一并改掉):
 
-            self._cached_installed = False
-            return True, "已从系统卸载根证书"
-        except Exception as e:
-            return False, f"卸载证书异常: {e}"
+        1) `certutil -delstore` 对**根证书是空操作**: 它返回 0 并打印"命令成功完成",
+           证书却纹丝不动。这正是"不受信任的历史根无限累积"的真因 (实测本机曾累积 53 个)。
+           `prune_stale_trust_roots` 早已改用 crypt32 原生删除, 但**卸载路径漏改了** ——
+           于是"卸载"从未真正卸载过, 用户以为已经清干净了。
+        2) **绝不能按名字删**: 两代根的 Subject 几乎同名
+           (`GameArt Toolkit Universal Root CA` / `PixivToolkit Universal Root CA`),
+           而同一时刻可能有一个**正在签发叶子证书**。按名字批量删会把它一起带走,
+           导致全机 net::ERR_CERT_AUTHORITY_INVALID。必须**按指纹精确删**。
+
+        删除范围: 只删 `list_own_trust_roots()` 认出的自有根 (Subject 命中本程序两代 CN),
+        第三方根一律不动。
+        """
+        own = self.list_own_trust_roots()
+        if not own:
+            self._cached_installed = None
+            return True, "受信任存储中没有本程序的根证书 (无需卸载)"
+
+        removed, failed = [], []
+        for cert in own:
+            ok, why = self._delete_trust_root(cert["store"], cert["thumbprint"])
+            tag = f"{cert['store']}/{cert['thumbprint']}"
+            (removed if ok else failed).append(tag if ok else {"root": tag, "reason": why})
+
+        self._cached_installed = None      # 存储已变化, 失效缓存
+        if failed:
+            detail = "; ".join(f"{f['root']}: {f['reason']}" for f in failed[:3])
+            return False, (f"已卸载 {len(removed)} 个本程序根证书, {len(failed)} 个失败 "
+                           f"({detail})")
+        return True, f"已从受信任存储卸载本程序的全部根证书 ({len(removed)} 个)"
 
     # ------------------------------------------------------------------
     # 信任库卫生: 清理历史代际残留的根证书
@@ -793,6 +813,48 @@ class CertManager:
         finally:
             crypt32.CertCloseStore(h_store, 0)
 
+    def live_ca_thumbprints(self) -> Dict[str, str]:
+        """本机上**仍可能在被使用**的自有根指纹 → 出处 (这些一律不得当"陈旧"删除)
+
+        为什么必须有这道保护 (2026-10-02 本会话**第 4 次**事故):
+          `prune_stale_trust_roots` 原来只把**本实例** `cer_path` 的指纹当"活跃",
+          其余自有根一律判为陈旧并删除。于是只要有人用
+          `nginx_dir=<dist>/GameArtToolkit/nginx` 跑一次证书生成, "活跃"就变成 dist 里
+          那个新根 (实测 144B3D6C), 而**源码树 nginx 正在真正使用的根**
+          (实测 542D3B4C) 被判为陈旧删掉 ⇒ 浏览器 net::ERR_CERT_AUTHORITY_INVALID,
+          **全部**走本地 CA 的服务一起失效。
+          根因是"活跃"的判据太窄 —— 它只看得见一个目录。这里放宽为:
+          **凡在"规范目录"或"本实例目录"里还能找到 ca.cer 的根, 就算在用。**
+          这是保守取向: 宁可少清一个, 也不能把正在签发叶子证书的根删掉。
+        """
+        out: Dict[str, str] = {}
+        dirs: List[Path] = []
+        try:
+            from path_utils import NGINX_DIR as _canon   # 规范目录 (源码树 / 安装目录)
+            dirs.append(Path(_canon))
+        except Exception:
+            pass
+        try:
+            dirs.append(Path(self.nginx_dir))            # 本实例目录 (可能是 dist)
+        except Exception:
+            pass
+        for root in dirs:
+            for rel in ("ca.cer", "ca/ca.cer", "conf/ca/ca.cer"):
+                f = root / rel
+                try:
+                    if not f.is_file():
+                        continue
+                    raw = f.read_bytes()
+                    if b"BEGIN CERTIFICATE" in raw:
+                        fp = x509.load_pem_x509_certificate(raw) \
+                            .fingerprint(hashes.SHA1()).hex()
+                    else:
+                        fp = hashlib.sha1(raw).hexdigest()
+                    out[fp.upper()] = str(f)
+                except Exception:
+                    continue
+        return out
+
     def prune_stale_trust_roots(self, dry_run: bool = False) -> Dict[str, Any]:
         """移除历史代际残留的根证书, 只保留当前活跃 CA
 
@@ -802,12 +864,26 @@ class CertManager:
 
         安全性: 只删除 Subject 命中本程序 CA 名称、且指纹 != 当前活跃 CA 的证书;
         第三方证书与当前活跃 CA 一律不动。
+
+        **2026-10-02 加固**: 除"当前活跃 CA"外, 还要保护 `live_ca_thumbprints()` 认出的
+        那些"仍在被使用"的根。原先只看本实例 cer_path 一个目录 —— 只要生成动作发生在
+        **另一个目录** (实测 dist), 真正在用的根就会被当陈旧删掉, 全机证书信任一起坏掉。
         """
         active = self.get_cert_thumbprint()
+        live = self.live_ca_thumbprints()
         before = self.list_own_trust_roots()
-        stale = [c for c in before if c["thumbprint"] and c["thumbprint"] != active]
+        stale = [c for c in before
+                 if c["thumbprint"] and c["thumbprint"] != active
+                 and c["thumbprint"].upper() not in live]
+        # 被保护而刻意不清理的项 —— 必须显式报出来, 否则"清理后仍有残留"会被误判成失败
+        protected = [c for c in before
+                     if c["thumbprint"] and c["thumbprint"] != active
+                     and c["thumbprint"].upper() in live]
         report: Dict[str, Any] = {
             "active": active,
+            "live": live,
+            "protected": [f"{c['store']}/{c['thumbprint']}"
+                          for c in protected],
             "total": len(before),
             "stale": len(stale),
             "removed": [],
@@ -819,11 +895,16 @@ class CertManager:
             report["message"] = "无法读取当前活跃 CA 指纹, 已中止清理 (避免误删正在使用的根)"
             return report
         if not stale:
-            report["message"] = f"信任库干净: 仅有当前活跃 CA ({len(before)} 个匹配项)"
+            report["message"] = (
+                f"信任库干净: 仅有当前活跃 CA ({len(before)} 个匹配项)"
+                + (f"; 另有 {len(protected)} 个仍在被使用的根已保留"
+                   if protected else ""))
             return report
         if dry_run:
             report["removed"] = [f"{c['store']}/{c['thumbprint']}" for c in stale]
-            report["message"] = f"预览: 将清理 {len(stale)} 个历史根证书"
+            report["message"] = (f"预览: 将清理 {len(stale)} 个历史根证书"
+                                 + (f", 保留 {len(protected)} 个仍在被使用的"
+                                    if protected else ""))
             return report
 
         # 逐项独立删除: 部分失败 (典型为机器级缺管理员权限) 不应中断整体清理
@@ -844,6 +925,10 @@ class CertManager:
         if report["removed"]:
             self._cached_installed = None       # 存储已变化, 失效缓存
         parts = [f"已清理 {len(report['removed'])} 个历史根证书"]
+        if protected:
+            # 显式说明, 否则"清理后仍有自有根残留"会被当成清理失败
+            parts.append(f"保留 {len(protected)} 个仍在被使用的根 "
+                         f"({', '.join(sorted(set(report['protected'])))[:120]})")
         if report["failed"]:
             parts.append(f"{len(report['failed'])} 个失败")
             if needs_admin:

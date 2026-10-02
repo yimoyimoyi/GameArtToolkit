@@ -1075,6 +1075,19 @@ PROFILES: List[ServiceProfile] = [
             # 同上: 岛屿(island)静态资源主机的**分片子域** (njl0.static.usercontent.goog 等),
             # 用一层通配覆盖, 避免逐分片登记
             "*.static.usercontent.goog",
+            # ⚠ 但通配**之外还必须逐个登记实测到的主机**: Hosts 不支持通配 (见下),
+            #    在默认的 hosts 后端下**只有具体名字才会被劫持**。
+            #    2026-10-02 用户控制台实测: `geminiweb-pa.clients6.google.com/v1/processSession`
+            #    与 `waa-pa.clients6.google.com/$rpc/google.internal.waa.v1.Waa/Create`
+            #    双双 net::ERR_CONNECTION_TIMED_OUT —— 而 processSession 正是
+            #    **WebChannel 会话端点**, 也就是"页面外壳能开、对话完全不通"的直接原因。
+            #    链路侧已实测可服务这三个主机 (curl --resolve 到 127.0.0.1 拿到的是
+            #    Google 自己的 404 页, 不是 default server 的 400 "Invalid URL"),
+            #    所以缺的只是"把它们劫持过来"这一步。
+            "njl0.static.usercontent.goog",
+            "waa-pa.clients6.google.com",
+            "geminiweb-pa.clients6.google.com",
+            "ogads-pa.clients6.google.com",
             # —— 模型 API (AI Studio / SDK 直连) ——
             # 注意: 这些域未登记时会被解析到 127.0.0.1 却落到默认 server (400),
             # 属"看着像通了"的失败, 故必须显式登记。

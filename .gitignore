@@ -160,6 +160,7 @@ scripts/test_*.py
 scripts/benchmark_*.py
 # 一次性排障 / 紧急清理助手 (与 probe_* 同类: 只在本机排查时用, 不上传)
 scripts/fix_ca_trust.py
+scripts/clean_residual_root.py
 scripts/nrpt_emergency_clean.py
 scripts/nrpt_step.py
 scripts/hosts_step.py
