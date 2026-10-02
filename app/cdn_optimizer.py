@@ -28,6 +28,8 @@ from typing import Dict, List, Tuple, Optional, Callable, Any
 
 from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID, PROFILES_BY_ID
+import h3_upstream
+import cover_sni
 from config_store import load_config
 from win_utils import is_port_in_use, get_physical_adapter_ip, auto_detect_active_proxy
 from ech_tunnel import ech_tunnel
@@ -47,6 +49,25 @@ SNI_MODES = {p.id: p.ssl_sni_mode for p in PROFILES}
 
 # 伪 SNI 服务: relay 转发时要求 rank1 (HTTP 干净) 才允许, 避免伪 SNI 触发 421/404
 PSEUDO_SNI_SERVICES = {p_id for p_id, m in SNI_MODES.items() if m not in ("host", "empty")}
+
+
+def effective_sni_mode(srv_id: str) -> str:
+    """该服务**当前**应使用的 SNI 模式 (含掩护 SNI 运行时降级)
+
+    为什么不能让探测与生成器各读一份: nginx_generator 会按掩护 SNI 回归结果降级
+    (见 app/cover_sni.py), 而探测若仍用旧的 g.cn, 就会挑出一批"在 g.cn 下可用、
+    在降级后的真实 SNI 下未必可用"的节点 —— 生成的是 A, 选的却是 B。
+    无新鲜探测结果时本函数返回值与 SNI_MODES 完全一致, 因此不改变既有行为。
+    """
+    prof = PROFILES_BY_ID.get(srv_id)
+    if prof is not None:
+        try:
+            m = cover_sni.effective_sni_mode(prof)
+            if m:
+                return m
+        except Exception:
+            pass
+    return SNI_MODES.get(srv_id, "host")
 
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
 SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
@@ -550,7 +571,8 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          measure_throughput: bool = False,
                          probe_domains: Optional[List[str]] = None,
                          ok_statuses: Optional[set] = None,
-                         proxy_connect_domain: bool = False) -> Dict:
+                         proxy_connect_domain: bool = False,
+                         cert_vendor: str = "") -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
 
     单节点独立生命周期计时:
@@ -565,11 +587,17 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
       任一副域状态码可疑 → 输出 http_suspect=True, 调用方不得判 rank0。
     - ok_statuses: 该服务显式放行的状态码集合 (如 S3 根路径 403 / githubassets 根路径 404,
       这些 4xx 是虚拟主机"无根文档/无权限"的正常响应而非假节点特征)
+    - cert_vendor: 启用证书硬门槛 (方案 §6.2 第 ③ 关)。**仅对已登记证书族的厂商生效**
+      (当前只有 google), 其余厂商一律不启用 —— 没有实测证据的厂商不做判定, 避免误杀。
+      判据 = 对端证书的 SAN 里至少有一条属于该厂商自有证书族; 不通过则**硬淘汰**该节点
+      (http_suspect=True 并提前返回), 因为伪 SNI 方案下运行期必须 proxy_ssl_verify off,
+      "这个节点是不是真的该厂商边缘"只能在探测阶段把关 —— 这是唯一防线。
     """
     def _do_probe_once() -> Dict:
         out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
                "tls_latency": None, "http_ok": False, "http_status": None, "error": "",
-               "http_suspect": False, "http_subdomains_ok": True, "throughput": None}
+               "http_suspect": False, "http_subdomains_ok": True, "throughput": None,
+               "cert_ok": None, "cert_sans": []}
         # http_suspect: 主域状态码可疑 (硬淘汰, 防假阳性)
         # http_subdomains_ok: 副域多域验证是否全部通过 (软信号, 失败仅排序降权不淘汰,
         #   防 GFW 特判封锁子域/瞬时抖动误杀整服务)
@@ -633,6 +661,23 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                 sock = None  # 所有权转移至 ssock
                 out["tls_ok"] = True
                 out["tls_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
+
+                # §6.2 第 ③ 关: 证书硬门槛 (仅已登记证书族的厂商)
+                if cert_vendor and cert_vendor in cover_sni.VENDOR_CERT_SUFFIXES:
+                    try:
+                        sans = cover_sni.cert_sans(ssock.getpeercert(binary_form=True))
+                    except Exception:
+                        sans = []
+                    out["cert_sans"] = sans[:8]
+                    ok = cover_sni.cert_belongs_to_vendor(sans, cert_vendor)
+                    out["cert_ok"] = bool(ok)
+                    if not ok:
+                        # 硬门槛: 不可降权, 直接淘汰。命中场景 = 空 SNI 的占位证书
+                        # invalid2.invalid / 打错服务器的别人家证书 / Bandaid 类错误 vhost。
+                        out["http_suspect"] = True
+                        out["error"] = (f"cert gate: 证书不属于 {cert_vendor} 证书族 "
+                                        f"(SAN={sans[:3] or '空'})")
+                        return out
             except Exception as e:
                 out["error"] = f"tls error: {e}"
                 return out
@@ -886,6 +931,7 @@ class CDNOptimizer:
         self.last_relay_services: set = set()
         # 最近一次走 ECH 隧道直连的服务集合
         self.last_ech_services: set = set()
+        self.last_h3_services: set = set()
         # 标记了 ech_enabled 但隧道未就绪、已退回常规分支的服务
         self.last_ech_degraded: set = set()
         # 单轮生成内的兜底探测缓存 (key=ip, value=(ok, latency))
@@ -936,7 +982,7 @@ class CDNOptimizer:
             if not ip_list:
                 ip_list = list(CANDIDATE_IPS.get(group_name, []))
 
-        sni_mode = SNI_MODES.get(group_name, "host")
+        sni_mode = effective_sni_mode(group_name)
         proxy = _load_proxy_config()
         proxy_ready = is_proxy_available(proxy)
         if not proxy_ready:
@@ -952,15 +998,19 @@ class CDNOptimizer:
         ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
         # 代理通道 CONNECT 域名 (适配 Clash IP 段 DIRECT 规则 / CDN geo 限制)
         proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
+        # §6.2 第 ③ 关: 证书硬门槛的厂商 (仅已登记证书族者生效, 见 probe_ip_endpoint_v2)
+        cert_vendor = str(getattr(profile, "cdn_vendor", "") or "").strip().lower()
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
                 direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
                                               measure_throughput=measure_thp,
-                                              probe_domains=probe_domains, ok_statuses=ok_statuses)
+                                              probe_domains=probe_domains, ok_statuses=ok_statuses,
+                                              cert_vendor=cert_vendor)
                 proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
                                                  measure_throughput=False,
                                                  probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                                 proxy_connect_domain=proxy_connect_domain) if proxy else None
+                                                 proxy_connect_domain=proxy_connect_domain,
+                                                 cert_vendor=cert_vendor) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -1066,7 +1116,7 @@ class CDNOptimizer:
         for srv_id, ips in service_raw_ips.items():
             srv = SERVICES_BY_ID.get(srv_id, {})
             domain = srv.get("domains", [""])[0] if srv else ""
-            sni_mode = SNI_MODES.get(srv_id, "host")
+            sni_mode = effective_sni_mode(srv_id)
             # 服务级探测档位 (profile.probe_timeout 优先, 回退全局 cdn_timeout_seconds)
             task_timeout = probe_timeout_for(srv_id, timeout)
             profile = PROFILES_BY_ID.get(srv_id)
@@ -1076,23 +1126,28 @@ class CDNOptimizer:
             ok_statuses = set(getattr(profile, "probe_ok_statuses", ()) or ()) or None
             # 代理通道 CONNECT 域名 (适配 Clash IP 段 DIRECT 规则 / CDN geo 限制)
             proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
+            # §6.2 第 ③ 关: 证书硬门槛的厂商 (仅已登记证书族者生效)
+            cert_vendor = str(getattr(profile, "cdn_vendor", "") or "").strip().lower()
 
             # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout, measure_thp,
-                                   probe_domains, ok_statuses, proxy_connect_domain))
+                                   probe_domains, ok_statuses, proxy_connect_domain, cert_vendor))
 
         def run_both(task):
-            srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains, ok_statuses, proxy_connect_domain = task
+            (srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains,
+             ok_statuses, proxy_connect_domain, cert_vendor) = task
             direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
                                           quick_retry=True, measure_throughput=measure_thp,
-                                          probe_domains=probe_domains, ok_statuses=ok_statuses)
+                                          probe_domains=probe_domains, ok_statuses=ok_statuses,
+                                          cert_vendor=cert_vendor)
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
                                              quick_retry=False, measure_throughput=False,
                                              probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                             proxy_connect_domain=proxy_connect_domain) if proxy else None
+                                             proxy_connect_domain=proxy_connect_domain,
+                                             cert_vendor=cert_vendor) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -1138,7 +1193,7 @@ class CDNOptimizer:
                     continue
                 if expected_ip not in done_ips:
                     items.append({"ip": expected_ip, "latency": None, "available": False, "rank": 3,
-                                  "via_proxy": False, "recommend": "none", "sni_mode": SNI_MODES.get(srv_id, "host"),
+                                  "via_proxy": False, "recommend": "none", "sni_mode": effective_sni_mode(srv_id),
                                   "direct": None, "proxy": None, "proxy_used": proxy_ready})
             stable_set = set(getattr(PROFILES_BY_ID.get(srv_id), "stable_ips", [])) or None
             items.sort(key=lambda x: _service_sort_key(x, ip_mode, stable_set))
@@ -1434,6 +1489,7 @@ class CDNOptimizer:
         # 每次生成重置 relay / ECH 服务集合 (由本轮决策重新填充)
         self.last_relay_services = set()
         self.last_ech_services = set()
+        self.last_h3_services = set()
         self.last_ech_degraded = set()
         # 重置兜底探测缓存: 结果只在一轮生成内复用, 跨轮必须重新探测以反映网络变化
         self._probe_cache.clear()
@@ -1462,6 +1518,26 @@ class CDNOptimizer:
             # 无关, 必须每轮重新评估 —— 否则隧道状态变化会被旧块掩盖
             # (实测: 该分支原本在合并之后, 未测速的服务直接沿用旧块, ECH 永不生效)。
             # --------------------------------------------------------------
+            # --------------------------------------------------------------
+            # 本地 HTTP/3 上游腿分支 (googlevideo)
+            #
+            # 与 ECH 分支同构且同样必须**置于增量合并之前**: 上游是本地代理端口,
+            # 与探测结果无关, 每轮都要重新评估, 否则会被旧块掩盖。
+            #
+            # 与 ECH 的差别: h3 腿是本地常驻进程, 没有"隧道健康"这种外部状态,
+            # 因此不做健康探测 (apply_optimal 由 UI 线程调用, 严禁在此发起网络探测),
+            # 直接写回环地址。"能否真的跑通"由 app/gvs_h3_probe 闸门在启用前把关。
+            # --------------------------------------------------------------
+            if getattr(PROFILES_BY_ID.get(srv_id), "h3_upstream", False):
+                lines.append(f"upstream upstream_{srv_id} {{")
+                lines.append(f"    # 经本地 HTTP/3 上游腿直连真实节点 (port={h3_upstream.PORT})")
+                lines.append(f"    server 127.0.0.1:{h3_upstream.PORT} {_upstream_server_opts()};")
+                lines.append("    keepalive 32;")
+                lines.append("    keepalive_timeout 30;")
+                lines.append("    keepalive_requests 10000;")
+                lines.append("}\n")
+                self.last_h3_services.add(srv_id)
+                continue
             if getattr(PROFILES_BY_ID.get(srv_id), "ech_enabled", False):
                 if ech_tunnel.is_healthy():
                     lines.append(f"upstream upstream_{srv_id} {{")
@@ -1847,7 +1923,7 @@ class CDNHealthMonitor:
 
         # 轻量探针检查当前主力节点 (三态验证 + 多域全验证 + 状态码放行, 全部通过才算健康)
         profile = PROFILES_BY_ID.get(srv_id)
-        sni_mode = SNI_MODES.get(srv_id, "host")
+        sni_mode = effective_sni_mode(srv_id)
         domain = srv["domains"][0] if srv["domains"] else ""
         measure_thp = bool(getattr(profile, "measure_throughput", False))
         probe_domains = list(getattr(profile, "probe_domains", ()) or ()) or None
@@ -1857,7 +1933,8 @@ class CDNHealthMonitor:
                                          timeout=PROBE_DEFAULTS.health_probe_timeout, sni_mode=sni_mode,
                                          measure_throughput=measure_thp,
                                          probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                         proxy_connect_domain=proxy_connect_domain)
+                                         proxy_connect_domain=proxy_connect_domain,
+                                         cert_vendor=str(getattr(profile, "cdn_vendor", "") or "").strip().lower())
 
         if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
                 and not _suspect_status(probe_res.get("http_status"))

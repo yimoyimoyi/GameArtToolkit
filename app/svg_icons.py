@@ -160,6 +160,26 @@ SVG_TEMPLATES = {
         <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"></path>
     </svg>""",
 
+    # 补登记: youtube_web 画像的 icon="video" 此前**没有对应模板**, 工厂会静默返回
+    # 一张全透明 QPixmap (见 SvgIconFactory.get_pixmap 的 not template 分支) ——
+    # 界面表现是"YouTube 卡片的图标位置空白", 不报错、不崩溃, 因此极易漏掉。
+    "video": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m22 8-6 4 6 4V8Z"></path>
+        <rect width="14" height="12" x="2" y="6" rx="2" ry="2"></rect>
+    </svg>""",
+
+    # 补登记: reddit / discord 用 icon="message", reddit_static 用 icon="code",
+    # 三者此前同样没有模板 (空白图标, 不报错)。一并补齐, 保证"画像声明的每个图标名
+    # 都有模板"这条不变量成立 (见 tests/test_theme_and_layout.py 的图标覆盖测试)。
+    "message": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"></path>
+    </svg>""",
+
+    "code": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="16 18 22 12 16 6"></polyline>
+        <polyline points="8 6 2 12 8 18"></polyline>
+    </svg>""",
+
     "book": """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"></path>
         <path d="M6 6h10"></path>

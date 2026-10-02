@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
 from win_utils import get_silent_startup_kwargs, is_admin
 from service_profile import PROFILES
+import private_key_acl
 
 CA_CER_PATH = NGINX_DIR / "ca.cer"
 
@@ -57,6 +58,18 @@ _CERT_NAME_SIMPLE_DISPLAY_TYPE = 4
 _CERT_STORE_PROV_SYSTEM_W = 10
 _CERT_SYSTEM_STORE_CURRENT_USER = 0x00010000
 _CERT_SYSTEM_STORE_LOCAL_MACHINE = 0x00020000
+# 只读打开标志。**审计/枚举路径必须带上它**: 不带时 crypt32 会以"可写"方式打开存储,
+# 而机器级存储的写访问需要管理员 —— 非提权下 CertOpenStore 直接失败(实测 GetLastError=5),
+# 于是枚举被静默跳过、报告**低报**问题。实测同一台机器同一时刻:
+#   PowerShell(Cert:\LocalMachine\Root) 非提权可读到 74 张, 而项目实现一张都读不到;
+#   提权前 --report 报"2 个", 提权后同一次 prune 却报 total=3 (多出机器级那份 C8B7...)。
+# 审计绝不能因为读不到就说"干净" —— 那是比不审计更危险的结果。
+_CERT_STORE_READONLY_FLAG = 0x00008000
+
+
+# 枚举失败的存储 (label -> 原因)。存在的意义: 让审计**说出自己没看到什么** ——
+# "读不到"被静默吞掉时, 报告会把"看不见"显示成"没问题", 这比不审计更危险。
+_STORE_ENUM_ERRORS: List[tuple] = []
 
 
 def iter_trust_store_certs():
@@ -88,8 +101,13 @@ def iter_trust_store_certs():
     stores = ((_CERT_SYSTEM_STORE_LOCAL_MACHINE, "LocalMachine\\Root"),
               (_CERT_SYSTEM_STORE_CURRENT_USER, "CurrentUser\\Root"))
     for flags, label in stores:
-        h_store = crypt32.CertOpenStore(ctypes.c_void_p(_CERT_STORE_PROV_SYSTEM_W), 0, 0, flags, "Root")
+        # 必须 OR 上只读标志, 否则机器级存储会因"要写权限"而打开失败 (见常量处注释)
+        h_store = crypt32.CertOpenStore(ctypes.c_void_p(_CERT_STORE_PROV_SYSTEM_W), 0, 0,
+                                        flags | _CERT_STORE_READONLY_FLAG, "Root")
         if not h_store:
+            # 不能静默跳过: 读不到的存储会被下游当成"里面没有问题"
+            _STORE_ENUM_ERRORS.append(
+                (label, f"CertOpenStore 失败 (GetLastError={ctypes.get_last_error()})"))
             continue
         try:
             ctx = crypt32.CertEnumCertificatesInStore(h_store, None)
@@ -119,6 +137,30 @@ def iter_trust_store_certs():
             crypt32.CertCloseStore(h_store, 0)
 
 
+# 公共后缀样式的"注册局标签": 若域名的**后两段**形如 <这些标签>.<两位国家码>,
+# 则这两段是公共后缀而不是可注册主域, 不得据此派生通配 SAN。
+# 为什么需要 (2026-10-02 实测): get_all_san_domains 会把 3 段以上域名的后两段
+# 当作"二级主域"并加通配 (i.pximg.net -> pximg.net, 正确)。但补全 Google 国家域名时
+# `www.google.com.sg` 会被推导出 `com.sg` 与 `*.com.sg` —— 那等于让**本机受信任的 CA
+# 持有一张对任意 .com.sg 域名有效的证书**。实测统计: 登记 266 个国家域名会引入
+# 21+ 个这类过宽通配 (`*.co.uk` / `*.co.jp` / `*.com.sg` …), 把信任面扩大到与
+# Google 完全无关的第三方域名上。这不是"多几个域名"的规模问题, 而是信任边界问题。
+# 注: 这是启发式 (不是完整 PSL)。判定条件是"后两段 + 两位国家码", 对 Google 的
+# ccTLD 全覆盖; 完整 PSL 需引入额外依赖与定期更新, 与本项目"零依赖自包含"取向不符。
+_PUBLIC_SUFFIX_REGISTRY_LABELS = {
+    "com", "co", "net", "org", "gov", "edu", "ac", "or", "ne", "go", "in",
+    "info", "biz", "mil", "sch", "gen", "firm", "nom", "web",
+}
+
+
+def _is_public_suffix_pair(last_two: List[str]) -> bool:
+    """后两段是否形如公共后缀 (如 com.sg / co.uk / com.hk)"""
+    if len(last_two) != 2:
+        return False
+    registry, cc = last_two[0].lower(), last_two[1].lower()
+    return len(cc) == 2 and registry in _PUBLIC_SUFFIX_REGISTRY_LABELS
+
+
 def get_all_san_domains() -> List[str]:
     """从 ServiceProfile 单源动态提取全量 SAN 域名列表并自动拓展通配符与二级主域名"""
     domains_set: Set[str] = set()
@@ -134,8 +176,9 @@ def get_all_san_domains() -> List[str]:
             domains_set.add(f"*.{d_clean}")
 
             # 智能提取二级主域名 (如 i.pximg.net -> pximg.net & *.pximg.net)
+            # 但公共后缀样式 (com.sg / co.uk) 必须排除, 见上方 _PUBLIC_SUFFIX_REGISTRY_LABELS
             parts = d_clean.split(".")
-            if len(parts) >= 3:
+            if len(parts) >= 3 and not _is_public_suffix_pair(parts[-2:]):
                 base_domain = ".".join(parts[-2:])
                 domains_set.add(base_domain)
                 domains_set.add(f"*.{base_domain}")
@@ -164,11 +207,30 @@ class CertManager:
 
         self._cached_thumbprint: Optional[str] = None
         self._cached_installed: Optional[bool] = None
+        self._last_harden_report: Dict[str, Any] = {}
 
     def _ensure_dirs(self):
-        """确保证书输出目录存在"""
+        """确保证书输出目录存在, 并把目录 ACL 先收紧
+
+        顺序很关键: **目录先收紧 (带 (OI)(CI) 继承), 随后写出的私钥就"生来"是紧 ACL**,
+        不必依赖"写完再改" —— 后者存在一个窗口期, 期间私钥是任何本地进程可读的。
+        """
         self.ca_dir.mkdir(parents=True, exist_ok=True)
         self.conf_ca_dir.mkdir(parents=True, exist_ok=True)
+        for d in (self.ca_dir, self.conf_ca_dir):
+            private_key_acl.harden_path(d, is_dir=True)
+
+    def harden_private_keys(self) -> Dict[str, Any]:
+        """收紧本机全部证书私钥 (ca.key / pixiv.net.key) 的 ACL 并回读校验
+
+        为什么必须做: 私钥写在用户可写目录里, 会继承父目录 ACL —— 实测
+        `nginx\\ca\\ca.key` 对 `Authenticated Users` 可写、对 `BUILTIN\\Users` 可读,
+        即**任意本地进程都能读走全机受信任的 CA 私钥**(等价于完整 TLS 劫持能力)。
+        详见 private_key_acl 模块头部说明。幂等, 可在每次启动时调用。
+        """
+        report = private_key_acl.harden_private_keys(self.nginx_dir)
+        self._last_harden_report = report
+        return report
 
     def _is_ca_valid(self) -> bool:
         """检查本地 Root CA 是否存在且有效（未过期且至少剩余 30 天有效期）"""
@@ -287,6 +349,13 @@ class CertManager:
             self.ca_cer_path.write_bytes(ca_pem)
             self.ca_cer_backup.write_bytes(ca_pem)
 
+            # 私钥 ACL 收紧 (目录已在 _ensure_dirs 收紧, 这里对文件再确认一次并回读校验)
+            harden = self.harden_private_keys()
+            if harden.get("failed"):
+                # 不阻断证书生成 (证书本身可用), 但必须如实上报, 绝不静默
+                return True, (f"成功生成本地私有 Root CA, 但私钥 ACL 收紧未完全成功: "
+                              f"{harden.get('message')}")
+
             self._cached_thumbprint = None
             self._cached_installed = None
             return True, "成功生成本地私有 Root CA 证书与私钥！"
@@ -384,6 +453,9 @@ class CertManager:
             self.conf_server_crt_path.write_bytes(server_pem)
             self.conf_server_key_path.write_bytes(server_key_pem)
 
+            # 服务端叶子私钥同样收紧 (被读走即可冒充全部被反代的域名)
+            self.harden_private_keys()
+
             return True, f"成功签发本地服务端通配证书 (覆盖 {len(all_sans)} 个 SAN 域名)！"
         except Exception as e:
             return False, f"签发服务端证书异常: {e}"
@@ -396,7 +468,13 @@ class CertManager:
         ok, msg = self.generate_server_cert(force=force)
         if not ok:
             return False, msg
-        return True, "本地 SSL 根证书与服务端证书已全部就绪！"
+        # 自愈路径: 证书已存在时上面的生成函数会提前返回, 于是"老私钥的松散 ACL"不会被修。
+        # 这里无条件再收紧一次 (幂等), 保证升级/换用户后也能自动收敛。
+        harden = self.harden_private_keys()
+        if harden.get("failed"):
+            return True, (f"本地 SSL 根证书与服务端证书已就绪; 但私钥 ACL 收紧未完全成功: "
+                          f"{harden.get('message')}")
+        return True, "本地 SSL 根证书与服务端证书已全部就绪 (私钥 ACL 已收紧)！"
 
     def get_cert_thumbprint(self) -> str:
         """获取本地 ca.cer 的证书指纹 (SHA1) (内存缓存，缺失时自动生成)"""
@@ -651,7 +729,12 @@ class CertManager:
             _fields_ = [("cbData", wintypes.DWORD),
                         ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
-        crypt32 = ctypes.windll.crypt32
+        # ⚠ 必须用 `use_last_error=True` 的句柄 + `ctypes.get_last_error()`。
+        # 原先写的是 `ctypes.windll.crypt32` + `ctypes.get_last_error()` —— 而 ctypes
+        # **没有** get_last_error 这个属性, hasattr 为假时它 fallback 到 0, 于是所有
+        # 删除失败都被报成"错误码 0"(毫无信息量)。实测正是它把真实的 E_ACCESSDENIED
+        # 掩盖成了无从下手的"1 个失败"。
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
         crypt32.CertOpenStore.restype = wintypes.HANDLE
         crypt32.CertOpenStore.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE,
                                           wintypes.DWORD, wintypes.LPCWSTR]
@@ -686,9 +769,17 @@ class CertManager:
             if not crypt32.CertDeleteCertificateFromStore(ctx):
                 # 删除失败时上下文未释放, 需手动释放
                 crypt32.CertFreeCertificateContext(ctx)
-                err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
-                return False, f"删除被拒绝 (错误码 {err})" if not store.startswith("LocalMachine") \
-                    else "删除被拒绝 (机器级存储需管理员权限)"
+                err = ctypes.get_last_error() & 0xFFFFFFFF
+                # E_ACCESSDENIED: Windows **保护受信任根**的移除 —— 无论 CurrentUser 还是
+                # LocalMachine, 删除根证书都需要管理员权限 (实测: 非管理员下 crypt32 与
+                # PowerShell X509Store.Remove 都回 E_ACCESSDENIED)。原先只在 LocalMachine
+                # 分支提示管理员, 恰好漏掉了实际会遇到的 CurrentUser 情形。
+                if err == 0x80070005:
+                    return False, (f"删除被拒绝: E_ACCESSDENIED (0x{err:08X}) —— 移除受信任根"
+                                   f"需要管理员权限 (CurrentUser\\Root 同样受保护)")
+                if store.startswith("LocalMachine"):
+                    return False, f"删除被拒绝 (GetLastError=0x{err:08X}) (机器级存储需管理员权限)"
+                return False, f"删除被拒绝 (GetLastError=0x{err:08X})"
 
             # 关键: 复查确认真的删掉了
             again = crypt32.CertFindCertificateInStore(h_store, encoding, 0, find_sha1,
@@ -739,12 +830,15 @@ class CertManager:
         needs_admin = False
         for cert in stale:
             tag = f"{cert['store']}/{cert['thumbprint']}"
-            ok, _why = self._delete_trust_root(cert["store"], cert["thumbprint"])
+            # 保留失败原因 —— 原先写成 `ok, _why = ...` 把它丢掉了, 用户只看到"1 个失败",
+            # 完全无从判断是权限、是锁、还是 API 语义问题 (实测就是被这一条掩盖了真因)。
+            ok, why = self._delete_trust_root(cert["store"], cert["thumbprint"])
             if ok:
                 report["removed"].append(tag)
             else:
-                report["failed"].append(tag)
-                if cert["store"].startswith("LocalMachine"):
+                report["failed"].append({"root": tag, "reason": why})
+                # E_ACCESSDENIED 对 CurrentUser\Root 同样出现, 不能再只按 store 名判断
+                if "E_ACCESSDENIED" in why or cert["store"].startswith("LocalMachine"):
                     needs_admin = True
 
         if report["removed"]:
@@ -753,7 +847,7 @@ class CertManager:
         if report["failed"]:
             parts.append(f"{len(report['failed'])} 个失败")
             if needs_admin:
-                parts.append("(机器级存储需管理员权限, 请以管理员身份重新运行)")
+                parts.append("(移除受信任根需要管理员权限, 请以管理员身份重新运行)")
         report["message"] = "; ".join(parts)
         return report
 
@@ -802,16 +896,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     """信任库卫生命令行入口
 
     用法:
-      python -m app.cert_manager --report      # 只读: 列出历史代际根证书
+      python -m app.cert_manager --report      # 只读: 列出历史代际根证书 + 私钥 ACL 体检
       python -m app.cert_manager --prune       # 清理历史代际根证书 (机器级需管理员)
       python -m app.cert_manager --prune --dry-run
+      python -m app.cert_manager --harden-keys # 收紧私钥 ACL (幂等, 无需管理员)
     """
     import argparse
 
     ap = argparse.ArgumentParser(description="证书信任库卫生维护")
-    ap.add_argument("--report", action="store_true", help="列出本程序历史各代根证书")
+    ap.add_argument("--report", action="store_true", help="列出本程序历史各代根证书 + 私钥 ACL 体检")
     ap.add_argument("--prune", action="store_true", help="清理历史代际根证书, 仅保留当前活跃 CA")
     ap.add_argument("--dry-run", action="store_true", help="只预览不删除")
+    ap.add_argument("--harden-keys", action="store_true", help="收紧证书私钥 ACL (幂等, 无需管理员)")
     args = ap.parse_args(argv)
 
     mgr = CertManager()
@@ -819,19 +915,56 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"当前活跃 CA: {active or '(未找到 ca.cer)'}")
     print(f"管理员权限 : {is_admin()}")
 
+    if args.harden_keys:
+        rep = mgr.harden_private_keys()
+        print(rep.get("message", ""))
+        for it in rep.get("done", []):
+            print(f"  [OK]   {it['path']}")
+        for it in rep.get("failed", []):
+            print(f"  [FAIL] {it['path']}  {it.get('reason', '')}")
+        return 1 if rep.get("failed") else 0
+
     if args.report or not (args.prune):
         roots = mgr.list_own_trust_roots()
         print(f"受信任存储中匹配本程序的根证书: {len(roots)} 个")
+        # 说明: 枚举失败的存储必须显式说出 —— 否则"读不到"会被读成"没问题"
+        if _STORE_ENUM_ERRORS:
+            print("  ⚠ 以下存储未能枚举, 其结果**未计入**上面的数量:")
+            for _lbl, _why in _STORE_ENUM_ERRORS:
+                print(f"      {_lbl}: {_why}")
         for c in roots:
             mark = "  <== 当前活跃" if c["thumbprint"] == active else ""
             print(f"  [{c['store']:22s}] {c['thumbprint']} {c['not_after']} {c['subject'][:48]}{mark}")
+
+        # 私钥 ACL 体检 (只读) —— CA 私钥是全机信任锚, 泄露等价于完整中间人能力
+        acl = private_key_acl.audit_private_keys(mgr.nginx_dir)
+        print(f"\n私钥 ACL 体检: 检查 {acl['checked']} 个文件, 暴露给宽泛受托人的 {acl['exposed']} 个")
+        for e in acl["entries"]:
+            if not e["readable"]:
+                print(f"  [?]    {e['path']}  ({e['error']})")
+            elif e["exposed_to"]:
+                print(f"  [暴露] {e['path']}  -> {', '.join(e['exposed_to'])}")
+            else:
+                print(f"  [OK]   {e['path']}")
+        if acl["exposed"]:
+            print("  提示: 运行 `python -m app.cert_manager --harden-keys` 收紧 (无需管理员)")
+
         if not args.prune:
             return 0
 
     report = mgr.prune_stale_trust_roots(dry_run=args.dry_run)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if report.get("failed"):
-        print("\n注意: 机器级存储删除需要管理员权限 —— 请以管理员身份重新运行本命令。")
+        print("\n失败明细:")
+        for it in report["failed"]:
+            # failed 现在是 [{root, reason}] 结构 (原先只是个字符串列表, 原因被丢弃)
+            if isinstance(it, dict):
+                print(f"  [FAIL] {it.get('root')}  {it.get('reason', '')}")
+            else:
+                print(f"  [FAIL] {it}")
+        print("\n提示: 移除受信任根证书需要管理员权限 "
+              "(CurrentUser\\Root 与 LocalMachine\\Root 都受 Windows 保护), "
+              "请以管理员身份重新运行本命令。")
         return 2
     return 0
 

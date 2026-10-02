@@ -297,6 +297,35 @@ VSVersionInfo(
     for temp_sub in ["client_body_temp", "proxy_temp", "fastcgi_temp", "scgi_temp", "uwsgi_temp"]:
         (target_nginx_root / "temp" / temp_sub).mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # 发布包密钥泄漏硬校验 (2026-10-02 新增)
+    #
+    # 为什么必须有: 上面的 ignore_patterns 是**按扩展名排除的黑名单** —— 一旦模式被改动、
+    # 或将来出现别的密钥扩展名, CA 私钥就会被静默放进发布包。实测本机 dist 里就残留过
+    # 一整套 `nginx/ca/ca.key` + `nginx/ca/ca.cer` (旧版 build.py 拷进去的),
+    # 而**那个根证书当时仍在本机受信任存储里** —— 等于把一个可用的中间人私钥, 连同
+    # "它已被信任"这个前提一起发了出去。
+    # 本项目是"零私钥分发"(每个安装在首次运行时自生成唯一 CA), 故这里对拷贝结果做硬校验:
+    # 发现证书/私钥一律删除并使构建失败 —— 用结果校验补黑名单的不可靠。
+    # 注意只用 target_nginx_root 递归: 依赖里 certifi 的 cacert.pem 是公开 CA 包, 不能误伤。
+    # ------------------------------------------------------------------
+    leaked = []
+    for _pat in ("*.key", "*.crt", "*.cer", "*.pem", "*.pfx", "*.p12"):
+        leaked.extend(target_nginx_root.rglob(_pat))
+    if leaked:
+        for _f in leaked:
+            try:
+                _f.unlink()
+            except Exception:
+                pass
+        print("\n[ERROR] 发布包的 nginx 目录里出现了证书/私钥文件 —— 已删除并中止构建:")
+        for _f in leaked:
+            print(f"    {_f}")
+        print("        CA 私钥绝不能进发布包 (每个安装应首次运行时自生成);"
+              " 请检查上面的 ignore_patterns 是否被改动。")
+        return False
+    print("  ✓ 发布包密钥校验通过: nginx 目录内无证书/私钥文件")
+
     if (BASE_DIR / "app" / "icon.ico").exists():
         shutil.copyfile(BASE_DIR / "app" / "icon.ico", target_out_dir / "icon.ico")
     if (BASE_DIR / "app" / "icon.png").exists():

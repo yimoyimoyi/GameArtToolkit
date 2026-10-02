@@ -44,6 +44,12 @@ class SniMode(str, Enum):
 VENDOR_COVER_SNI = {
     "fastly": "www.fastly.com",
     "akamai": "steambroadcast.akamaized.net",
+    # Google 属**同租户掩护**: g.cn 是 Google 自家的未被封锁短域名, 其边缘按 HTTP Host
+    # 路由到真实站点。2026-10-01 P0 实测: 8/8 中转 IP × SNI=g.cn × 真实 Host 全部
+    # 200/302, 上游证书 SAN 含 *.google.cn (Google Trust Services WR2/WE2)。
+    # 注意: 这与 Fastly/Akamai 的跨租户掩护不同 —— Google 是自己掩护自己, 所以
+    # 绝不能套用"CF/CloudFront 拒绝跨租户"的判断, 也不要反过来推广到其它厂商。
+    "google": "g.cn",
 }
 
 # 逐服务验证过的额外掩护域名 (同 CDN、同段、且自身 SNI 未被封锁)。
@@ -121,6 +127,12 @@ class ServiceProfile:
                                                # Hosts 模式下"启用了也不可用", 因此不纳入默认启用
     proxy_connect_by_domain: bool = False     # 代理通道探测时 CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT 规则直连、CDN geo 限制中国 IP 的场景)
     ech_enabled: bool = False                 # 经本地 ECH 隧道直连 (要求目标托管在 Cloudflare; 见 docs/ech-tunnel-proposal.md)
+    h3_upstream: bool = False                 # 上游腿改走本地 HTTP/3 代理 (app/h3_upstream.py):
+                                              # 用于 TCP 被压制、只有 HTTP/3 可达的目标 (googlevideo)。
+                                              # nginx 侧与 ECH 同款 —— 明文回环 + 不输出 proxy_ssl_*。
+                                              # ⚠ 该通道可用性是分钟级时变的, 启用前必须先过
+                                              #   `python -m app.gvs_h3_probe` 闸门
+                                              #   (见 docs/googlevideo-quic-channel.md)
     websocket: bool = False                   # 该服务的 location / 需要透传 WebSocket 升级头 (Connection "upgrade")
     # 让 nginx 对上游 404 也执行换节点重试。
     # 通用模板默认【不】重试 404 —— 因为 githubassets / crates.io / google_fonts 等服务的
@@ -805,6 +817,317 @@ PROFILES: List[ServiceProfile] = [
                        "120.253.253.161", "120.253.255.33",  # 电信缓存段 (原候选)
                        "120.253.255.161", "120.253.253.34"]  # 电信缓存段 (2026-08 实测解析, css 200)
     ),
+    # ==========================================================================
+    # Google / YouTube 三条画像 (2026-10-01 P0 情报采集后定档)
+    #
+    # 为什么拆三条而不是一条 "google":
+    #   后端行为不同 —— 网页态带账号(不可缓存) / 静态资源(可缓存) / YouTube 网页态(不可缓存)。
+    #   这是项目一贯教训 (nuget 三拆、reddit vs reddit_static、discord vs discord_gateway):
+    #   **后端行为不同的域名合池必然导致多域错配**。
+    #   google_fonts 已单独存在 (走国内电信缓存段 120.253.x), 本次**不动它、也不与它合并**;
+    #   本组的域名刻意避开 fonts.googleapis.com / fonts.gstatic.com。
+    #
+    # 通道选择依据 (P0 实测):
+    #   ① 掩护 SNI=g.cn 有效: 8/8 中转 IP × 真实 Host 全部 200/302, 上游证书 SAN 含
+    #      *.google.cn —— 属**同租户掩护** (Google 自家域互相掩护), 不是跨租户。
+    #   ② 不用空 SNI: 空 SNI 时上游回占位证书 invalid2.invalid, HTTP 层虽仍按 Host 路由
+    #      (实测亦 200), 但证书不匹配 => 探测阶段无法用证书 SAN 校验"是不是真 Google 边缘"。
+    #      本组统一用 g.cn, 以保留 ③ 这道硬门槛。
+    #   ③ 不用 DIRECT / QUIC: 自身 SNI 直连 Google 边缘被 RST; QUIC 通道"浏览器自行采用 h3"
+    #      这一前提已被 netlog 证伪 (docs 第十四节), 且 quic_probe.QUIC_ENABLED 当前为停用。
+    #
+    # 2026-10-01 补充实测 (候选池 + 证书门槛, 详见 docs/cover-sni-degradation.md):
+    #   ④ **中转节点是按 SNI 选证书的**: 同一 IP 发 g.cn 拿到含 *.google.cn 的那张,
+    #      发 www.gstatic.com 拿到 gstatic 那张, 发空 SNI 拿到占位证书 invalid2.invalid。
+    #      所以上面 ② 说的"证书校验真伪"这道门槛是真门槛 —— 但它必须表述为
+    #      **"证书是否属于该厂商自有证书族"**(g.cn 命中 *.google.cn), 而不是
+    #      "证书名是否覆盖真实 Host": 掩护 SNI 的定义就是证书名**必然不覆盖**真实 Host,
+    #      按后者写会把全部掩护策略误判为失效 (本模块的运行时实现踩过这个坑, 已固化回归测试)。
+    #   ⑤ **proxy_ssl_verify off 是伪 SNI 的代价, 不是 Google 的固有属性**: 用真实域名当 SNI 时
+    #      证书名 8/8 覆盖真实 Host、链 8/8 受系统信任。因此 "host" 是"Google 关闭域名前置"
+    #      时的退路, 已登记进 app/cover_sni.py 的候选池 (末位空 SNI 之前)。
+    #      ⚠ 但**当前仍未开启**上游证书校验: nginx 是 Windows 构建且仓库未下发 CA 包
+    #      (全树无 proxy_ssl_trusted_certificate)。要开启需先随包提供 CA bundle。
+    #   ⑥ ssl_sni_mode="g.cn" 是**默认值**, 不是运行时唯一取值:
+    #      app/cover_sni.py 会在启动加速前回归实测, 失效时按候选池降级, 并把结果交给
+    #      nginx_generator (写 $host / "" 并附降级注释) 与 UI (状态卡 + 显式不可用告警)。
+    # ==========================================================================
+    #
+    # 真伪判别方法 (本次新引入, 供后续复用):
+    #   `/generate_204` 是 Google 全线前台的通用探活端点 —— 真边缘回 204, 而"打错服务器"的
+    #   Bandaid Misdirected Traffic Server 不回。实测 68/69 个候选域名经中转 IP 返回 204。
+    #
+    # candidate_ips 说明: 8 个国内云中转 IP 全部实测可服务本组域名。但**它们并非同质** ——
+    #   例如 scholar.google.com 根路径仅在部分节点回 200 (其余回 403, 属上游按区域/节点的
+    #   正常差异, /generate_204 在所有节点均为 204)。因此本组依赖测速优选按域挑选,
+    #   不要假定任一节点等价。
+    # ==========================================================================
+    ServiceProfile(
+        id="google_web",
+        group="dev",
+        name="Google 搜索与账号",
+        desc="Google 搜索/账号/邮件/云盘/文档等网页态服务 (经本机 nginx + g.cn 掩护 SNI)",
+        # 域名清单来自 2026-10-01 逐域实测 + 2026-10-02 国家域名补全
+        domains=[
+            "google.com", "www.google.com", "accounts.google.com", "mail.google.com",
+            "gmail.com", "drive.google.com", "docs.google.com", "sheets.google.com",
+            "slides.google.com", "photos.google.com", "maps.google.com", "news.google.com",
+            "translate.google.com", "calendar.google.com", "myaccount.google.com",
+            "contacts.google.com", "play.google.com", "id.google.com", "apis.google.com",
+            "scholar.google.com", "books.google.com", "meet.google.com", "keep.google.com",
+            "sites.google.com", "groups.google.com", "myactivity.google.com",
+            "adssettings.google.com", "support.google.com", "workspace.google.com",
+            "cloud.google.com", "gemini.google.com", "notebooklm.google.com",
+            "takeout.google.com", "earth.google.com",
+            # ------------------------------------------------------------------
+            # Google 国家/地区域名 (2026-10-02 补全, 起因: 用户给出的
+            # https://www.google.com.sg/intl/zh-CN/about/products?tab=wh )
+            #
+            # 判据必须是**对 Host 敏感**的路径 —— 这里踩过一个坑并有对照数据:
+            #   ✗ `/generate_204`: 对 Host 完全不敏感。实测 `www.baidu.com`、
+            #     `www.google.com.zz`(不存在的 TLD)、随机标签 **全部回 204**。
+            #     用它当门槛会把 14 个 Google 根本没运营的 ccTLD 也判成"可用"
+            #     (google.com.aw/.az/.bm/.cr/.cw/.gd/.gy/.hn/.kn/.ky/.lc/.sr/.tc/.vg)。
+            #   ✓ `/search?q=test`: 真实 web vhost 回 200/301(-> www.google.com) 且带
+            #     `server: gws`; 不存在的域名一律 **404** 且无 server 头。
+            #     负对照 5/5 正确判否, 正对照 3/3 正确通过。
+            #
+            # 测法必须与运行时一致: **SNI=g.cn + Host=真实域名** 打到 8 个中转 IP
+            # (拿候选域名当 SNI 测的是"能否直连", 与本通道无关)。
+            # 实测 294 个候选 (147 ccTLD × apex/www) ⇒ 266 个真实 vhost, 28 个判否;
+            # 266 个里**没有一个**在用户给出的那条真实路径上失败。
+            #
+            # ⚠ SAN 影响面: 本组域名数从 34 涨到 300, 本地 CA 的 SAN 覆盖面随之扩大
+            #   (方案 §7.1 要求显式接受并披露)。为此同步修掉了 cert_manager 的一个
+            #   派生缺陷: 对 `www.google.com.sg` 这类多段公共后缀会派生出 `*.com.sg`
+            #   ——那等于让本机受信任的 CA 持有对**任意 .com.sg 域名**有效的证书。
+            #   现已按公共后缀样式跳过派生 (见 cert_manager._PUBLIC_SUFFIX_REGISTRY_LABELS)。
+            # ------------------------------------------------------------------
+            "google.ae", "google.al", "google.at", "google.ba", "google.bg", "google.bs", "google.ca",
+            "google.cd", "google.ch", "google.ci", "google.cl", "google.cm", "google.co.ao",
+            "google.co.bw", "google.co.ck", "google.co.cr", "google.co.id", "google.co.il",
+            "google.co.in", "google.co.jp", "google.co.ke", "google.co.kr", "google.co.ma",
+            "google.co.mz", "google.co.nz", "google.co.th", "google.co.tz", "google.co.ug",
+            "google.co.uk", "google.co.vi", "google.co.za", "google.co.zm", "google.co.zw",
+            "google.com.ag", "google.com.ai", "google.com.ar", "google.com.au", "google.com.bd",
+            "google.com.bh", "google.com.bo", "google.com.br", "google.com.bz", "google.com.co",
+            "google.com.cy", "google.com.do", "google.com.ec", "google.com.eg", "google.com.et",
+            "google.com.fj", "google.com.ge", "google.com.gh", "google.com.gi", "google.com.gt",
+            "google.com.hk", "google.com.jm", "google.com.kh", "google.com.kw", "google.com.lb",
+            "google.com.ly", "google.com.mm", "google.com.mt", "google.com.mx", "google.com.my",
+            "google.com.na", "google.com.ng", "google.com.ni", "google.com.np", "google.com.om",
+            "google.com.pa", "google.com.pe", "google.com.pg", "google.com.ph", "google.com.pk",
+            "google.com.pr", "google.com.py", "google.com.qa", "google.com.sa", "google.com.sb",
+            "google.com.sg", "google.com.sv", "google.com.tn", "google.com.tr", "google.com.tw",
+            "google.com.ua", "google.com.uy", "google.com.vc", "google.com.ve", "google.com.vn",
+            "google.cz", "google.de", "google.dk", "google.dz", "google.ee", "google.es", "google.fi",
+            "google.fr", "google.gr", "google.hr", "google.hu", "google.ie", "google.iq", "google.is",
+            "google.it", "google.jo", "google.kz", "google.la", "google.lk", "google.lt", "google.lv",
+            "google.md", "google.mg", "google.mk", "google.mn", "google.ms", "google.mu", "google.mw",
+            "google.nl", "google.no", "google.nu", "google.pl", "google.pt", "google.ro", "google.rs",
+            "google.ru", "google.rw", "google.se", "google.si", "google.sk", "google.sn", "google.so",
+            "google.to", "google.tt", "google.ws", "www.google.ae", "www.google.al", "www.google.at",
+            "www.google.ba", "www.google.bg", "www.google.bs", "www.google.ca", "www.google.cd",
+            "www.google.ch", "www.google.ci", "www.google.cl", "www.google.cm", "www.google.co.ao",
+            "www.google.co.bw", "www.google.co.ck", "www.google.co.cr", "www.google.co.id",
+            "www.google.co.il", "www.google.co.in", "www.google.co.jp", "www.google.co.ke",
+            "www.google.co.kr", "www.google.co.ma", "www.google.co.mz", "www.google.co.nz",
+            "www.google.co.th", "www.google.co.tz", "www.google.co.ug", "www.google.co.uk",
+            "www.google.co.vi", "www.google.co.za", "www.google.co.zm", "www.google.co.zw",
+            "www.google.com.ag", "www.google.com.ai", "www.google.com.ar", "www.google.com.au",
+            "www.google.com.bd", "www.google.com.bh", "www.google.com.bo", "www.google.com.br",
+            "www.google.com.bz", "www.google.com.co", "www.google.com.cy", "www.google.com.do",
+            "www.google.com.ec", "www.google.com.eg", "www.google.com.et", "www.google.com.fj",
+            "www.google.com.ge", "www.google.com.gh", "www.google.com.gi", "www.google.com.gt",
+            "www.google.com.hk", "www.google.com.jm", "www.google.com.kh", "www.google.com.kw",
+            "www.google.com.lb", "www.google.com.ly", "www.google.com.mm", "www.google.com.mt",
+            "www.google.com.mx", "www.google.com.my", "www.google.com.na", "www.google.com.ng",
+            "www.google.com.ni", "www.google.com.np", "www.google.com.om", "www.google.com.pa",
+            "www.google.com.pe", "www.google.com.pg", "www.google.com.ph", "www.google.com.pk",
+            "www.google.com.pr", "www.google.com.py", "www.google.com.qa", "www.google.com.sa",
+            "www.google.com.sb", "www.google.com.sg", "www.google.com.sv", "www.google.com.tn",
+            "www.google.com.tr", "www.google.com.tw", "www.google.com.ua", "www.google.com.uy",
+            "www.google.com.vc", "www.google.com.ve", "www.google.com.vn", "www.google.cz",
+            "www.google.de", "www.google.dk", "www.google.dz", "www.google.ee", "www.google.es",
+            "www.google.fi", "www.google.fr", "www.google.gr", "www.google.hr", "www.google.hu",
+            "www.google.ie", "www.google.iq", "www.google.is", "www.google.it", "www.google.jo",
+            "www.google.kz", "www.google.la", "www.google.lk", "www.google.lt", "www.google.lv",
+            "www.google.md", "www.google.mg", "www.google.mk", "www.google.mn", "www.google.ms",
+            "www.google.mu", "www.google.mw", "www.google.nl", "www.google.no", "www.google.nu",
+            "www.google.pl", "www.google.pt", "www.google.ro", "www.google.rs", "www.google.ru",
+            "www.google.rw", "www.google.se", "www.google.si", "www.google.sk", "www.google.sn",
+            "www.google.so", "www.google.to", "www.google.tt", "www.google.ws",
+            # ------------------------------------------------------------------
+            # 用户 URL 的重定向落点及其同族站点 (2026-10-02 补全)
+            #
+            # 起因: `https://www.google.com.sg/intl/zh-CN/about/products?tab=wh` 实测 302 到
+            # `https://about.google/intl/zh-CN/products?tab=wh` —— **只登记 google.com.sg
+            # 是不够的**: 浏览器会接着去请求 about.google, 该域名不在清单里就不会被劫持,
+            # 最终页面照样打不开。补全必须覆盖重定向落点, 否则只是"第一跳成功"的假可用。
+            #
+            # 判据同样要求对 Host 敏感, 并额外看**对端自报的 server 头**
+            # (Google 自有前台: sffe / ESF / gws / Google Frontend):
+            #   登记 —— about.google(/=200,真实路径 301) / www.about.google(302) /
+            #           policies.google.com(ESF,200) / safety.google / abc.xyz(Alphabet,200) /
+            #           opensource.google / diversity.google / careers.google.com /
+            #           research.google / ai.google / blog.google.com /
+            #           developers.google.com / developer.android.com /
+            #           source.android.com / chromewebstore.google.com / one.google.com
+            #   不登记 —— blog.google / store.google / fi.google / deepmind.google /
+            #           sustainability.google / impact.google: 全部路径 404 **且无 server 头**,
+            #           与本通道下"不存在的域名"特征一致 (即该节点不服务它们)。
+            #           按"不通的服务一律不加入"原则排除 —— 注意这与"该域名在现实世界是否
+            #           存在"无关: blog.google 现实存在, 但走本通道拿不到内容, 登记就是假可用。
+            # ------------------------------------------------------------------
+            "about.google", "www.about.google", "policies.google.com", "safety.google",
+            "abc.xyz", "opensource.google", "diversity.google", "careers.google.com",
+            "research.google", "ai.google", "blog.google.com", "developers.google.com",
+            "developer.android.com", "source.android.com", "chromewebstore.google.com",
+            "one.google.com",
+        ],
+        icon="search",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_google_web",
+        cdn_vendor="google",
+        ssl_sni_mode="g.cn",            # 同租户掩护 (见 VENDOR_COVER_SNI 注释)
+        # 账号/邮件/文档属账号态, 一律不缓存 (与 youtube_web 同理)
+        enable_cache=False,
+        # 副域独立 TLS 校验: 多域全部非可疑才算干净节点, 防 GFW 按子域特判封锁
+        probe_domains=("www.google.com", "accounts.google.com"),
+        candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
+                       "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"]
+    ),
+    ServiceProfile(
+        id="google_static",
+        group="dev",
+        name="Google 静态资源 CDN",
+        desc="gstatic / googleusercontent / ggpht 静态资源 (经本机 nginx + g.cn 掩护 SNI)",
+        domains=[
+            "gstatic.com", "www.gstatic.com", "ssl.gstatic.com", "maps.gstatic.com",
+            "t0.gstatic.com", "t1.gstatic.com", "t2.gstatic.com", "t3.gstatic.com",
+            "csi.gstatic.com", "encrypted-tbn0.gstatic.com",
+            "googleusercontent.com", "www.googleusercontent.com",
+            "lh3.googleusercontent.com", "lh4.googleusercontent.com",
+            "lh5.googleusercontent.com", "lh6.googleusercontent.com",
+            "play-lh.googleusercontent.com", "ggpht.com", "yt3.ggpht.com", "yt4.ggpht.com",
+        ],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_google_static",
+        cdn_vendor="google",
+        ssl_sni_mode="g.cn",
+        # 开缓存 (本画像天然可缓存: 纯静态、证书独立、URL 不含账号态)。
+        # 此前**刻意关闭**, 因为它要等两道前置缺陷都修好才能安全开启 —— 2026-10-01 已双双修复:
+        #   ① 缓存键串域: 全局键原为 `$scheme$proxy_host$uri$is_args$args`, 而 `$proxy_host`
+        #      是 proxy_pass 里的 **upstream 名**而非真实 Host, 同一 upstream 下的不同域名
+        #      算出**同一个键**。本地 nginx 最小复现已证实: 两个 server_name 指向同一 upstream
+        #      时, 第二个域拿到第一个域的 HIT 内容 (响应体里 Host 仍是 a.test)。
+        #      本画像有 20 个域名, 开着缓存等于把串内容影响面从 2 域放大到 20 域。
+        #      修法: nginx.conf 改为 `$scheme$host$uri$is_args$args` (见该处注释)。
+        #   ② 缓存与零缓冲互斥: 本画像 group=dev, 生成器会给 dev 组统一发
+        #      `proxy_buffering off` + `proxy_max_temp_file_size 0`, 而 nginx 需要缓冲响应体
+        #      才能落盘缓存 —— 本地实测第二次请求仍为 MISS、源站被重新命中。现已在生成器里
+        #      改为「enable_cache=True 的画像保留缓冲」, 顺带修好了 google_fonts / jsdelivr /
+        #      npm / pypi / crates 等 dev 组画像**缓存一直空转**的老问题。
+        enable_cache=True,
+        # 根路径无文档: www.gstatic.com / t0-t3 / ggpht 均 404 (sffe/fife 正常应答),
+        # 与 google_fonts 同理, 必须放行 404 否则测速会把所有候选判为可疑节点而全挂
+        probe_ok_statuses=(404,),
+        probe_domains=("www.gstatic.com", "t0.gstatic.com"),
+        candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
+                       "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"]
+    ),
+    ServiceProfile(
+        id="youtube_web",
+        group="dev",
+        name="YouTube 网页与图片",
+        desc="YouTube 网页态、缩略图与播放器资源 (经本机 nginx + g.cn 掩护 SNI)",
+        # 注: googlevideo.com (视频流本体) 由**独立画像**承载 —— 它走不了本通道:
+        #   经中转 IP 请求 /videoplayback 时上游回 "Bandaid Misdirected Traffic Server"
+        #   (Google 明确回"打错服务器"), 而真实 IPv6 节点的 TCP 侧被压制 (同一时刻
+        #   QUIC 5/5 成功 vs TCP 0/5)。视频通路需另走 QUIC 上游腿, 未在本次范围内。
+        #   登记它只会造出"页面能开但视频永远转圈"的假可用。
+        domains=[
+            "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+            "youtube-nocookie.com", "www.youtube-nocookie.com",
+            "ytimg.com", "i.ytimg.com", "s.ytimg.com",
+            "youtubei.googleapis.com", "studio.youtube.com", "music.youtube.com",
+            "tv.youtube.com", "gdata.youtube.com",
+        ],
+        icon="video",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_youtube_web",
+        cdn_vendor="google",
+        ssl_sni_mode="g.cn",
+        # 账号态 (观看记录/订阅/登录), 明确**禁缓存**
+        enable_cache=False,
+        # i.ytimg.com 根路径 404 (sffe 正常应答) —— 放行以免误杀全部候选
+        probe_ok_statuses=(404,),
+        probe_domains=("www.youtube.com", "i.ytimg.com"),
+        candidate_ips=["47.104.71.109", "47.103.46.164", "47.103.34.63", "8.138.21.175",
+                       "8.134.173.202", "183.56.143.147", "47.113.110.152", "47.104.21.37"]
+    ),
+    # --------------------------------------------------------------------------
+    # googlevideo (YouTube 视频流) —— 2026-10-02 **改为登记, 但默认不启用**
+    #
+    # 与 2026-10-01 那次"刻意不登记"的差别 (那次结论没错, 是本轮把通道那一半补上了):
+    #
+    # ① 通道侧已被实测打通 (不再是"原理上到不了"):
+    #    `L7 + h3 上游腿` 这个形态**不需要自己去当 SABR 客户端** —— 让它做**哑管道**即可:
+    #    浏览器照常走 TCP 明文到本机 nginx, nginx 转给 h3 上游腿, 腿用 HTTP/3 送到真实节点。
+    #    实测 (客户端是纯 HTTP/1.1, **零 QUIC**):
+    #      6 个候选节点触达 5 个, 其中 3 个拿到**真正的 gvs 响应**
+    #      (`server: gvs 1.0` + `content-type: application/vnd.yt-ump`);
+    #      对照组 cdn.jsdelivr.net 经同一条腿取到 200 + 1,272,972 B。
+    #    这条路的**部署价值**: 不再依赖浏览器的 QUIC —— 实测火绒挂钩会让 Chrome 的 QUIC 全灭
+    #    (`QUIC_HANDSHAKE_FAILED`), 而**同一时刻**本项目自己的 aioquic 客户端照样拿到 204。
+    #
+    # ② 仍然**没有解决"能不能播"**: 上面那 3 个 403 就是 SABR/UMP 本身 —— 普通 HTTP Range GET
+    #    取 SABR 分片流会被 gvs 拒。上一轮逐条排除过的事实依然成立 (出口 IP / 节点 / `n=` /
+    #    PO Token / 可播放性全部排除, 403 头自报 `server: gvs 1.0` 说明确实打到了真视频服务)。
+    #    **本画像登记的是"通道", 不是"播放可用"** —— 故默认**不启用** (见 requires_dns_backend),
+    #    由用户显式开启, 且描述里写清"播放尚未验证", 不做假可用。
+    #
+    # ③ 为什么必须 requires_dns_backend:
+    #    节点名是动态且海量的 (rr1---sn-xxxx.googlevideo.com), 而 **Windows hosts 文件不支持通配**,
+    #    Hosts 后端无法把 *.googlevideo.com 劫持到本机 → 浏览器会走污染解析, 表现为
+    #    "页面能开而视频永远转圈"。只有 NRPT 的后缀匹配能覆盖 (app/h3_upstream.check_preconditions
+    #    会在 Hosts 后端下明确警告这一点)。
+    #    注: 本轮验证时用"用户级 Chrome DoH 策略"绕开了管理员权限要求 (见
+    #    docs/googlevideo-other-methods.md §6.2), 生产上仍是 NRPT 或等效的解析下发路径。
+    #
+    # ④ 域名只登记 apex: `*.googlevideo.com` 由证书派生免费得到 (get_all_san_domains 会同时
+    #    产出 googlevideo.com 与 *.googlevideo.com), 而 nginx 侧需要显式通配 —— 故这里直接写
+    #    通配形式 (nginx server_name 支持 *.example.com; win_utils 也认这种写法)。
+    #    **不要逐个登记节点名**: 节点名动态且海量。
+    #
+    # 复现与证据: docs/googlevideo-other-methods.md (方法 A/B 全链实测) +
+    #             docs/googlevideo-quic-channel.md (SABR 定因与逐条排除表)
+    # --------------------------------------------------------------------------
+    ServiceProfile(
+        id="googlevideo",
+        group="dev",
+        name="YouTube 视频流 (HTTP/3 上游腿)",
+        desc="经本机 HTTP/3 上游腿直连真实视频节点 (通道已实测; SABR 播放尚未验证, 默认不启用)",
+        domains=["*.googlevideo.com"],
+        icon="video",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_googlevideo",
+        # 走本地 h3 上游腿: 生成器据此输出明文回环 + 不输出 proxy_ssl_*
+        h3_upstream=True,
+        # 无候选 IP 池: 上游是本地代理端口, 与候选节点无关 (cdn_optimizer 的 h3 分支
+        # 无条件写 127.0.0.1:44411, 不依赖任何探测结果)。节点解析由腿自己做。
+        candidate_ips=[],
+        # 探测对它是纯假阴性: 真实节点 TCP 侧被压制 (同一时刻 QUIC 5/5 vs TCP 0/5),
+        # 走 TCP 探测只会把全部节点判死。
+        skip_cdn_probe=True,
+        # 视频流绝不落盘缓存
+        enable_cache=False,
+        # 动态节点名只能靠 NRPT 后缀匹配 (hosts 不支持通配) —— 该标记同时使它
+        # 不进入 DEFAULT_ENABLED_SERVICES (见 ip_pool 的默认启用过滤)
+        requires_dns_backend=True,
+    ),
+    # --------------------------------------------------------------------------
     ServiceProfile(
         id="turnstile",
         group="dev",

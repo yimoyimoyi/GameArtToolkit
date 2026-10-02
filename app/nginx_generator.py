@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ech_tunnel import ech_tunnel
+import h3_upstream
 from path_utils import NGINX_DIR
 from service_profile import (
     PROFILES,
@@ -75,6 +76,29 @@ class NginxConfGenerator:
         return found
 
     @classmethod
+    def _h3_services_from_upstream(cls, upstream_conf: Path) -> Optional[Set[str]]:
+        """从 upstream-dynamic.conf 解析"上游走本地 HTTP/3 腿"的服务 id 集合
+
+        与 ECH 分支同源: 判据必须取自**文件实际内容**(CDNOptimizer 真写了回环地址),
+        而不是 profile 的静态标记 —— 两者脱钩会产出"明文 HTTP 打向真实 :443",
+        上游直接回 400 (该错配已实测复现, 见 _ech_services_from_upstream 注释)。
+
+        同样必须匹配**精确端口**: relay 分支也写 127.0.0.1:443xx, 但它承载 TLS, 需 https://。
+        """
+        if not upstream_conf.exists():
+            return None
+        try:
+            text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return None
+        marker = f"127.0.0.1:{h3_upstream.PORT}"
+        found: Set[str] = set()
+        for m in re.finditer(r"upstream\s+(upstream_[a-z0-9_]+)\s*\{(.*?)\}", text, re.S):
+            if marker in m.group(2):
+                found.add(m.group(1)[len("upstream_"):])
+        return found
+
+    @classmethod
     def _use_ech(cls, profile: ServiceProfile, ech_services: Optional[Set[str]]) -> bool:
         """该服务本次是否走 ECH 隧道 (必须与 CDNOptimizer 写入的 upstream 一致)"""
         if not getattr(profile, "ech_enabled", False):
@@ -86,8 +110,20 @@ class NginxConfGenerator:
         return profile.id in ech_services
 
     @classmethod
+    def _use_h3(cls, profile: ServiceProfile, h3_services: Optional[Set[str]]) -> bool:
+        """该服务本次是否走本地 HTTP/3 上游腿 (与 CDNOptimizer 写入的 upstream 保持一致)"""
+        if not getattr(profile, "h3_upstream", False):
+            return False
+        if h3_services is None:
+            # 无 upstream 快照 (首次生成/文件缺失): 以静态标记为准 ——
+            # h3 腿是本地常驻进程, 没有 ECH 那种"隧道健康"外部状态需要复核
+            return True
+        return profile.id in h3_services
+
+    @classmethod
     def render_server_block(cls, profile: ServiceProfile,
-                           ech_services: Optional[Set[str]] = None) -> str:
+                           ech_services: Optional[Set[str]] = None,
+                           h3_services: Optional[Set[str]] = None) -> str:
         """为单个 ServiceProfile 渲染标准 Nginx Server 块"""
         domains_list = list(profile.domains)
 
@@ -116,18 +152,41 @@ class NginxConfGenerator:
             for _wd in ("*.patreon.com", "*.patreonusercontent.com"):
                 if _wd not in domains_list:
                     domains_list.append(_wd)
+        # 注: googlevideo 曾在此补 `*.googlevideo.com` (动态节点名)。该服务已于 2026-10-01
+        # 按"不通不加入"原则撤下登记 (签名 URL 绑定出口 IP, 本设计无法播放), 见
+        # service_profile 里的长注释与 docs/googlevideo-quic-channel.md。
 
         # 保序去重
         domains_list = list(dict.fromkeys(domains_list))
         domains_str = " ".join(domains_list)
 
         # SNI 与 Host 头部策略
-        if profile.ssl_sni_mode == "empty":
+        #
+        # 掩护 SNI 不是常量 (方案 §5.1 / §6.4): 这里不再直接读 profile.ssl_sni_mode,
+        # 而是问 cover_sni 模块"当前该用哪个策略"。该模块按候选池实测, 掩护域失效时
+        # 自动降级 (g.cn → 其它 Google 自有域 → 真实 SNI → 空 SNI); **没有新鲜探测结果时
+        # 原样返回画像配置值**, 因此本处不改变任何既有行为, 只在探测明确说"首选已失效"
+        # 时才换 SNI。降级结果同时由 UI 显示 (方案 §10 验收标准 6)。
+        sni_mode = profile.ssl_sni_mode
+        try:
+            import cover_sni as _cover_sni
+            sni_mode = _cover_sni.effective_sni_mode(profile) or profile.ssl_sni_mode
+        except Exception:      # pragma: no cover - 探测模块不可用时绝不阻断生成
+            sni_mode = profile.ssl_sni_mode
+        if sni_mode != profile.ssl_sni_mode:
+            lines_note_downgrade = (
+                f"    # [降级] 掩护 SNI 回归探测判定 {profile.ssl_sni_mode} 失效, "
+                f"本块实际使用 {sni_mode} (见 app/cover_sni.py)"
+            )
+        else:
+            lines_note_downgrade = ""
+
+        if sni_mode == "empty":
             sni_str = '""'
-        elif profile.ssl_sni_mode == "host":
+        elif sni_mode == "host":
             sni_str = "$host"
         else:
-            sni_str = f'"{profile.ssl_sni_mode}"'
+            sni_str = f'"{sni_mode}"'
 
         if profile.id == "steam_community":
             # Host 分流: api.steampowered.com 必须保持原 Host 才能命中 API 网关 vhost
@@ -144,14 +203,19 @@ class NginxConfGenerator:
         # 协议必须与 upstream 实际写入的后端一致 (隧道=明文回环, 退化候选池=https),
         # 判据取自 upstream-dynamic.conf 而非静态标记, 详见 _ech_services_from_upstream。
         ech = cls._use_ech(profile, ech_services)
-        scheme = "http" if ech else "https"
-        ssl_lines = [] if ech else [
+        # HTTP/3 上游腿与 ECH 同款: 后端是本地回环上的**明文** HTTP 入口, 真正的 TLS/QUIC
+        # 由本地代理自己发起。此时同样必须完全不输出 proxy_ssl_*。
+        h3 = cls._use_h3(profile, h3_services)
+        plaintext_local = bool(ech or h3)
+        scheme = "http" if plaintext_local else "https"
+        ssl_lines = [] if plaintext_local else [
             f"        proxy_ssl_name {sni_str};",
             "        proxy_ssl_server_name on;",
             "        proxy_ssl_verify off;",
             "        proxy_ssl_session_reuse on;",
         ]
-        title = f"{profile.name} (经本地 ECH 隧道直连 Cloudflare)" if ech else profile.name
+        title = f"{profile.name} (经本地 ECH 隧道直连 Cloudflare)" if ech else (
+            f"{profile.name} (经本地 HTTP/3 上游腿)" if h3 else profile.name)
 
         # ----------------------------------------------------------------------
         # 1. Pixiv 主站特殊处理 (包含 /ajax/ CORS 与 /ws/ WebSocket)
@@ -177,6 +241,8 @@ class NginxConfGenerator:
             f"    server_name {domains_str};",
             ""
         ]
+        if lines_note_downgrade:
+            lines.append(lines_note_downgrade)
 
         if profile.group == "dev":
             lines.append("    client_max_body_size 0;  # 支持任意体积大文件与 Git packfile")
@@ -238,11 +304,24 @@ class NginxConfGenerator:
 
         # 针对开发生态 (Git/GitHub/GitLab/大文件) 开启全链路流式零缓冲、Range 穿透与超长超时
         if profile.group == "dev":
+            lines.append("        # 大文件与 Git Smart HTTP 极速流式透传配置 (彻底消灭磁盘 I/O 缓冲假死)")
+            # ⚠ proxy_buffering off 与 proxy_cache **互斥** —— 二者不可同时出现在一个 location。
+            # 实测依据 (2026-10-01, 本地 nginx 最小复现, 见 cache_probe 实验): 同一 location
+            # 同时写 `proxy_cache` 与 `proxy_buffering off` + `proxy_max_temp_file_size 0` 时,
+            # 第二次请求 `$upstream_cache_status` 仍是 MISS、源站被重新命中 (seq 4→5);
+            # 仅把缓冲改回 on, 第二次即 HIT。原因: nginx 需要缓冲响应体才能落盘缓存。
+            # 影响面 (修复前): 所有 group=dev 且 enable_cache=True 的画像缓存**全是空转**
+            # (google_fonts / jsdelivr / npm / pypi / crates 等), 白白多打一次回源。
+            # 故: 开了缓存的画像保留缓冲 (缓存优先), 未开缓存的才走零缓冲流式透传。
+            if profile.enable_cache:
+                lines.append("        proxy_buffering on;   # 本画像开了磁盘缓存, 必须保留缓冲否则缓存不生效 (见上)")
+            else:
+                lines.extend([
+                    "        proxy_buffering off;",
+                    "        proxy_max_temp_file_size 0;",
+                ])
             lines.extend([
-                "        # 大文件与 Git Smart HTTP 极速流式透传配置 (彻底消灭磁盘 I/O 缓冲假死)",
-                "        proxy_buffering off;",
                 "        proxy_request_buffering off;",
-                "        proxy_max_temp_file_size 0;",
                 "        proxy_force_ranges on;",
                 "        proxy_set_header Range $http_range;",
                 "        proxy_set_header If-Range $http_if_range;",
@@ -439,7 +518,8 @@ server {{
 
     @classmethod
     def generate_all(cls, target_dir: Path = CONF_DIR,
-                     ech_services: Optional[Set[str]] = None) -> Dict[str, str]:
+                     ech_services: Optional[Set[str]] = None,
+                     h3_services: Optional[Set[str]] = None) -> Dict[str, str]:
         """全量渲染并原子写入三大站点配置文件
 
         ech_services 为走 ECH 隧道的服务 id 集合 (决定 proxy_pass 用 http 还是
@@ -451,6 +531,8 @@ server {{
         results = {}
         if ech_services is None:
             ech_services = cls._ech_services_from_upstream(target_dir / "upstream-dynamic.conf")
+        if h3_services is None:
+            h3_services = cls._h3_services_from_upstream(target_dir / "upstream-dynamic.conf")
 
         # 1. 渲染 site-gaming.conf
         gaming_profiles = [p for p in PROFILES
@@ -471,7 +553,7 @@ server {{
                 "}\n"
             )
         for p in gaming_profiles:
-            gaming_blocks.append(cls.render_server_block(p, ech_services))
+            gaming_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         gaming_content = "\n".join(gaming_blocks)
         (target_dir / "site-gaming.conf").write_text(gaming_content, encoding="utf-8")
         results["site-gaming.conf"] = gaming_content
@@ -485,7 +567,7 @@ server {{
             "# ==============================================================================\n"
         ]
         for p in acg_profiles:
-            acg_blocks.append(cls.render_server_block(p, ech_services))
+            acg_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         acg_content = "\n".join(acg_blocks)
         (target_dir / "site-acg.conf").write_text(acg_content, encoding="utf-8")
         results["site-acg.conf"] = acg_content
@@ -499,7 +581,7 @@ server {{
             "# ==============================================================================\n"
         ]
         for p in dev_profiles:
-            dev_blocks.append(cls.render_server_block(p, ech_services))
+            dev_blocks.append(cls.render_server_block(p, ech_services, h3_services))
         dev_content = "\n".join(dev_blocks)
         (target_dir / "site-dev.conf").write_text(dev_content, encoding="utf-8")
         results["site-dev.conf"] = dev_content

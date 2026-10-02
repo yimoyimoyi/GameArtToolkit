@@ -23,8 +23,49 @@
 - **🚀 本地多协议反代加速数据平面 (覆盖 3 大生态热门核心服务)**
   - **二次元与创作者生态**：Pixiv 网页/API/APP 接口、pximg 插画 CDN、Pixivision 官方杂志、Fanbox 创作者赞助、BOOTH 同人商城、Danbooru 动漫图库、VNDB 视觉小说资料库、Fantia 创作者俱乐部。
   - **游戏生态**：Steam 商店/结账、Steam 社区 118 修复、Steam Akamai 图片 CDN、Ubisoft 育碧商城、EA App / Origin、Battle.net 战网国际服、GOG 游戏商城、Xbox 微软游戏生态、Minecraft 游戏生态。
-  - **开发者与 AI 生态**：GitHub 主站 Web/API、GitHub 静态资产与 Raw 直连、GitHub Releases 附件极速下载 (L4 Relay 旁路直通)、GitHub 前端 JS/CSS CDN、GitHub S3 大文件对象存储 (Release 安装包与 Issue 上传图片)、GitLab 国际版、HuggingFace 模型权重 LFS 直连与全套图片 CDN (缩略图/头像/资产图)、Cloudflare Turnstile 与 hCaptcha 人机验证码加速、公共前端 CDN (jsDelivr / unpkg / cdnjs) 矩阵加速。
+  - **开发者与 AI 生态**：GitHub 主站 Web/API、GitHub 静态资产与 Raw 直连、GitHub Releases 附件极速下载 (L4 Relay 旁路直通)、GitHub 前端 JS/CSS CDN、GitHub S3 大文件对象存储 (Release 安装包与 Issue 上传图片)、GitLab 国际版、HuggingFace 模型权重 LFS 直连与全套图片 CDN (缩略图/头像/资产图)、**Google 搜索/账号/邮件/云盘/文档全家族**、**Google 静态资源 CDN (gstatic / googleusercontent / ggpht)**、**YouTube 网页与缩略图**、Cloudflare Turnstile 与 hCaptcha 人机验证码加速、公共前端 CDN (jsDelivr / unpkg / cdnjs) 矩阵加速。
+  - **Google / YouTube 走"同租户掩护 SNI"（`g.cn`）**：Google 自家边缘按 HTTP Host 路由，
+    因此用未被封锁的自家短域名 `g.cn` 作掩护 SNI、Host 保持真域名即可直连。2026-10-01 实测
+    8/8 中转 IP × 真实 Host 全部 200/302，上游证书 SAN 含 `*.google.cn`（Google Trust Services
+    WR2/WE2）。**68/69 个候选域名实测 `/generate_204` 返回 204**（真 Google 前台的判据，
+    "打错服务器"的 Bandaid 兜底服务不回 204）。首选仍保持掩护域是有意为之：真实域名作 SNI
+    会把域名明文写进 ClientHello（客户端→中转节点这一段）。
+    刻意拆成 `google_web` / `google_static` / `youtube_web` 三条画像（后端行为不同，合池必然错配）；
+    `google_fonts` 保持独立（它走国内电信缓存段 `120.253.x`），域名互不重叠。
+    ⚠️ **`googlevideo.com` 视频流域不登记**（2026-10-01 定案）：该通道下上游返回
+    `Bandaid Misdirected Traffic Server`（Google 明确回"打错服务器"）；唯一可用的
+    `HTTP/3 + IPv6 真实节点`通道虽有完整实现（`app/h3_upstream.py` 上游腿 +
+    `app/gvs_h3_probe` 闸门 + 应用启动/看门狗/退出接线），但**已定因不适用**：
+    403 的响应头自报 `server: gvs 1.0`（确实打到了真 Google Video Server）
+    + `content-type: application/vnd.yt-ump` —— 该 URL 是 **SABR/UMP 分片流**，
+    用普通 HTTP Range GET 会被拒。即 **`L7 + h3 上游腿` 无法充当 SABR 客户端**，
+    属**形态选错**而非"暂时调不通"（出口 IP / 节点 / `n=` / PO Token / 可播放性均已逐条排除）。
+    故按「不通的服务一律不加入，不做假可用」原则（同 `twitch_web` / `stackoverflow`）
+    **不登记**；HTTP/3 上游腿作为**已验证的潜伏能力**保留（同 QUIC 通道的处置）。
+    正确形态是让**浏览器自己**说 h3/SABR —— 即项目已有的 `app/quic_launcher.py`
+    （`--origin-to-force-quic-on`），它恰好绕开了"Chrome 不会因明文 DNS 自行采用 h3"这一前提。
+    完整证据链与逐条排除表见 [docs/googlevideo-quic-channel.md](docs/googlevideo-quic-channel.md)。
+  - **掩护 SNI 候选池 + 自动回归 + 降级链**（`app/cover_sni.py`）：掩护 SNI 不是常量，而是
+    **运行时状态** —— 启动加速前实测「掩护域是否仍然有效」，失效时按候选池自动降级：
+    `g.cn → www.g.cn → google.cn → www.google.cn → gstatic.com → www.gstatic.com → 真实域名 → 空 SNI`，
+    全失败则**显式判为不可用并在界面红色告警**（宁可报错也不静默白屏）。
+    验证四关（§6.2）：TCP → TLS → **证书必须属于该厂商自有证书族** → 用真实 Host 请求
+    `/generate_204`。主控制台有专门的状态卡显示当前层级与已淘汰候选，设置页有两个开关
+    （「自动回归与降级」「允许降级到空 SNI」）。
+    两个实测要点：① 中转节点**按 SNI 选证书**（发 `g.cn` 拿到 `*.google.cn` 那张，发空 SNI
+    拿到占位证书 `invalid2.invalid`），所以"证书族"这道门槛是真门槛；
+    ② **`proxy_ssl_verify off` 是伪 SNI 的代价而非 Google 的固有属性** —— 用真实域名当 SNI 时
+    证书名 8/8 覆盖、链 8/8 受信，这条可完整校验的退路正是"Google 关闭域名前置"时的兜底。
+    详见 [docs/cover-sni-degradation.md](docs/cover-sni-degradation.md)。
   - **本地磁盘二级缓存**：二次打开插画与静态资源实现本地 0ms 闪电响应。
+    本轮修掉两个既有缺陷（均以真实 nginx 最小复现证实）：① 缓存键原为
+    `$proxy_host`（= proxy_pass 里的 upstream 名，不是真实 Host），导致**同一 upstream 下
+    不同域名互相串内容**（实测 `b.test` 直接命中 `a.test` 的缓存并拿到它的响应体）；
+    改为 `$host` 后各域隔离。② `proxy_buffering off` 与 `proxy_cache` **互斥**，
+    dev 组画像同时写这两条会让缓存**完全空转**（实测第二次请求仍是 MISS）——
+    影响面覆盖 `google_fonts` / `jsdelivr` / `npm` / `pypi` / `crates` 等，
+    现已改为「开了缓存的画像保留缓冲」。`google_static` 因此得以按方案 P3 开启缓存，
+    端到端实测 `MISS → HIT`。
   - **L4 Relay 旁路隧道**：针对直连受阻的海外服务，自动经由本地上游代理端口透明转发，无需修改系统全局代理。
   - **域名劫持双后端 (Hosts / NRPT)**：可在「系统 Hosts 注入」与「Windows NRPT 名称解析策略表」之间切换。NRPT 后端不改动 Hosts 文件，且后缀匹配天然覆盖整棵子域树，代价是需管理员权限并独占 53/UDP；前置条件不满足时按配置自动回退 Hosts，并把回退原因（含 53 端口占用进程名）显示在设置页。
   - **替代路线解锁（按站点选最轻通道）**：对"TCP 侧 TLS 标准 SNI 被 RST / 被污染"的站点，逐站点选择
@@ -173,6 +214,17 @@ GameArtToolkit/
 3. **Steam 账号安全保证**：免密切换功能基于 Steam 官方在本地生成的凭据配置 (`loginusers.vdf`)，本程序不涉及任何用户密码或令牌的网络传输。
 4. **NRPT 重定向开关显示"暂不可用"**：NRPT 的 DNS 目标端口固定为 53，若本机 53/UDP 已被 Clash Verge 等代理的 DNS 覆写占用，则无法启用（设置页会直接标出占用进程名）。此时可继续使用 Hosts 后端，或在代理软件中关闭 DNS 覆写 / 把其 DNS 监听端口改到非 53 端口后再开启。设计说明见 [docs/nrpt-redirect-design.md](docs/nrpt-redirect-design.md)。
 5. **受信任根证书里有一堆历史证书**：早期版本的卸载路径 `certutil -delstore` 对根证书是空操作（返回成功但并未删除），导致每次 CA 重新生成都会在受信任根里新增一个永不回收的证书。现已改为 crypt32 原生删除 + **删除后复查确认**，并在每次安装前自动清理历史代际。清理既有残留需管理员权限：`python -m app.cert_manager --report` 查看、`--prune` 执行。详见 [docs/cert-trust-hygiene.md](docs/cert-trust-hygiene.md)。
+6. **证书私钥对本机所有用户可读（已修复）**：本地 CA 私钥 `nginx/ca/ca.key` 原先在用户可写目录里直接写出，继承了父目录 ACL —— 实测为
+   `BUILTIN\Authenticated Users:(M)`（可改）+ `BUILTIN\Users:(RX)`（可读），即**任意本地进程都能读走全机受信任的 CA 私钥**，
+   等价于完整的 TLS 劫持能力；服务端叶子私钥被读走则允许冒充全部被反代的域名。
+   现已改为：生成时把目录 ACL 收紧为 **`SYSTEM` + `Administrators` + 当前用户**（并带 `(OI)(CI)` 继承，使新私钥"生来即紧"），
+   断开继承，且每次生成/自愈后**回读校验**（设置调用返回成功不算数）。自查与修复均**无需管理员**：
+
+   ```
+   python -m app.cert_manager --report        # 含私钥 ACL 体检
+   python -m app.cert_manager --harden-keys   # 一键收紧 (幂等)
+   python -m app.private_key_acl --audit      # 等价的自查入口
+   ```
 
 ---
 

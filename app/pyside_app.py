@@ -54,6 +54,7 @@ from nginx_manager import NginxManager
 from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
 from l4_relay import relay_server
 from ech_tunnel import ech_tunnel
+from h3_upstream import h3_proxy, check_preconditions as check_h3_preconditions
 from dns_server import local_dns_server
 from env_detector import EnvDetector
 from win_utils import (
@@ -171,6 +172,9 @@ def emergency_fast_cleanup() -> Dict[str, Any]:
         # 下次 start() 会发现 is_running() 为真而直接复用该进程, 若期间域名
         # 白名单变化过, 新域名不会被加载, 表现为部分站点静默不通。
         ech_tunnel.stop()
+        # h3 上游腿是**进程内线程**, 同样必须显式停止: 否则端口 44411 会一直被本进程占着,
+        # 下次启动时 H3UpstreamManager.start() 会因"端口被非本实例占用"而明确失败。
+        h3_proxy.stop()
     except Exception:
         pass
 
@@ -795,6 +799,138 @@ class NavigatorCard(QFrame):
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
+
+
+class CoverSniCard(QFrame):
+    """Google / YouTube 掩护 SNI 通道状态卡片
+
+    为什么必须有这块界面 (方案 §8 降级链末行 + §10 验收标准第 6 条):
+      方案把"不可用"明确列为降级链的最后一行, 并要求「**显式标记失败并在 UI 可见,
+      宁可报错也不静默白屏**」; §10 第 6 条也要求「掩护 SNI 失效时能在无人干预下降级,
+      且 UI 状态可见」。掩护 SNI 是整套方案里唯一无法用代码修好的外部依赖 (§6.4) ——
+      Google 一旦关闭域名前置, 没有这块卡片, 用户只会看到"页面打不开", 完全无从判断
+      是哪一环失效、有没有自动降级、现在用的是哪条通路。
+
+    展示三层信息: ① 当前层级(降级链第几级) ② 首选策略是否仍有效 ③ 不可用时显式报错。
+    """
+
+    def __init__(self, parent_window: 'MainWindow'):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.setProperty("class", "MDCard")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        is_dark = ThemeManager.get_instance().is_dark
+        icon_c = "#D0BCFF" if is_dark else "#6750A4"
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(22, 22)
+        icon_lbl.setPixmap(SvgIconFactory.get_pixmap("shield", icon_c, 20))
+        head.addWidget(icon_lbl)
+
+        title = QLabel("Google / YouTube 通道状态")
+        title.setProperty("class", "ItemTitle")
+        head.addWidget(title)
+        head.addStretch()
+
+        self.btn_recheck = QPushButton("立即复检")
+        self.btn_recheck.setProperty("class", "MDBtnTonal")
+        self.btn_recheck.setToolTip("重新探测掩护 SNI 候选池, 失效时自动降级 (约 1~8 秒)")
+        self.btn_recheck.clicked.connect(self.recheck)
+        head.addWidget(self.btn_recheck)
+        lay.addLayout(head)
+
+        self.lbl_level = QLabel("尚未探测")
+        self.lbl_level.setWordWrap(True)
+        self.lbl_level.setProperty("class", "ItemDesc")
+        lay.addWidget(self.lbl_level)
+
+        self.lbl_detail = QLabel("")
+        self.lbl_detail.setWordWrap(True)
+        self.lbl_detail.setProperty("class", "ItemDesc")
+        lay.addWidget(self.lbl_detail)
+
+        self._worker = None
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    def refresh(self, state=None):
+        """按当前运行时状态刷新 (state 为 None 时只读缓存, 不触发网络探测)"""
+        try:
+            import cover_sni
+        except Exception:
+            self.lbl_level.setText("掩护 SNI 探测模块不可用")
+            return
+        if state is None:
+            state = cover_sni.get_state(cover_sni.GOOGLE_VENDOR)
+        if state is None:
+            self.lbl_level.setText(
+                "尚未探测 —— 启动加速时会自动回归一次; 当前按画像写死的 SNI 运行")
+            self.lbl_detail.setText("")
+            return
+
+        if not state.available:
+            # 显式失败: 方案 §8 明确要求不得静默白屏, 这里用红色警示文案点明后果
+            self.lbl_level.setText(
+                f"⚠ 通道不可用 —— 候选池 {len(state.results)} 个策略全部失效")
+            tried = "、".join(r.strategy or "(空)" for r in state.results)
+            self.lbl_detail.setText(
+                f"已尝试: {tried}\n"
+                f"Google/YouTube 的网页与静态资源将无法经本机加速访问; "
+                f"请检查网络, 或稍后点「立即复检」。")
+            return
+
+        age = state.age()
+        fresh = "刚刚" if age < 60 else f"{int(age // 60)} 分钟前"
+        detail = []
+        cur = next((r for r in state.results if r.strategy == state.strategy), None)
+        if cur:
+            detail.append(f"节点 TLS 通过 {cur.tls_ok}/{cur.total}, "
+                          f"真实 Host 探活 {cur.http_ok}/{cur.total}")
+            if cur.verify_possible:
+                detail.append("该策略下证书名匹配真实域名 (具备开启上游证书校验的条件)")
+            else:
+                detail.append("掩护策略下证书名必然不匹配真实域名 —— 运行期必须关闭上游证书校验 "
+                              "(伪 SNI 的固有代价, 由探测阶段的证书族门槛补偿)")
+        self.lbl_level.setText(f"当前通路: {state.level_label} (策略={state.strategy}) · {fresh} 复检")
+        if state.notes:
+            detail.append(state.notes)
+        down = [r.strategy for r in state.results if not r.passed and r.strategy != state.strategy]
+        if down:
+            detail.append(f"已淘汰: {'、'.join(down)}")
+        self.lbl_detail.setText("\n".join(detail))
+
+    def recheck(self):
+        """后台跑一次强制回归 (网络探测不能放 UI 线程, 否则界面冻结)"""
+        try:
+            import cover_sni
+        except Exception:
+            return
+        self.btn_recheck.setEnabled(False)
+        self.lbl_level.setText("正在复检掩护 SNI 候选池...")
+
+        def _job():
+            return cover_sni.check_google_channel(force=True)
+
+        self._worker = BackgroundTaskWorker(_job)
+        self._worker.done.connect(self._on_recheck_done)
+        self._worker.start()
+
+    def _on_recheck_done(self, result):
+        self.btn_recheck.setEnabled(True)
+        if isinstance(result, Exception):
+            self.lbl_level.setText(f"复检失败: {result}")
+            return
+        self.refresh(result)
+        if self.parent_window:
+            ok = bool(getattr(result, "available", False))
+            show_toast(self.parent_window,
+                       getattr(result, "summary", lambda: "复检完成")()
+                       if callable(getattr(result, "summary", None)) else "复检完成",
+                       toast_type="success" if ok else "error", duration=4500)
 
 
 class ToolHubCard(QFrame):
@@ -1454,6 +1590,20 @@ class MainWindow(QMainWindow):
         for grp_id, grp_info in SERVICE_GROUPS.items():
             grp_card = self._build_service_group_card(grp_id, grp_info, cfg_services)
             layout.addWidget(grp_card)
+
+        # 4.5 Google / YouTube 掩护 SNI 通道状态卡
+        #     仅当该通道确实在用 (有 Google 系画像处于启用状态) 时才出现 —— 一个只服务
+        #     Google 的状态块不该出现在完全没启用 Google 的界面上。
+        #     方案 §10 第 6 条要求"掩护 SNI 失效时能在无人干预下降级, 且 UI 状态可见",
+        #     这块卡片就是那个"可见"。
+        self.cover_sni_card = None
+        try:
+            import cover_sni as _cs
+            if set(_cs.google_profile_ids()) & cfg_services:
+                self.cover_sni_card = CoverSniCard(self)
+                layout.addWidget(self.cover_sni_card)
+        except Exception as e:
+            print(f"[UI] 掩护 SNI 状态卡构建失败 (不影响加速): {e}")
 
         layout.addStretch()
         scroll.setWidget(content)
@@ -3730,6 +3880,78 @@ class MainWindow(QMainWindow):
         p_layout.addLayout(row_pxy_fields)
         return proxy_card
 
+    def _build_settings_cover_sni_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """掩护 SNI 通道设置卡 (方案 §5.1 候选池 / §6.4 持续回归 / §8 降级链)
+
+        两个开关都只改"降级策略", 不改首选: 首选永远是画像里写死的掩护域 g.cn
+        (实测 8/8 节点四关全过)。这两个开关管的是"首选失效之后怎么办"。
+        """
+        card = QFrame()
+        card.setProperty("class", "MDCard")
+        c_layout = QVBoxLayout(card)
+        c_layout.setContentsMargins(20, 16, 20, 16)
+        c_layout.setSpacing(12)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(22, 22)
+        icon_lbl.setPixmap(SvgIconFactory.get_pixmap("shield", primary_icon_c, 20))
+        head.addWidget(icon_lbl)
+        lbl_title = QLabel("Google / YouTube 通道")
+        lbl_title.setProperty("class", "ItemTitle")
+        head.addWidget(lbl_title)
+        head.addStretch()
+        c_layout.addLayout(head)
+
+        # 开关 1: 自动回归 + 自动降级
+        row1 = QHBoxLayout()
+        t1 = QVBoxLayout()
+        t1.setSpacing(2)
+        lb1 = QLabel("掩护 SNI 自动回归与降级")
+        lb1.setProperty("class", "ItemTitle")
+        lb1.setWordWrap(True)
+        d1 = QLabel(
+            "启动加速前实测掩护域名是否仍然有效 (证书族门槛 + 真实 Host 探活); "
+            "失效时按候选池自动切换: g.cn → 其它 Google 自有域 → 真实域名 → 空 SNI。"
+            "关闭后一律使用画像里写死的 SNI, 便于排障时排除自动切换这一变量"
+        )
+        d1.setProperty("class", "ItemDesc")
+        d1.setWordWrap(True)
+        t1.addWidget(lb1)
+        t1.addWidget(d1)
+        row1.addLayout(t1)
+        row1.addStretch()
+        self.sw_cover_auto_regress = MDSwitch(checked=bool(cfg.get("cover_sni_auto_regress", True)))
+        self.sw_cover_auto_regress.toggled.connect(self.on_cover_auto_regress_toggled)
+        row1.addWidget(self.sw_cover_auto_regress)
+        c_layout.addLayout(row1)
+
+        # 开关 2: 是否允许降到空 SNI
+        row2 = QHBoxLayout()
+        t2 = QVBoxLayout()
+        t2.setSpacing(2)
+        lb2 = QLabel("允许降级到空 SNI (最后手段)")
+        lb2.setProperty("class", "ItemTitle")
+        lb2.setWordWrap(True)
+        d2 = QLabel(
+            "空 SNI 时对端返回占位证书 invalid2.invalid, 上游证书完全无法校验 —— 实测链校验 0/8 通过。"
+            "关闭后, 掩护域与真实域名全部失效时直接判为【不可用】并在界面显式报错, "
+            "而不会静默降到一条没有任何证书保障的通路上"
+        )
+        d2.setProperty("class", "ItemDesc")
+        d2.setWordWrap(True)
+        t2.addWidget(lb2)
+        t2.addWidget(d2)
+        row2.addLayout(t2)
+        row2.addStretch()
+        self.sw_cover_allow_empty = MDSwitch(checked=bool(cfg.get("cover_sni_allow_empty", True)))
+        self.sw_cover_allow_empty.toggled.connect(self.on_cover_allow_empty_toggled)
+        row2.addWidget(self.sw_cover_allow_empty)
+        c_layout.addLayout(row2)
+
+        return card
+
     def _build_settings_dns_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
         """卡片 5: 本地 DNS 智能分流与上游解析"""
         dns_card = QFrame()
@@ -4085,6 +4307,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_settings_env_card(primary_icon_c))
         layout.addWidget(self._build_settings_general_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_hosts_card(primary_icon_c, cfg))
+        layout.addWidget(self._build_settings_cover_sni_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_speedtest_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_proxy_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_dns_card(primary_icon_c, cfg))
@@ -4683,6 +4906,27 @@ class MainWindow(QMainWindow):
                     pass
             return
 
+        # h3 上游腿存活兜底 (与上面的 ECH 兜底同理, 且是同类事故的另一半):
+        # upstream-dynamic.conf 里写着 127.0.0.1:<h3 端口> 而代理线程已死时,
+        # 到达 googlevideo server 块的请求会全部 502。
+        # 注意判据同样是"配置在用它" 而不是"该服务被启用" —— 配置与实际进程一致才算健康。
+        try:
+            from path_utils import NGINX_DIR as _NGINX_DIR2
+            from nginx_generator import NginxConfGenerator as _Gen2
+            h3_in_use = bool(_Gen2._h3_services_from_upstream(
+                _NGINX_DIR2 / "conf" / "upstream-dynamic.conf"))
+        except Exception:
+            h3_in_use = False
+        if h3_in_use and not h3_proxy.is_healthy():
+            ok, msg = self._start_h3_upstream()
+            print(f"[Watchdog] h3 上游腿未就绪, 已尝试重启: {ok} {msg}")
+            if ok:
+                try:
+                    nginx_mgr.reload()
+                except Exception:
+                    pass
+            return
+
         cfg = load_config()
         if not cfg.get("auto_proxy", True):
             return
@@ -4797,6 +5041,17 @@ class MainWindow(QMainWindow):
             ech_ok, ech_msg = self._start_ech_tunnel()
             result["ech_ok"], result["ech_msg"] = ech_ok, ech_msg
 
+            # h3 上游腿同样必须先于 nginx 就绪: 它的 upstream (127.0.0.1:44411) 会被写进
+            # upstream-dynamic.conf, 代理没起时到达该 server 块的请求一律 502
+            h3_ok, h3_msg = self._start_h3_upstream()
+            result["h3_ok"], result["h3_msg"] = h3_ok, h3_msg
+
+            # 掩护 SNI 自动回归 (方案 §5.1 / §6.4): 必须排在 nginx 配置生成**之前** ——
+            # NginxConfGenerator.generate_all 会依据回归结果决定写画像里的 "g.cn" 还是
+            # 降级后的真实域名/空 SNI (见 app/cover_sni.py 与 nginx_generator 的降级注释)。
+            # 常规路径只需探第一个候选, 约 1 秒; 只有掩盘域真的失效时才会逐个下探。
+            result["cover_sni"] = self._regress_cover_sni(services)
+
             n_ok, n_msg = nginx_mgr.start()
             if not n_ok:
                 self._remove_redirect()
@@ -4816,6 +5071,24 @@ class MainWindow(QMainWindow):
         except Exception as e:
             result.update(stage="error", msg=f"{type(e).__name__}: {e}")
             return result
+
+    def _regress_cover_sni(self, services):
+        """启动加速前做一次掩护 SNI 回归, 返回 VendorState (跳过时返回 None)
+
+        阻塞调用, 因此只在"确有 Google 系服务启用且开关打开"时才跑; 常规路径 (首选
+        掩护域 g.cn 仍然有效) 只探一个策略的整池节点, 8 个 IP 并行约 1 秒。任何异常都
+        吞掉并返回 None —— 探测失败绝不能阻断加速启动, 此时生成器沿用画像写死的 SNI。
+        """
+        try:
+            import cover_sni
+            if not cover_sni.auto_regress_enabled():
+                return None
+            if not (set(cover_sni.google_profile_ids()) & set(services or ())):
+                return None
+            return cover_sni.check_google_channel()
+        except Exception as e:
+            print(f"[CoverSNI] 回归探测失败 (沿用画像写死的 SNI): {e}")
+            return None
 
     def _finish_start_acceleration(self, result: Dict[str, Any], show_toast_on_fail: bool):
         """启动加速的界面收尾 (仅在 UI 线程执行)"""
@@ -4844,6 +5117,21 @@ class MainWindow(QMainWindow):
             return
 
         services = result.get("services") or []
+        # 掩护 SNI 状态卡刷新 (方案 §10 第 6 条: 降级必须可见)。
+        # 不可用时不仅更新卡片, 还额外弹一条错误提示 —— 方案 §8 末行要求"显式标记失败",
+        # 只在卡片里写一行小字不算"显式"。
+        if getattr(self, "cover_sni_card", None) is not None:
+            try:
+                cs_state = result.get("cover_sni")
+                self.cover_sni_card.refresh(cs_state)
+                if cs_state is not None and not getattr(cs_state, "available", True):
+                    show_toast(self,
+                               f"⚠ Google/YouTube 通道不可用: 掩护 SNI 候选池全部失效 "
+                               f"({len(getattr(cs_state, 'results', []))} 个策略)",
+                               toast_type="error", duration=7000)
+            except Exception as e:
+                print(f"[UI] 掩护 SNI 状态卡刷新失败: {e}")
+
         if show_toast_on_fail:
             extra = (f" | {result.get('relay_msg', '')}" if result.get("relay_ok")
                      else f" | ⚠ {result.get('relay_msg', '')}")
@@ -4878,6 +5166,33 @@ class MainWindow(QMainWindow):
         ip_pool = list(dict.fromkeys(ip_pool))
 
         return ech_tunnel.start(domains=domains, ip_pool=ip_pool)
+
+    def _start_h3_upstream(self) -> Tuple[bool, str]:
+        """启动本地 HTTP/3 上游腿 (仅当存在 h3_upstream 画像时)
+
+        与 ECH 隧道的差别: ECH 隧道需要域名白名单与 IP 池作参数, 而 h3 腿按请求的
+        Host 自行解析目标节点 (见 h3_upstream.default_resolver), 因此无参数。
+
+        ⚠ 这里**不**做通道可用性判断: 通道是分钟级时变的 (实测同一小时在 0% 与 100% 之间翻转),
+        若按"当前不可用就不启动", 会出现"过一会儿好用了但代理没起"的状态。
+        正确分工是: 代理常驻; 「要不要启用该服务」由 app/gvs_h3_probe 闸门在启用前把关。
+        """
+        from service_profile import PROFILES
+
+        h3_services = [p for p in PROFILES if getattr(p, "h3_upstream", False)]
+        if not h3_services:
+            return True, "无服务使用 HTTP/3 上游腿"
+        ok, msg = h3_proxy.start()
+        # 前置条件校验: 不阻断启动 (代理本身可用), 但必须**如实告知** —— 否则用户会在
+        # Hosts 模式下得到一个静默失效的 googlevideo (详见 check_preconditions 注释)
+        try:
+            blockers = check_h3_preconditions(
+                (load_config() or {}).get("redirect_mode", "hosts"))
+        except Exception:
+            blockers = []
+        if blockers:
+            msg = f"{msg}; ⚠ " + "；".join(blockers)
+        return ok, msg
 
     def _start_relay(self) -> Tuple[bool, str]:
         """启动 L4 Relay 代理转发器: 端口预检 + 从现有 upstream 配置恢复 relay 端口路由"""
@@ -4921,6 +5236,7 @@ class MainWindow(QMainWindow):
         relay_server.stop()
         relay_server.clear_proxy_routes()
         ech_tunnel.stop()
+        h3_proxy.stop()
         self._remove_redirect()
         try:
             cert_mgr.restore_dev_environments()
@@ -5034,6 +5350,40 @@ class MainWindow(QMainWindow):
         else:
             note = REDIRECT_STATE.get("note") or ""
             show_toast(self, f"已回退 Hosts 重定向: {note or msg}", toast_type="warning", duration=3500)
+
+    def on_cover_auto_regress_toggled(self, checked: bool):
+        """掩护 SNI 自动回归/自动降级开关"""
+        update_config_key("cover_sni_auto_regress", checked)
+        if checked:
+            show_toast(self, "已开启掩护 SNI 自动回归：启动加速前探测并按需降级",
+                       toast_type="success", duration=2800)
+        else:
+            # 关掉后可能残留上一次的降级状态 —— 必须清掉, 否则"关了开关仍用降级后的 SNI"
+            try:
+                import cover_sni
+                cover_sni.clear_states()
+            except Exception:
+                pass
+            if getattr(self, "cover_sni_card", None) is not None:
+                self.cover_sni_card.refresh()
+            show_toast(self, "已关闭自动回归：将固定使用画像写死的 SNI（下次启动生效）",
+                       toast_type="info", duration=2800)
+
+    def on_cover_allow_empty_toggled(self, checked: bool):
+        """是否允许降级链的最后一级 (空 SNI)"""
+        update_config_key("cover_sni_allow_empty", checked)
+        try:
+            import cover_sni
+            cover_sni.clear_states()
+        except Exception:
+            pass
+        if getattr(self, "cover_sni_card", None) is not None:
+            self.cover_sni_card.refresh()
+        if checked:
+            show_toast(self, "允许降级到空 SNI（上游证书无法校验，仅作最后手段）",
+                       toast_type="warning", duration=3000)
+        else:
+            show_toast(self, "已禁止空 SNI：候选池全部失效时将显式报不可用", toast_type="info", duration=2800)
 
     def on_dns_mode_toggled(self, checked: bool):
         """响应本地 DNS 模式切换"""

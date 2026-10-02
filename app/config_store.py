@@ -66,6 +66,16 @@ DEFAULT_CONFIG = {
     # QUIC(HTTP/3) 直连服务的优选 IP 顺序 (由 quic_probe 用真实 QUIC 握手测速生成)
     "quic_optimal_ips": {},
 
+    # Google/YouTube 掩护 SNI 通道 (方案 §5.1 / §6.4 / §8)
+    # auto_regress: 启动加速前自动回归"掩护 SNI 是否仍然有效", 失效时按候选池自动降级
+    #               (g.cn → 其它 Google 自有域 → 真实域名 → 空 SNI)。关掉则一律用画像里
+    #               写死的 ssl_sni_mode, 不降级 —— 便于排障时排除"自动切换"这个变量。
+    "cover_sni_auto_regress": True,
+    # allow_empty: 是否允许降级链的最后一级"空 SNI"。该级证书必为占位证书
+    #              (invalid2.invalid), 上游证书完全无法校验; 关掉它则宁可在 UI 显式报
+    #              "不可用", 也不静默降到一条没有任何证书保障的通路上。
+    "cover_sni_allow_empty": True,
+
     "cache_max_size_mb": 1024,
     "auto_clear_cache_on_exit": False,
 
