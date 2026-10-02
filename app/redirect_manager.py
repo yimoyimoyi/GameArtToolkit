@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hosts_manager import build_domain_targets
 from nrpt_manager import NRPT_DNS_PORT, NRPT_NAME_SERVER, NrptManager
 from pac_redirect import PacRedirectManager
-import proxy_settings
 from win_utils import ProxyBypassManager
 
 MODE_HOSTS = "hosts"
@@ -33,75 +32,6 @@ MODE_NRPT = "nrpt"
 # 免管理员 / 不写注册表 / 不占 53 / 不改系统 DNS (见 app/pac_redirect.py)。
 # 定位: 面向用户的**正式无管理员方案**; nrpt 保留为测试/高级手段。
 MODE_PAC = "pac"
-# pac_auto: 同样用 PAC 表达通配, 但**不由程序拉起浏览器**, 而是把 PAC 地址写进
-# Windows 用户级「自动配置脚本」(WinINET AutoConfigURL): 不需要管理员、
-# 不出现"由贵单位管理"横幅、覆盖所有沿用系统代理的应用, 且实测**运行中的浏览器
-# 会当场采用**(写入后调用 InternetSetOption 通知系统)。见 app/proxy_settings.py。
-MODE_PAC_AUTO = "pac_auto"
-
-# 持久化备份用的配置键。**为什么必须落盘而不是只放内存** (2026-10-02):
-# pac_auto 会改用户的**系统代理设置**。若只把原值放在内存里, 进程一旦被强杀/崩溃,
-# 备份随之丢失, 用户的系统代理就被永久改成了我们的 PAC —— 那等于替用户改掉了上网方式,
-# 且他本人无从恢复。落盘后, 下次启动的 cleanup_orphans 能把它还原回去。
-_CFG_PROXY_BACKUP = "proxy_settings_backup"
-
-
-def _persist_proxy_backup(backup: dict) -> None:
-    try:
-        from config_store import load_config, save_config
-        cfg = load_config() or {}
-        cfg[_CFG_PROXY_BACKUP] = backup
-        save_config(cfg)
-    except Exception:
-        pass
-
-
-def _load_proxy_backup():
-    try:
-        from config_store import load_config
-        return (load_config() or {}).get(_CFG_PROXY_BACKUP)
-    except Exception:
-        return None
-
-
-def _clear_proxy_backup() -> None:
-    try:
-        from config_store import load_config, save_config
-        cfg = load_config() or {}
-        if _CFG_PROXY_BACKUP in cfg:
-            cfg.pop(_CFG_PROXY_BACKUP, None)
-            save_config(cfg)
-    except Exception:
-        pass
-
-
-def restore_system_proxy_if_needed() -> Tuple[bool, str]:
-    """若系统代理仍指向我们的 PAC, 按落盘备份还原 (启动时与清理时都调用)
-
-    三种情况都要处理, 且都要**幂等**:
-      1. 正常退出: 有备份 -> 还原并清除备份;
-      2. 上次被强杀: 有备份 -> 还原 (这正是落盘的意义);
-      3. 备份也丢了但 AutoConfigURL 仍指向本机 PAC 端口 -> 至少把它删掉,
-         否则用户的浏览器会把所有流量送进一个可能已不存在的本地代理。
-    """
-    try:
-        cur = proxy_settings.read_current()
-    except Exception as e:
-        return False, f"读取系统代理失败: {e}"
-    auto = ((cur.get("values") or {}).get("AutoConfigURL") or [None])[0]
-    backup = _load_proxy_backup()
-    if not auto and not backup:
-        return True, "系统代理无需还原"
-    if backup:
-        ok, msg = proxy_settings.restore(backup)
-        if ok:
-            _clear_proxy_backup()
-        return ok, msg
-    # 没有备份, 但值仍在: 只清理指向本机 PAC 的那种, 绝不乱动用户自设的其它 PAC
-    if auto and "127.0.0.1" in str(auto) and "proxy.pac" in str(auto):
-        ok, msg = proxy_settings.restore({"values": {}})
-        return ok, f"检测到上次遗留的本地 PAC 设置, 已清除 ({auto})"
-    return True, "系统代理指向的不是本项目的 PAC, 不动它"
 
 DEFAULT_DNS_PORT = 5353
 
@@ -116,8 +46,6 @@ def normalize_mode(cfg: Optional[Dict[str, Any]]) -> str:
         return MODE_NRPT
     if raw == MODE_PAC:
         return MODE_PAC
-    if raw == MODE_PAC_AUTO:
-        return MODE_PAC_AUTO
     return MODE_HOSTS
 
 
@@ -163,18 +91,12 @@ def apply_redirect(cfg: Dict[str, Any], services: List[str], hosts, nrpt=None,
     state["mode"] = mode
     state["domain_count"] = len(domains)
 
-    if mode in (MODE_PAC, MODE_PAC_AUTO):
+    if mode == MODE_PAC:
         # PAC 分支: 域名表交给 PAC 后端 (它把通配表达在 PAC 的 JS 里)。
         # 与 NRPT 分支一样, **同时清掉 Hosts 规则** —— Hosts 优先级高于代理之前的解析,
         # 残留会让部分域名绕过本后端, 造成"有的能开有的不能"的错乱。
         pac = pac_mgr or _PAC
-        # 兜底必须复现用户既有代理设置: PAC 优先于固定代理, 一律返回 DIRECT 会把
-        # 用户自己的代理整个旁路掉 (实测其 CONNECT 数为 0)。
-        try:
-            _fb = proxy_settings.pac_fallback_directive()
-        except Exception:
-            _fb = "DIRECT"
-        ok, msg = pac.start(domains, fallback=_fb)
+        ok, msg = pac.start(domains)
         if not ok:
             # ★ 这里**刻意不回退 Hosts**: Hosts 表达不了通配, 回退后动态节点名依然不被劫持
             # —— 那正是本项目一直在消除的"假可用"(界面显示已加速, 实际视频永远转圈)。
@@ -187,25 +109,8 @@ def apply_redirect(cfg: Dict[str, Any], services: List[str], hosts, nrpt=None,
         except Exception:
             pass
         _restore_bypass(domains)
-        state.update({"backend": mode, "fell_back": False, "note": "",
+        state.update({"backend": MODE_PAC, "fell_back": False, "note": "",
                       "pac_url": pac.pac_url()})
-
-        if mode == MODE_PAC_AUTO:
-            # 把 PAC 写进系统「自动配置脚本」: 不需管理员、不需程序拉起浏览器,
-            # 且实测运行中的浏览器会当场采用 (写入后已通知系统)。
-            # ⚠ 写入前**必须备份**用户原有代理设置, 并持久化 —— 否则进程被强杀后
-            #    备份随内存丢失, 用户的系统代理就被我们永久改掉了。
-            backup = proxy_settings.read_current()
-            ok2, msg2 = proxy_settings.set_autoconfig_url(pac.pac_url())
-            if not ok2:
-                pac.stop()
-                state.update({"backend": None, "fell_back": False, "note": msg2})
-                return False, f"无法写入系统自动配置脚本: {msg2}"
-            _persist_proxy_backup(backup)
-            state["proxy_backup_saved"] = True
-            return True, (f"{msg}; {msg2}; 已自动备份并还原原有代理设置。"
-                          f"用浏览器直接打开即可 (若个别浏览器未生效, 重启该浏览器)。")
-
         return True, (f"{msg}; 请以 `--proxy-pac-url={pac.pac_url()}` 启动浏览器"
                       f" (界面上的『以 PAC 启动浏览器』已代为处理)")
 
@@ -282,14 +187,6 @@ def remove_redirect(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     # PAC 后端必须先停: 它持有两个监听端口 (隧道 + PAC 服务), 残留端口会让下次启动
     # 撞上"端口被占用", 而且旧 PAC 可能仍在把浏览器流量导向本机。
     try:
-        _r_ok, _r_msg = restore_system_proxy_if_needed()
-        if _r_msg and "无需" not in _r_msg and "不动它" not in _r_msg:
-            messages.append(_r_msg)
-    except Exception as e:
-        ok_all = False
-        messages.append(f"系统代理还原异常: {e}")
-
-    try:
         if pac.running:
             ok, msg = pac.stop()
             ok_all = ok_all and ok
@@ -347,11 +244,6 @@ def fast_remove_redirect(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     ok = True
     # PAC 后端同样必须在退出通道停掉: 它持有两个本地监听端口。
     # (它不涉及整机解析, 所以危害不如 NRPT 残留, 但端口残留会让下次启动直接失败。)
-    try:
-        restore_system_proxy_if_needed()
-    except Exception:
-        ok = False
-
     try:
         if pac.running:
             pac.stop()
@@ -412,16 +304,6 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
 
     if not (applied_hosts or applied_nrpt):
         return {"cleaned": False, "detail": "无残留"}
-
-    # ★ 启动时也要还原**系统代理**: 上一次进程被强杀时无法执行清理, 而 pac_auto 改的是
-    #   用户的系统代理设置 —— 若不在启动时还原, 用户的浏览器会把所有流量送进一个
-    #   可能已不存在的本地代理, 等于全网上不了。落盘备份使这一步可恢复。
-    try:
-        _p_ok, _p_msg = restore_system_proxy_if_needed()
-        if _p_msg and "无需" not in _p_msg and "不动它" not in _p_msg:
-            detail = f"{detail}; {_p_msg}" if detail else _p_msg
-    except Exception as e:
-        detail = f"{detail}; 系统代理还原异常: {e}" if detail else f"系统代理还原异常: {e}"
 
     ok = fast_remove_redirect(cfg, hosts, nrpt, dns)
     parts = []

@@ -1238,7 +1238,7 @@ def wildcard_capable(redirect_mode: str) -> bool:
         (见 app/pac_redirect.py; 实测完整域名表 553 条, 播放成功)。
     判据写成能力查询, 新增后端时这里只需加一条, 不必改调用方。
     """
-    return str(redirect_mode or "").strip().lower() in ("nrpt", "pac", "pac_auto")
+    return str(redirect_mode or "").strip().lower() in ("nrpt", "pac")
 
 
 def needs_wildcard_resolution(profile) -> bool:
@@ -1322,18 +1322,9 @@ ALIAS_SUFFIXES = ("gvt1.com", "snap.gvt1.com", "bdn.dev", "gcpcdn.gvt1.com")
 _DNS_POISON_PREFIX = ("157.240.", "31.13.", "2a03:2880", "162.125.", "65.49.",
                       "104.244.", "108.160.", "59.24.",
                       # —— 2026-10-02 实测补入 ——
-                      # ⚠ 下面四条刻意写成**整个 /16**, 而不是实测到的那个 /24。
-                      # 第二次实测 (node_reach_measure.py, 同一批节点名重查) 拿到的是
-                      # **同段内的另一个取值**: 128.242.245.157 / 199.96.63.177 /
-                      # 199.59.148.247 / 185.60.216.169 —— 而当时表里写的是
-                      # 128.242.240. / 199.96.62. / 199.59.149. / (无), 于是**四条全部漏过**,
-                      # 其中 rr2---sn-i3b7kns1 因此被解析到 Facebook 地址并白烧 71.9s。
-                      # 投毒取值在段内轮换, 按 /24 精确拉黑等于每轮换一次就漏一次。
-                      # 与 cdn_optimizer.POLLUTED_IP_PREFIXES 的粒度保持一致 (那边本来就是 /16)。
-                      "128.242.", "199.96.", "199.59.", "185.60.216.",
                       "2001::1", "2001:0:",
-                      "185.45.", "174.132.", "192.133.77.",
-                      "69.171.235.")
+                      "185.45.", "174.132.", "128.242.240.", "192.133.77.",
+                      "199.96.62.", "69.171.235.", "199.59.149.")
 
 # Google 自有网段 (公开段 + 本次实测用到的段)。用途不是"硬门槛"而是**优先信号**:
 # 投毒应答的取值是无穷的, 逐个拉黑是打地鼠; 而"真 Google 边缘必然落在 Google 段内"
@@ -1384,65 +1375,8 @@ def prefer_google(ips: List[str]) -> List[str]:
     return good if good else ips
 
 
-# 只能整段拉黑的投毒取值所在网段 (与具体取值无关)
-_POISON_NET_CIDRS = ("2001::/32",)      # Teredo: 真 CDN 永远不会用隧道段
-_POISON_NETS = None
-
-
-def _poison_nets():
-    global _POISON_NETS
-    if _POISON_NETS is None:
-        import ipaddress
-        nets = []
-        for c in _POISON_NET_CIDRS:
-            try:
-                nets.append(ipaddress.ip_network(c))
-            except Exception:
-                pass
-        _POISON_NETS = nets
-    return _POISON_NETS
-
-
-# googlevideo 节点家族的名字域 (含实测用到的**别名域** —— 节点名在别名域上解析最干净)
-_GVS_FAMILY_SUFFIXES = (".googlevideo.com", ".gvt1.com", ".bdn.dev",
-                        ".c.youtube.com")
-# 节点名形态: rr1---sn-i3b7kns6 / rr5---sn-ajaig5-5h (也接受 rr1.sn-… 这类写法)
-_GVS_NODE_RE = None
-
-
-def is_gvs_family_host(host: str) -> bool:
-    """该请求目标是否属于 googlevideo 节点家族 —— 是则解析结果**必须**落在 Google 段
-
-    为什么必须与普通 h3 目标分开处理 (2026-10-02 节点测量定因):
-      对普通 h3 目标 (Cloudflare / Fastly / unpkg 自测) 非 Google 地址是**正常**的,
-      套上"必须 Google 段"会把它整个弄坏;
-      而 GVS 节点是 Google **自建**边缘, 不存在第三方承载 —— 因此对这类名字,
-      任何非 Google 段的应答都**必然**是投毒注入, 可以放心硬淘汰。
-    实测依据: 9 个节点名 × 5 个来源, 4 个别名域对 8/9 个节点一致返回 Google 段地址,
-    唯一例外 (rr2---sn-i3b7kns1) 是别名域全部为空、只剩被投毒的 apex 应答。
-    """
-    global _GVS_NODE_RE
-    import re
-    h = strip_port(host).lower().rstrip(".")
-    if h.endswith(_GVS_FAMILY_SUFFIXES):
-        return True
-    if _GVS_NODE_RE is None:
-        _GVS_NODE_RE = re.compile(r"^rr\d+[.-]+sn-[a-z0-9-]+$")
-    return bool(_GVS_NODE_RE.match(h.split(".", 1)[0]))
-
-
 def is_poisoned(ip: str) -> bool:
-    if "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX):
-        return True
-    # Teredo 隧道段 2001::/32: 实测两个投毒取值 2001::1 与 2001::67d6:a86a 都落在段内。
-    # 必须按**段**判定, 不能用字面前缀: 写 "2001::1" 挡不住同段其他取值 (实测漏掉
-    # 2001::67d6:a86a), 而写泛化的 "2001:" 又会误杀 Google 真实的 2001:4860::/32。
-    try:
-        import ipaddress
-        a = ipaddress.ip_address(str(ip).strip())
-        return any(a.version == n.version and a in n for n in _poison_nets())
-    except Exception:
-        return False
+    return "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX)
 
 
 def _doh(name: str, qtype: str, timeout: float = 4.0) -> List[str]:
@@ -1492,17 +1426,11 @@ def default_resolver(host: str) -> List[str]:
       - 而 Cloudflare 等目标反过来常常只有 IPv4 可达 (本机实测 CF 的 IPv6 全超时)。
     两者都返回, 由调用方按序尝试 —— 这样同一个上游腿既能服务 googlevideo,
     也能服务普通 h3 目标 (自测/对照用)。
-
-    **GVS 节点家族走"必须 Google 段"的硬判据** (见 is_gvs_family_host):
-    这类名字的非 Google 应答必然是投毒, 留着它只会让腿把 connect 预算烧在一个
-    永远不答的地址上 (实测 rr2---sn-i3b7kns1 拿到 Facebook 地址 → 3/3 失败,
-    71.9s 纯白烧)。宁可返回空、让上层**快速如实失败**, 也不要拿投毒地址去试。
     """
     node = node_name_from_host(host)
     if not node:
         return []
     target = strip_port(host)
-    strict = is_gvs_family_host(target)
     if target.endswith(ALIAS_SUFFIXES):
         names = [target]
     else:
@@ -1515,18 +1443,10 @@ def default_resolver(host: str) -> List[str]:
             v6 = _doh(name, "AAAA")
         if not v4:
             v4 = _doh(name, "A")
-        if strict:
-            # 只有**真的**拿到 Google 段地址才收工。否则继续换下一个名字 ——
-            # 若在这里按"有应答就 break", 一个投毒应答就会把后面的别名域/apex 全部截断。
-            if any(is_google_edge_ip(ip) for ip in v6 + v4):
-                break
-        elif v6 or v4:
+        if v6 or v4:
             break
     if v6 or v4:
-        cand = v6 + v4
-        if strict:
-            cand = [ip for ip in cand if is_google_edge_ip(ip)]
-        return cand
+        return v6 + v4
 
     # 兜底: 系统解析 (可能被投毒, 已过滤), 同样 IPv6 优先
     try:
@@ -1539,11 +1459,9 @@ def default_resolver(host: str) -> List[str]:
                         bucket.append(ip)
             except Exception:
                 continue
-        out = (prefer_google(list(dict.fromkeys(out6)))
-               + prefer_google(list(dict.fromkeys(out4))))
-        if strict:
-            out = [ip for ip in out if is_google_edge_ip(ip)]
-        return out
+        # 系统解析最容易拿到投毒应答, 因此这一路更要把 Google 段排到前面
+        # (2026-10-02 实测: 未排序时 www.youtube.com 拿到 2001::1 + 174.132.167.252 两个投毒值)
+        return prefer_google(list(dict.fromkeys(out6))) + prefer_google(list(dict.fromkeys(out4)))
     except Exception:
         return []
 

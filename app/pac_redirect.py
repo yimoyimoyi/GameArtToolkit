@@ -66,22 +66,15 @@ _TUNNEL_TIMEOUT = 300.0
 
 
 def build_pac(proxy_port: int, exact_hosts: Sequence[str],
-              wildcard_suffixes: Sequence[str], fallback: str = "DIRECT") -> bytes:
+              wildcard_suffixes: Sequence[str]) -> bytes:
     """生成 PAC 脚本 (纯函数, 可离线单测)
 
     :param exact_hosts: 精确主机名 (来自已启用服务的域名表)
     :param wildcard_suffixes: 通配后缀, 形如 `.googlevideo.com` (注意带前导点)
         —— 与 registered 域名的 `*.x` 形式差一个点, 由调用方转换。
-    :param fallback: **未命中域名时返回什么**。默认 `DIRECT`; 但**用户已配置固定代理时
-        必须传入其代理指令** (见 proxy_settings.pac_fallback_directive) ——
-        否则会把用户自己的代理整个旁路掉。实测: PAC 优先于固定代理, 返回 DIRECT 时
-        用户代理收到的 CONNECT 数为 **0**, 他其它所有站点都会变成直连。
+    未命中一律 DIRECT。
     """
     import json as _json
-    fb = (fallback or "DIRECT").strip() or "DIRECT"
-    # 只接受合法的 PAC 返回形式, 避免把注册表里的任意字符串拼进脚本 (注入面)
-    if not (fb == "DIRECT" or fb.startswith(("PROXY ", "SOCKS ", "SOCKS5 ", "HTTP "))):
-        fb = "DIRECT"
     return (
         "// GameArt Toolkit - PAC: 命中域名经本机隧道交给 nginx\n"
         "function FindProxyForURL(url, host) {\n"
@@ -96,7 +89,7 @@ def build_pac(proxy_port: int, exact_hosts: Sequence[str],
         "  if (exact.indexOf(host) >= 0) {\n"
         f"    return 'PROXY 127.0.0.1:{int(proxy_port)}';\n"
         "  }\n"
-        f"  return {_json.dumps(fb)};\n"
+        "  return 'DIRECT';\n"
         "}\n").encode("utf-8")
 
 
@@ -251,7 +244,6 @@ class PacRedirectManager:
         self._exact: List[str] = []
         self._wild: List[str] = []
         self._pac: Optional[bytes] = None
-        self._fallback = 'DIRECT'
         self._lock = threading.Lock()
         self.tunnels: List[str] = []
         self.last_error = ""
@@ -287,26 +279,19 @@ class PacRedirectManager:
             "exact_hosts": len(self._exact),
             "wildcard_suffixes": len(self._wild),
             "pac_bytes": len(self._pac or b""),
-            "fallback": self._fallback,
             "tunnels": len(tunnels),
             "tunnel_sample": tunnels[:12],
             "last_error": self.last_error,
         }
 
     # ---------------------------------------------------------------- 生命周期
-    def start(self, domains: Sequence[str],
-              fallback: str = "DIRECT") -> Tuple[bool, str]:
-        """按域名表启动转发器与 PAC 服务 (幂等: 已运行则只更新 PAC 内容)
-
-        `fallback` 是**未命中域名**时的 PAC 返回值。若用户已配置固定代理, 必须传入
-        其代理指令 —— 否则会把用户自己的代理整个旁路 (实测: 用户代理收到 0 个 CONNECT)。
-        """
+    def start(self, domains: Sequence[str]) -> Tuple[bool, str]:
+        """按域名表启动转发器与 PAC 服务 (幂等: 已运行则只更新 PAC 内容)"""
         exact, wild = split_domains(domains)
         if not exact and not wild:
             return False, "无域名需要重定向"
         self._exact, self._wild = exact, wild
-        self._pac = build_pac(self.proxy_port, exact, wild, fallback=fallback)
-        self._fallback = (fallback or 'DIRECT').strip() or 'DIRECT'
+        self._pac = build_pac(self.proxy_port, exact, wild)
         if self.running:
             return True, (f"PAC 后端已在运行, 已更新域名表 "
                           f"({len(exact)} 精确 + {len(wild)} 通配)")
