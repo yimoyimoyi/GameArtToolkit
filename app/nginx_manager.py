@@ -94,6 +94,26 @@ class NginxManager:
             pass
         return actual
 
+    def prepare_certificates(self) -> Tuple[bool, str]:
+        """确保证书与私钥就绪 (幂等; 按需自签发/重签发以覆盖新增域名)
+
+        ★ 这是**唯一**会改动证书的入口 (2026-10-02 从 test_config() 里挪出来)。
+        为什么必须显式成一个方法而不是留在"语法预检"里:
+          `test_config()` 的语义是 `nginx -t` 预检 —— 一个**看起来只读**的动作。
+          而它原先内含 `ensure_certificates()`, 也就是"测一下配置就可能铸造新根证书并
+          改写全机受信任存储"。这与"预检不得有副作用"直接冲突, 也是 4 次"在用根被删"
+          事故里那一步的触发面。现在把它显式化: 预检只读, 证书准备由 start() 调用一次。
+
+        注意与"信任库"的分工: 本方法只负责**本目录**的证书文件 (叶证书按 SAN 重签),
+        不动受信任存储 —— 装机/清理那条路径在 app/cert_manager.py 的 install_cert /
+        prune_stale_trust_roots, 两者刻意分开。
+        """
+        try:
+            return CertManager(cer_path=self.nginx_dir / "ca.cer",
+                               nginx_dir=self.nginx_dir).ensure_certificates()
+        except Exception as e:
+            return False, f"本地证书自检失败: {type(e).__name__}: {e}"
+
     def test_config(self) -> Tuple[bool, str]:
         """执行 nginx -t 进行语法与 upstream 预检 (包含前置模板渲染)"""
         if not self.nginx_exe.exists():
@@ -114,8 +134,13 @@ class NginxManager:
             # 2. 自动从 ServiceProfile 单源渲染三大站点配置
             NginxConfGenerator.generate_all(self.nginx_dir / "conf")
 
-            # 3. 自动确保证书与私钥在本地按需自生成就绪 (零分发与自愈)
-            CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir).ensure_certificates()
+            # ⚠ 证书生成**已从这里移走** (2026-10-02 定因):
+            #   `test_config()` 的语义是"`nginx -t` 语法预检" —— 一个**看起来只读**的动作。
+            #   而它原先会在里面调用 `CertManager(...).ensure_certificates()`, 也就是
+            #   **测一下配置就可能铸造一个新的根证书并改写全机受信任存储**。
+            #   这与"审计/预检不得有副作用"直接冲突, 也正是 4 次"在用根被删"事故里
+            #   那一步的触发面 (生成发生在非预期目录时, 旧根会被当陈旧清除)。
+            #   现在改由启动流程在调用 test_config() **之前**显式确保一次, 见 start()。
 
             # 4. site 引用的 upstream 未定义时自动补全
             #    (新增 ServiceProfile 后 site 配置会引用新 upstream, 若未重新测速则 nginx 无法启动;
@@ -163,6 +188,12 @@ class NginxManager:
             return False, f"未找到 nginx.exe: {self.nginx_exe}"
 
         # 配置预检
+        # 证书必须先于预检就绪 —— 它原先藏在 test_config() 里面 (见那里的注释),
+        # 使"语法预检"带上"铸造根证书并改全机信任"的副作用。挪到启动流程显式调用:
+        # 预检保持只读, 而"确保证书"这件事仍然在启动时完成一次 (自愈能力不变)。
+        ok_c, msg_c = self.prepare_certificates()
+        if not ok_c:
+            return False, msg_c
         ok, test_msg = self.test_config()
         if not ok:
             return False, test_msg

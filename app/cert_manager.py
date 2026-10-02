@@ -477,16 +477,17 @@ class CertManager:
         return True, "本地 SSL 根证书与服务端证书已全部就绪 (私钥 ACL 已收紧)！"
 
     def get_cert_thumbprint(self) -> str:
-        """获取本地 ca.cer 的证书指纹 (SHA1) (内存缓存，缺失时自动生成)"""
+        """获取本地 cer_path 的证书指纹 (SHA1) —— **只读, 缺文件返回空串**
+
+        ⚠ 原先在文件缺失时会**自动调用 `ensure_certificates()`** (2026-10-02 移除此副作用)。
+        那意味着"读一下指纹"这个纯查询动作可以**生成一整套 CA 并改写全机受信任存储** ——
+        而本方法被 prune 之类的清理/审计路径调用, 于是"审计"变成了"改配置"。
+        现在缺文件就如实返回空串, 由调用方显式决定要不要生成:
+          · `prune_stale_trust_roots` 见到空串会**中止清理**(已有行为, 保守且正确);
+          · 启动流程在 `NginxManager.start()` 里显式 ensure 一次。
+        """
         if self._cached_thumbprint:
             return self._cached_thumbprint
-
-        if not self.cer_path.exists():
-            # 仅针对默认主路径自动触发自愈生成
-            if self.cer_path == CA_CER_PATH:
-                self.ensure_certificates()
-            else:
-                return ""
 
         if not self.cer_path.exists():
             return ""

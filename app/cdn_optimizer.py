@@ -947,6 +947,9 @@ class CDNOptimizer:
         self.last_h3_services: set = set()
         # 标记了 ech_enabled 但隧道未就绪、已退回常规分支的服务
         self.last_ech_degraded: set = set()
+        # 本轮把画像候选池并入 upstream (作 backup) 的服务集合。
+        # 存在的意义: "并入了几个"是可见性的一部分 —— 否则单点 upstream 会静默存在。
+        self.last_pool_merged: set = set()
         # 单轮生成内的兜底探测缓存 (key=ip, value=(ok, latency))
         # 各服务的候选池大量重叠 (如 github_raw/release/assets 共用 185.199.108-111 段),
         # 按 IP 去重后同一轮只需探测一次。实测全量兜底 33 个服务串行重复探测耗时 105s,
@@ -1504,6 +1507,7 @@ class CDNOptimizer:
         self.last_ech_services = set()
         self.last_h3_services = set()
         self.last_ech_degraded = set()
+        self.last_pool_merged = set()
         # 重置兜底探测缓存: 结果只在一轮生成内复用, 跨轮必须重新探测以反映网络变化
         self._probe_cache.clear()
 
@@ -1573,9 +1577,34 @@ class CDNOptimizer:
             if not ip_items:
                 old_block = existing_blocks.get(f"upstream_{srv_id}")
                 if old_block:
-                    lines.append(old_block + "\n")
+                    # 旧块是**上一次的实测快照**: 未重新测速时应当原样保留
+                    # (单测 TestIncrementalMerge 就是守这条 —— 不碰没测过的东西)。
+                    # 但"原样保留"有一个致命副作用, 实测抓到: upstream_reddit 的旧块
+                    # 只含一个后来超时的 151.101.77.140, 而画像自带的
+                    # 199.232.161.140 / 199.232.113.140 在掩护 SNI (www.fastly.com) 下
+                    # 实测是 301 可用 —— 却因为"旧块里没有它们"而**永远进不去**,
+                    # 单点故障被永久固化, 服务 504。
+                    # 因此: 正文原样保留, 只把**缺的候选池**以 backup 身份补进去。
+                    # backup 只在主力全部失效时启用 ⇒ 不会动到已测量的主力。
+                    lines.append(self._augment_block_with_pool(old_block, srv_id) + "\n")
                     continue
-                ip_items = [{"ip": ip} for ip in CANDIDATE_IPS.get(srv_id, [])]
+            # ⚠ 调用方可能显式传 None (不是空列表) —— 必须先归一化, 否则下面会 TypeError。
+            ip_items = list(ip_items or [])
+
+            # ★ 候选池**始终并入** (2026-10-02): 无论探测是否成功。
+            #   原先只在"既无探测数据又无旧块"时才读 CANDIDATE_IPS —— 于是一次成功的
+            #   探测就能把 upstream 写成**单点**, 之后该 IP 一失效服务即全挂。
+            #   并入的项**不带 rank** ⇒ 排序后落进 degraded ⇒ 写成 `backup`,
+            #   只在主力全部失效时才启用, 因此不会顶掉测量出来的主力位。
+            _known = {it.get("ip") for it in ip_items if it.get("ip")}
+            _added = 0
+            for _ip in CANDIDATE_IPS.get(srv_id, []) or []:
+                if _ip and _ip not in _known:
+                    ip_items.append({"ip": _ip})
+                    _known.add(_ip)
+                    _added += 1
+            if _added:
+                self.last_pool_merged.add(srv_id)
 
             rank0 = [it for it in ip_items if it.get("rank", 3) == 0]
             rank12 = [it for it in ip_items if it.get("rank", 3) in (1, 2)]
@@ -1677,6 +1706,19 @@ class CDNOptimizer:
                 for ip in valid_ips[:6]:
                     lines.append(self._fmt_server(ip, _upstream_server_opts()))
             else:
+                # ★ 最后一道保证: **产出文本之前**, 确保画像候选池都在 (作 backup)。
+                #   为什么放在这里而不是只在数据流上游: upstream 的 ip_items 有多条来源
+                #   (新探测 / 旧块取回 / 候选池兜底), 每条都可能把候选池甩掉 ——
+                #   实测 reddit 在数据流里确实并入了候选, 但最终写出的仍是一个单点。
+                #   "单点 upstream" 必须在**唯一产出 server 行的地方**被排除, 否则
+                #   任何一条上游路径的疏漏都会重新引入它 (本项目反复踩的"只修了看得见的那处")。
+                #   backup 语义: 只在主力全部失效时启用 ⇒ 不会顶掉测量出来的主力位。
+                _have = set(primary_ips) | set(backup_ips)
+                for _ip in (CANDIDATE_IPS.get(srv_id, []) or []):
+                    if _ip and _ip not in _have:
+                        backup_ips.append(_ip)
+                        _have.add(_ip)
+                backup_ips = backup_ips[:5]
                 for ip in primary_ips:
                     lines.append(self._fmt_server(ip, _upstream_server_opts()))
                 for ip in backup_ips:
@@ -1688,6 +1730,29 @@ class CDNOptimizer:
             lines.append("}\n")
 
         return "\n".join(lines)
+
+    def _augment_block_with_pool(self, block: str, srv_id: str) -> str:
+        """把画像候选池里**旧块尚缺**的 IP 以 `backup` 身份补进旧块 (正文其余原样保留)
+
+        为什么是"补 backup"而不是"重建": 旧块是上一次的**实测快照**, 没重新测速就不该
+        改动它 (单测 TestIncrementalMerge 守的正是这条)。但"什么都不动"会让单点故障被
+        **永久固化** —— 实测 upstream_reddit 只有一个后来超时的 151.101.77.140, 而画像
+        自带的 199.232.161.140 / 199.232.113.140 在掩护 SNI 下是 301 可用, 却因为
+        "旧块里没有"而永远进不去, 服务直接 504。
+        补 backup 是两全: 已测量的主力一个不动, 候选池成为可接管的冗余。
+        """
+        pool = [ip for ip in (CANDIDATE_IPS.get(srv_id, []) or []) if ip]
+        if not pool:
+            return block
+        missing = [ip for ip in pool if ip not in block]
+        if not missing:
+            return block
+        idx = block.rfind("}")
+        if idx < 0:
+            return block
+        add = "\n".join(self._fmt_server(ip, "backup " + _upstream_server_opts())
+                        for ip in missing[:5])
+        return block[:idx].rstrip("\n") + "\n" + add + "\n" + block[idx:]
 
     def _scan_site_upstream_refs(self) -> set:
         """扫描 nginx.conf 实际 include 的 site 配置, 提取所有 proxy_pass 引用的 upstream 名"""

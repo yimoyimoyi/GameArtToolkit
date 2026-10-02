@@ -48,7 +48,8 @@ from hosts_manager import HostsManager
 from nrpt_manager import NrptManager, NRPT_DNS_PORT
 from redirect_manager import (
     apply_redirect, remove_redirect, fast_remove_redirect, is_redirect_applied,
-    normalize_mode as normalize_redirect_mode, MODE_NRPT
+    normalize_mode as normalize_redirect_mode,
+    MODE_HOSTS, MODE_NRPT, MODE_PAC, MODE_PAC_AUTO
 )
 from nginx_manager import NginxManager
 from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
@@ -4067,6 +4068,45 @@ class MainWindow(QMainWindow):
         d_layout.addWidget(self.lbl_nrpt_status)
         self.refresh_nrpt_status_label()
 
+        # 5.1b ★ 解析后端四选一 (2026-10-02)
+        #      为什么单列一个选择器而不是只留 NRPT 那个开关:
+        #      `pac` / `pac_auto` 两个后端**早就实现好了** (见 app/redirect_manager 的 PAC 分支
+        #      与 app/pac_redirect.py), 但界面上只能改 config.json 才选得到 —— 于是最实用的
+        #      那个 (pac_auto: 免管理员 + 运行中的浏览器立即采纳) 事实上无人能用。
+        #      同时它也是**通配域名**的唯一免管理员出路: googlevideo 在 hosts 下被硬拦,
+        #      gemini 的 *.clients6.google.com 在 hosts 下会漏 (Hosts 不支持通配)。
+        row_mode = QHBoxLayout()
+        r_mode_text = QVBoxLayout()
+        r_mode_text.setSpacing(2)
+        lbl_mode_title = QLabel("加速域名解析后端")
+        lbl_mode_title.setProperty("class", "ItemTitle")
+        lbl_mode_title.setWordWrap(True)
+        lbl_mode_desc = QLabel(
+            "Hosts/NRPT 需要管理员；**通配域名**（如 *.clients6.google.com、动态节点名 "
+            "rr1---sn-xxx.googlevideo.com）只有具备通配能力的后端才劫持得到。"
+            "PAC 两种均免管理员：pac 需由本程序启动浏览器，pac_auto 写系统自动配置脚本、"
+            "运行中的浏览器即刻采纳。切换后若加速正在运行会即时迁移。")
+        lbl_mode_desc.setProperty("class", "ItemDesc")
+        lbl_mode_desc.setWordWrap(True)
+        r_mode_text.addWidget(lbl_mode_title)
+        r_mode_text.addWidget(lbl_mode_desc)
+        row_mode.addLayout(r_mode_text)
+        row_mode.addStretch()
+        self.combo_redirect_mode = QComboBox()
+        for _label, _value in (
+                ("Hosts 注入（需管理员）", MODE_HOSTS),
+                ("NRPT 策略表（需管理员 + 空闲 53）", MODE_NRPT),
+                ("PAC + 启动浏览器（免管理员）", MODE_PAC),
+                ("PAC 自动配置脚本（免管理员·免重启浏览器）", MODE_PAC_AUTO)):
+            self.combo_redirect_mode.addItem(_label, _value)
+        _cur = normalize_redirect_mode(cfg)
+        _i = self.combo_redirect_mode.findData(_cur)
+        if _i >= 0:
+            self.combo_redirect_mode.setCurrentIndex(_i)
+        self.combo_redirect_mode.currentIndexChanged.connect(self.on_redirect_mode_selected)
+        row_mode.addWidget(self.combo_redirect_mode)
+        d_layout.addLayout(row_mode)
+
         # 5.1c ★ PAC 免管理员方案 (2026-10-02): 把通配从 DNS 层挪到线路层
         #      为什么单列一行而不是塞进上面的开关: `--proxy-pac-url` 是**进程级**参数,
         #      无法靠写配置让已在运行的浏览器生效, 必须由本程序以该参数启动浏览器。
@@ -5546,9 +5586,57 @@ class MainWindow(QMainWindow):
                    duration=6000 if ok2 else 8000)
         self.refresh_pac_status_label()
 
+    def on_redirect_mode_selected(self, _index: int = 0):
+        """解析后端选择器: 四选一, 加速运行中即刻迁移, 未运行则随下次启动生效
+
+        与 `on_redirect_mode_toggled` (NRPT 开关) 是同一件事的两个入口 —— 两者都写
+        `redirect_mode` 并即刻重应用, 因此必须**互相同步**, 否则会出现
+        "开关显示 Hosts 而选择器显示 PAC" 的自相矛盾状态。
+        """
+        mode = self.combo_redirect_mode.currentData() or MODE_HOSTS
+        update_config_key("redirect_mode", mode)
+        # 同步旧开关 (它只表达 hosts/nrpt 二态)
+        if hasattr(self, "sw_redirect_nrpt"):
+            try:
+                self.sw_redirect_nrpt.blockSignals(True)
+                self.sw_redirect_nrpt.setChecked(mode == MODE_NRPT)
+                self.sw_redirect_nrpt.blockSignals(False)
+            except Exception:
+                pass
+        self.refresh_nrpt_status_label()
+        self.refresh_pac_status_label()
+
+        if mode in (MODE_PAC, MODE_PAC_AUTO):
+            # 免管理员后端: 顺带启动 PAC 服务并展示地址, 让用户知道下一步做什么
+            pass
+        if not (nginx_mgr.is_running() or self._is_redirect_active()):
+            show_toast(self, f"解析后端已设为 [{self.combo_redirect_mode.currentText()}]"
+                             f"（加速启动时生效）", toast_type="info", duration=2600)
+            return
+
+        cfg = load_config()
+        services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
+        ok, msg = self._apply_redirect(services)
+        self.refresh_nrpt_status_label()
+        self.refresh_pac_status_label()
+        if ok:
+            show_toast(self, f"已切换解析后端: {msg}", toast_type="success", duration=3200)
+        else:
+            show_toast(self, msg, toast_type="error", duration=5000)
+
     def on_redirect_mode_toggled(self, checked: bool):
         """切换加速域名的重定向后端, 加速运行中即刻迁移, 未运行则随下次启动生效"""
         update_config_key("redirect_mode", "nrpt" if checked else "hosts")
+        # 同步新的四选一选择器 (两者是同一件事的两个入口, 不同步会自相矛盾)
+        if hasattr(self, "combo_redirect_mode"):
+            try:
+                _i = self.combo_redirect_mode.findData(MODE_NRPT if checked else MODE_HOSTS)
+                if _i >= 0:
+                    self.combo_redirect_mode.blockSignals(True)
+                    self.combo_redirect_mode.setCurrentIndex(_i)
+                    self.combo_redirect_mode.blockSignals(False)
+            except Exception:
+                pass
         self.refresh_nrpt_status_label()
 
         if not (nginx_mgr.is_running() or self._is_redirect_active()):
