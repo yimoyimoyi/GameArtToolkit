@@ -56,7 +56,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # 44411 紧邻 ECH 段且当前空闲 —— 统一"4xxxx = 本地明文回环上游"的语义。
 PORT = 44411
 
-DEFAULT_CONNECT_TIMEOUT = 8.0
+DEFAULT_CONNECT_TIMEOUT = 4.0
+# 等**首个响应头**的预算 (握手已完成的阶段) —— 必须与 connect 档分开。
+#
+# 为什么从 8s 降到 4s (B3, 2026-10-02 节点测量定因, n=69 次定 IP 探测):
+#   成功者的**握手**极快: 中位 253ms / p90 320ms; 失败者**从不回应** (20s 大预算下
+#   仍无响应, 其中 5 次是"握手很快成功但服务端不答首头")。也就是说
+#   包内**不存在"握手慢但最终成功"的连续带** —— 8s 预算里有 7.x 秒纯粹是在等一个
+#   不会来的包。按 _forward 的真实模型 (hs<=cap 且 hdr<=cap) 反推, cap 3s→20s 的
+#   成功率是 19%→23%, 即放大预算只能多救 1/69。
+#   握手降到 4s 后: 失败路径的花费**减半**, 且 12s 的重试预算才容得下 2~3 次尝试
+#   (8s 档只容得下 1 次 —— 这正是"v6 抖一次就硬失败"的机制之一)。
+#   ⚠ 适用范围: 这个数值是按 **googlevideo** 实测定的, 而当前 `h3_upstream=True` 的画像
+#     **只有 googlevideo 一个** (见 service_profile), 所以腿的实际负载就是它。
+#     将来若有别的服务挂到这条腿上, 必须**重新实测**它的握手分布再决定是否共用这个值。
+DEFAULT_FIRST_BYTE_TIMEOUT = 8.0
+# 为什么首头仍留 8s 而**不**跟着降到 4s: 同一批实测里有**两个真实成功**的首头耗时
+# 达 5531ms 与 7162ms (rr4---sn-oji3bc-5n r1 / rr4---sn-4g5e6nzl r1) —— 那是 gvs
+# 服务端自己的慢, 不是建连问题。把这一档一起砍到 4s 会**丢掉这两次成功**;
+# 拆开两档就能只砍"等死地址"的成本, 不砍"等服务端"的耐心。
 DEFAULT_IDLE_TIMEOUT = 20.0
 # 流式目标 (SABR / 大文件) 的逐读静默上限。为什么必须显著大于 20s:
 # SABR 服务端在"播放器缓冲已满"时**合法地长时间不发数据**, 这正是它节流的实现方式。
@@ -141,7 +159,7 @@ _REASON = {
 # ===========================================================================
 @dataclass(frozen=True)
 class TimeoutBudget:
-    """一次请求-响应周期的超时预算 —— **三档拆开, 不再让一个数值身兼三职**
+    """一次请求-响应周期的超时预算 —— **四档拆开, 不再让一个数值身兼数职**
 
     为什么必须拆 (2026-10-02 代码审阅定因): 原先 `DEFAULT_CONNECT_TIMEOUT = 8.0` 同时充当
       (a) 建连超时、(b) 逐读空闲超时、(c) 外层 Future 上限 (`timeout×2+8` = 24 s)。
@@ -149,34 +167,91 @@ class TimeoutBudget:
     都会在 24 s 处抛 TimeoutError, 得到的是这个魔数的行为, 不是 SABR 的结论。
     (既有的"5/5 通过"之所以没暴露它: 端到端用例是 200 KB 文件与 206 切片, 全在 24 s 内完成。)
 
-    三档语义 (与项目已有的"服务级覆盖全局"先例同形, 见 `ServiceProfile.probe_timeout`):
-      connect      仅建连 + 等首个响应头 (保持较小, 让失活节点快速交棒)
+    四档语义 (与项目已有的"服务级覆盖全局"先例同形, 见 `ServiceProfile.probe_timeout`):
+      connect      仅**建连 (QUIC 握手)** 的预算 —— 保持很小, 让失活地址快速交棒
+      first_byte   握手完成后**等首个响应头**的预算 (与 connect 分开, 见常量注释:
+                   死地址卡在 connect 档, 而 gvs 服务端自己的慢需要更长的耐心)
       idle_read    两次数据之间允许的最大静默 (流式必须显著放大, 见 DEFAULT_STREAM_IDLE_READ)
       max_duration 整个周期上限; **None = 不设上限** (流式服务的正确取值)
+
+    ⚠ `first_byte` 必须是**最后一个**字段: 既有调用方按位置写
+    `TimeoutBudget(1.0, 300.0, None)`, 加在中间会静默改掉它们的语义。
     """
     connect: float = DEFAULT_CONNECT_TIMEOUT
     idle_read: float = DEFAULT_IDLE_TIMEOUT
     max_duration: Optional[float] = None
+    first_byte: float = DEFAULT_FIRST_BYTE_TIMEOUT
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"connect": self.connect, "idle_read": self.idle_read,
-                "max_duration": self.max_duration}
+        return {"connect": self.connect, "first_byte": self.first_byte,
+                "idle_read": self.idle_read, "max_duration": self.max_duration}
 
 
 def as_budget(value: "Optional[Union[float, TimeoutBudget]]",
               idle_read: Optional[float] = None,
-              max_duration: Optional[float] = None) -> TimeoutBudget:
+              max_duration: Optional[float] = None,
+              first_byte: Optional[float] = None) -> TimeoutBudget:
     """把旧的 `timeout: float` 形式兼容成 TimeoutBudget
 
     关键: 裸 float 只填 connect 与 idle_read, **max_duration 一律为 None** ——
     这正是移除"24 秒硬天花板"的那一步。传 float 的既有调用者不会再有总时长上限。
+
+    `first_byte` 的兼容规则 (2026-10-02 拆档时定):
+      · 显式传 float 的旧调用方 → `first_byte = connect`, 语义与拆档前**逐字一致**
+        (拆档前等首头用的正是 `budget.connect`), 不会有静默漂移;
+      · 未传 (value 为 None) → 两档各取模块默认 (connect=4s / first_byte=8s);
+      · 生产路径 (`H3UpstreamProxy`) 显式传一个 TimeoutBudget, 从而拿到同样的
+        connect=4s / first_byte=8s —— 新语义只进入**经过实测论证的那条路径**。
     """
     if isinstance(value, TimeoutBudget):
         return value
-    connect = DEFAULT_CONNECT_TIMEOUT if value is None else float(value)
+    if value is None:
+        connect = DEFAULT_CONNECT_TIMEOUT
+        fb = DEFAULT_FIRST_BYTE_TIMEOUT if first_byte is None else float(first_byte)
+    else:
+        connect = float(value)
+        # 旧调用方传的 float 只表达"建连超时"; 拆档前它兼任首头档, 这里保持等价。
+        fb = connect if first_byte is None else float(first_byte)
     return TimeoutBudget(connect=connect,
                          idle_read=float(idle_read) if idle_read else connect,
-                         max_duration=max_duration)
+                         max_duration=max_duration,
+                         first_byte=fb)
+
+
+def ip_family(ip: str) -> str:
+    """地址族标记: `"v6"` / `"v4"` —— 与 attempt_order 划分族的口径保持一致"""
+    return "v6" if ":" in str(ip) else "v4"
+
+
+def _describe_exc(exc: BaseException) -> str:
+    """异常 → 简短可读描述 (与拆档前日志格式 `类型: 消息` 保持一致)
+
+    `asyncio.TimeoutError` 的 str 是空串, 直接拼会得到 "TimeoutError: " 这种带尾冒号的
+    噪音, 这里统一收尾。
+    """
+    s = f"{type(exc).__name__}: {exc}".strip()
+    return s.rstrip(":") or type(exc).__name__
+
+
+class UpstreamStageError(Exception):
+    """带上失败**阶段**的上游错误 —— B1 需要它来区分"握手失败"与"首头失败"
+
+    为什么这个区分是必须的 (2026-10-02 节点测量, n=69):
+      · **握手阶段**失败 ⇒ 该地址**整个不可达** (UDP 没有 RST, 打到死地址只会静默
+        丢包)。实测这种失败是**按地址族整体成立**的: 42 个 v4 样本只成功 2 个,
+        且 9 个节点里 7 个的 v4 候选是 3/3 全失败 ⇒ 可以据此跳过同族其余地址。
+      · **首头阶段**失败 ⇒ **不能**据此推断整个族: 实测同一 (IP, SNI) 在 ~30s 内
+        既成又败 (rr5---sn-ajaig5-5h 直探 0/9, 生产路径同一 IP 2/3 成功),
+        属分钟级抖动。
+    """
+
+    STAGE_HANDSHAKE = "handshake"
+    STAGE_HEADERS = "headers"
+
+    def __init__(self, stage: str, detail: str):
+        super().__init__(detail)
+        self.stage = stage
+        self.detail = detail
 
 
 def read_request_body(headers_get, rfile, max_bytes: int = MAX_REQUEST_BODY,
@@ -599,9 +674,12 @@ class H3Forwarder:
         #   两件事必须分开: **握手**用 connect 档限时, **已建连后的静默**用 idle_read 档。
         try:
             proto = await asyncio.wait_for(self._get_conn(ip, sni), timeout=budget.connect)
-        except Exception:
+        except Exception as e:
             self.stats["errors"] += 1
-            raise
+            # 打上"握手阶段"标记: forward() 据此判定**该地址族**在本轮不可达并跳过同族
+            # 其余地址 (见 UpstreamStageError)。消息保持与拆档前逐字一致, 便于比对日志。
+            raise UpstreamStageError(UpstreamStageError.STAGE_HANDSHAKE,
+                                     _describe_exc(e)) from e
 
         try:
             sid = proto._quic.get_next_available_stream_id()
@@ -619,17 +697,21 @@ class H3Forwarder:
                     proto.h3.send_data(sid, body, end_stream=True)
                 proto.transmit()
 
-                # 等首个响应头: 用 connect 档 (保持较小, 失活节点快速交棒)。
-                # **不再**用同一个数值兼作整周期上限 —— 见 TimeoutBudget 注释。
-                deadline = time.perf_counter() + budget.connect
+                # 等首个响应头: 用 **first_byte 档**(握手已单独限时)。
+                # 拆档理由见 DEFAULT_FIRST_BYTE_TIMEOUT: 死地址卡在握手, 而 gvs 服务端
+                # 自己的慢 (实测两次真实成功要 5.5s / 7.2s) 需要更长的耐心。
+                deadline = time.perf_counter() + budget.first_byte
                 status: Optional[int] = None
                 resp_headers: List[Tuple[bytes, bytes]] = []
                 while status is None:
                     if time.perf_counter() > deadline or proto.terminated.is_set():
-                        # 还没写任何东西 → 抛出去让 forward() 换下一个节点
+                        # 还没写任何东西 → 抛出去让 forward() 换下一个节点。
+                        # ⚠ 标记为**首头阶段**: 这**不能**用来推断整个地址族不可达。
                         self.stats["errors"] += 1
                         self.events.add("upstream_no_response", f"{ip} {path.split('?')[0][:40]}")
-                        raise ConnectionError(f"{ip}: upstream_no_response")
+                        raise UpstreamStageError(
+                            UpstreamStageError.STAGE_HEADERS,
+                            f"{ip}: upstream_no_response")
                     try:
                         ev = await asyncio.wait_for(q.get(), timeout=0.5)
                     except asyncio.TimeoutError:
@@ -708,7 +790,7 @@ class H3Forwarder:
     def forward(self, host: str, method: str, path: str,
                 headers: Sequence[Tuple[str, str]], body: bytes,
                 out: "queue.Queue",
-                timeout: "Optional[Union[float, TimeoutBudget]]" = DEFAULT_CONNECT_TIMEOUT,
+                timeout: "Optional[Union[float, TimeoutBudget]]" = None,
                 idle_read: Optional[float] = None,
                 max_duration: Optional[float] = None,
                 retries: Optional[int] = None) -> None:
@@ -730,8 +812,17 @@ class H3Forwarder:
              ⇒ 需要**重解析再试一遍**(见下方第二轮)。
         这两条都不依赖 DNS 稳定, 因此对"通道分钟级时变"是正向收益。
 
-        超时: `timeout` 兼容旧的裸 float; 三档预算见 TimeoutBudget。
+        超时: `timeout` 兼容旧的裸 float; 四档预算见 TimeoutBudget。
         **裸 float 不再产生"整周期硬上限"** —— max_duration 默认 None。
+
+        **B1 (2026-10-02 节点测量): 某族首个地址在握手阶段失败后, 本轮跳过该族其余地址。**
+        为什么: 实测 42 个 v4 样本只成功 2 个, 且 9 个节点里 7 个的 v4 候选是 3/3 全失败,
+        即"族级不可达"是**整体成立**的; 而候选集里常见 2~4 个同族地址, 逐个等满
+        connect 档纯属重复付账 (`attempt_order` 的 limit 就是 4)。
+        ⚠ 跳过**按轮**生效, 不跨轮继承: 一轮 = 一份 DNS 快照, 重解析是"再问一次世界变了没",
+        拿到新快照就该重新给该族机会 (实测 v6 会在 ~30s 内又从死转活)。
+        ⚠ 只跳过**同族**, 绝不跳过别的族 —— googlevideo 只有 v6 通、Cloudflare 只有 v4 通,
+        把"首族失败"推广成"全都别试"会把可用目标整个弄坏。
         """
         budget = as_budget(timeout, idle_read=idle_read, max_duration=max_duration)
         retries = self.retries if retries is None else int(retries)
@@ -755,6 +846,8 @@ class H3Forwarder:
         t_start = time.perf_counter()
         # 两轮: 第 0 轮用初始候选, 第 1 轮**重解析**(DoH 答案时变, 单候选时尤其需要)
         for rnd in range(2):
+            # B1 的族级失效集合 —— **每轮重置** (见 docstring: 一轮 = 一份 DNS 快照)
+            dead_families: set = set()
             if rnd == 0:
                 cands = [ip for ip in attempt_order(ips) if ip not in tried]
             else:
@@ -770,6 +863,11 @@ class H3Forwarder:
                 if not cands:
                     break
             for ip in cands:
+                if ip_family(ip) in dead_families:
+                    self.events.add(
+                        "family_skipped",
+                        f"{ip} 同族 ({ip_family(ip)}) 本轮已有地址握手失败, 跳过")
+                    continue
                 for attempt in range(retries + 1):
                     # 两道闸门 (见 RETRY_TIME_BUDGET 注释): 次数上限 + 墙钟预算。
                     # 只靠次数挡不住长尾 —— 6×8s=48s 仍太久; 流式协议要的是
@@ -803,10 +901,24 @@ class H3Forwarder:
                                             f"{authority} 第 {attempts} 次尝试成功 ({ip})")
                         return
                     except Exception as e:         # 未写入任何内容 -> 可以再试
-                        last_err = f"{type(e).__name__}: {e}".strip().rstrip(":")
+                        # 阶段标记优先: 拆档后 _forward 会抛 UpstreamStageError, 它的
+                        # detail 已是"类型: 消息"形式, 再加一层类型前缀只会变成噪音。
+                        last_err = (e.detail if isinstance(e, UpstreamStageError)
+                                    else _describe_exc(e))
                         self.events.add(
                             "target_failed",
                             f"{ip} try{attempt + 1}/{retries + 1} rnd{rnd} {last_err}")
+                        # B1: 只有**握手阶段**失败才说明该地址族整体不可达 (见
+                        # UpstreamStageError 注释); 首头阶段失败在**可用**地址上也会发生,
+                        # 拿它推断整个族会把抖动误判成死族。
+                        if getattr(e, "stage", None) == UpstreamStageError.STAGE_HANDSHAKE:
+                            fam = ip_family(ip)
+                            if fam not in dead_families:
+                                dead_families.add(fam)
+                                self.events.add(
+                                    "family_unreachable",
+                                    f"{authority} {fam} 首个地址 {ip} 握手失败, "
+                                    f"本轮跳过同族其余地址")
                         try:
                             fut.cancel()           # 让 _forward 在 await 点收到 CancelledError
                         except Exception:
@@ -882,7 +994,8 @@ class H3Forwarder:
 # ===========================================================================
 # HTTP/1.1 回环服务 (nginx 的明文上游入口)
 # ===========================================================================
-def make_handler(forwarder: H3Forwarder, timeout: float):
+def make_handler(forwarder: H3Forwarder,
+                 timeout: "Union[float, TimeoutBudget]"):
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "GameArtH3Upstream/1.0"
@@ -1064,7 +1177,8 @@ class H3UpstreamProxy:
                  target_port: int = 443,
                  idle_read: float = DEFAULT_STREAM_IDLE_READ,
                  max_duration: Optional[float] = None,
-                 retries: int = DEFAULT_RETRY_SAME_NODE):
+                 retries: int = DEFAULT_RETRY_SAME_NODE,
+                 first_byte: Optional[float] = None):
         self.port = port
         self.host = host
         self.timeout = timeout
@@ -1074,6 +1188,15 @@ class H3UpstreamProxy:
         self.idle_read = idle_read
         self.max_duration = max_duration
         self.retries = int(retries)
+        # 生产路径显式给出**拆档**后的预算 (connect=握手 / first_byte=等首头)。
+        # 为什么在这里构造而不是让 as_budget 从裸 float 推: 见 as_budget 的兼容规则 ——
+        # 旧调用方传 float 时必须保持"first_byte == connect"的逐字语义, 而新语义
+        # (握手 4s / 首头 8s) 只应进入**经过实测论证的这条生产路径**。
+        self.budget = TimeoutBudget(
+            connect=float(timeout), idle_read=float(idle_read),
+            max_duration=max_duration,
+            first_byte=(DEFAULT_FIRST_BYTE_TIMEOUT if first_byte is None
+                        else float(first_byte)))
         self.forwarder = H3Forwarder(resolver or default_resolver, sni_for, timeout,
                                      idle_timeout=idle_read,
                                      target_port=target_port, retries=retries)
@@ -1091,7 +1214,7 @@ class H3UpstreamProxy:
             return True, "已在运行"
         try:
             self._httpd = ThreadingHTTPServer(
-                (self.host, self.port), make_handler(self.forwarder, self.timeout))
+                (self.host, self.port), make_handler(self.forwarder, self.budget))
             self._httpd.daemon_threads = True
             self._thread = threading.Thread(target=self._httpd.serve_forever,
                                             name="h3-upstream-http", daemon=True)
@@ -1322,9 +1445,18 @@ ALIAS_SUFFIXES = ("gvt1.com", "snap.gvt1.com", "bdn.dev", "gcpcdn.gvt1.com")
 _DNS_POISON_PREFIX = ("157.240.", "31.13.", "2a03:2880", "162.125.", "65.49.",
                       "104.244.", "108.160.", "59.24.",
                       # —— 2026-10-02 实测补入 ——
+                      # ⚠ 下面四条刻意写成**整个 /16**, 而不是实测到的那个 /24。
+                      # 第二次实测 (node_reach_measure.py, 同一批节点名重查) 拿到的是
+                      # **同段内的另一个取值**: 128.242.245.157 / 199.96.63.177 /
+                      # 199.59.148.247 / 185.60.216.169 —— 而当时表里写的是
+                      # 128.242.240. / 199.96.62. / 199.59.149. / (无), 于是**四条全部漏过**,
+                      # 其中 rr2---sn-i3b7kns1 因此被解析到 Facebook 地址并白烧 71.9s。
+                      # 投毒取值在段内轮换, 按 /24 精确拉黑等于每轮换一次就漏一次。
+                      # 与 cdn_optimizer.POLLUTED_IP_PREFIXES 的粒度保持一致 (那边本来就是 /16)。
+                      "128.242.", "199.96.", "199.59.", "185.60.216.",
                       "2001::1", "2001:0:",
-                      "185.45.", "174.132.", "128.242.240.", "192.133.77.",
-                      "199.96.62.", "69.171.235.", "199.59.149.")
+                      "185.45.", "174.132.", "192.133.77.",
+                      "69.171.235.")
 
 # Google 自有网段 (公开段 + 本次实测用到的段)。用途不是"硬门槛"而是**优先信号**:
 # 投毒应答的取值是无穷的, 逐个拉黑是打地鼠; 而"真 Google 边缘必然落在 Google 段内"
@@ -1375,8 +1507,65 @@ def prefer_google(ips: List[str]) -> List[str]:
     return good if good else ips
 
 
+# 只能整段拉黑的投毒取值所在网段 (与具体取值无关)
+_POISON_NET_CIDRS = ("2001::/32",)      # Teredo: 真 CDN 永远不会用隧道段
+_POISON_NETS = None
+
+
+def _poison_nets():
+    global _POISON_NETS
+    if _POISON_NETS is None:
+        import ipaddress
+        nets = []
+        for c in _POISON_NET_CIDRS:
+            try:
+                nets.append(ipaddress.ip_network(c))
+            except Exception:
+                pass
+        _POISON_NETS = nets
+    return _POISON_NETS
+
+
+# googlevideo 节点家族的名字域 (含实测用到的**别名域** —— 节点名在别名域上解析最干净)
+_GVS_FAMILY_SUFFIXES = (".googlevideo.com", ".gvt1.com", ".bdn.dev",
+                        ".c.youtube.com")
+# 节点名形态: rr1---sn-i3b7kns6 / rr5---sn-ajaig5-5h (也接受 rr1.sn-… 这类写法)
+_GVS_NODE_RE = None
+
+
+def is_gvs_family_host(host: str) -> bool:
+    """该请求目标是否属于 googlevideo 节点家族 —— 是则解析结果**必须**落在 Google 段
+
+    为什么必须与普通 h3 目标分开处理 (2026-10-02 节点测量定因):
+      对普通 h3 目标 (Cloudflare / Fastly / unpkg 自测) 非 Google 地址是**正常**的,
+      套上"必须 Google 段"会把它整个弄坏;
+      而 GVS 节点是 Google **自建**边缘, 不存在第三方承载 —— 因此对这类名字,
+      任何非 Google 段的应答都**必然**是投毒注入, 可以放心硬淘汰。
+    实测依据: 9 个节点名 × 5 个来源, 4 个别名域对 8/9 个节点一致返回 Google 段地址,
+    唯一例外 (rr2---sn-i3b7kns1) 是别名域全部为空、只剩被投毒的 apex 应答。
+    """
+    global _GVS_NODE_RE
+    import re
+    h = strip_port(host).lower().rstrip(".")
+    if h.endswith(_GVS_FAMILY_SUFFIXES):
+        return True
+    if _GVS_NODE_RE is None:
+        _GVS_NODE_RE = re.compile(r"^rr\d+[.-]+sn-[a-z0-9-]+$")
+    return bool(_GVS_NODE_RE.match(h.split(".", 1)[0]))
+
+
 def is_poisoned(ip: str) -> bool:
-    return "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX)
+    if "face:b00c" in ip or any(ip.startswith(p) for p in _DNS_POISON_PREFIX):
+        return True
+    # Teredo 隧道段 2001::/32: 实测两个投毒取值 2001::1 与 2001::67d6:a86a 都落在段内。
+    # 必须按**段**判定, 不能用字面前缀: 写 "2001::1" 挡不住同段其他取值 (实测漏掉
+    # 2001::67d6:a86a), 而写泛化的 "2001:" 又会误杀 Google 真实的 2001:4860::/32。
+    try:
+        import ipaddress
+        a = ipaddress.ip_address(str(ip).strip())
+        return any(a.version == n.version and a in n for n in _poison_nets())
+    except Exception:
+        return False
 
 
 def _doh(name: str, qtype: str, timeout: float = 4.0) -> List[str]:
@@ -1426,11 +1615,17 @@ def default_resolver(host: str) -> List[str]:
       - 而 Cloudflare 等目标反过来常常只有 IPv4 可达 (本机实测 CF 的 IPv6 全超时)。
     两者都返回, 由调用方按序尝试 —— 这样同一个上游腿既能服务 googlevideo,
     也能服务普通 h3 目标 (自测/对照用)。
+
+    **GVS 节点家族走"必须 Google 段"的硬判据** (见 is_gvs_family_host):
+    这类名字的非 Google 应答必然是投毒, 留着它只会让腿把 connect 预算烧在一个
+    永远不答的地址上 (实测 rr2---sn-i3b7kns1 拿到 Facebook 地址 → 3/3 失败,
+    71.9s 纯白烧)。宁可返回空、让上层**快速如实失败**, 也不要拿投毒地址去试。
     """
     node = node_name_from_host(host)
     if not node:
         return []
     target = strip_port(host)
+    strict = is_gvs_family_host(target)
     if target.endswith(ALIAS_SUFFIXES):
         names = [target]
     else:
@@ -1443,10 +1638,18 @@ def default_resolver(host: str) -> List[str]:
             v6 = _doh(name, "AAAA")
         if not v4:
             v4 = _doh(name, "A")
-        if v6 or v4:
+        if strict:
+            # 只有**真的**拿到 Google 段地址才收工。否则继续换下一个名字 ——
+            # 若在这里按"有应答就 break", 一个投毒应答就会把后面的别名域/apex 全部截断。
+            if any(is_google_edge_ip(ip) for ip in v6 + v4):
+                break
+        elif v6 or v4:
             break
     if v6 or v4:
-        return v6 + v4
+        cand = v6 + v4
+        if strict:
+            cand = [ip for ip in cand if is_google_edge_ip(ip)]
+        return cand
 
     # 兜底: 系统解析 (可能被投毒, 已过滤), 同样 IPv6 优先
     try:
@@ -1459,9 +1662,11 @@ def default_resolver(host: str) -> List[str]:
                         bucket.append(ip)
             except Exception:
                 continue
-        # 系统解析最容易拿到投毒应答, 因此这一路更要把 Google 段排到前面
-        # (2026-10-02 实测: 未排序时 www.youtube.com 拿到 2001::1 + 174.132.167.252 两个投毒值)
-        return prefer_google(list(dict.fromkeys(out6))) + prefer_google(list(dict.fromkeys(out4)))
+        out = (prefer_google(list(dict.fromkeys(out6)))
+               + prefer_google(list(dict.fromkeys(out4))))
+        if strict:
+            out = [ip for ip in out if is_google_edge_ip(ip)]
+        return out
     except Exception:
         return []
 
