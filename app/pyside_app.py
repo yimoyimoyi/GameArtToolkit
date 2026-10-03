@@ -17,6 +17,9 @@ import base64
 import random
 import atexit
 import threading
+# 自愈预算用上下文管理器表达 (§watchdog_repair): 三条修复路径的写法必须完全一致,
+# 否则"某一条忘了判断"就又回到无限重启循环。
+import contextlib
 from pathlib import Path
 from typing import Optional, List, Dict, Set, Tuple, Any
 
@@ -1053,6 +1056,97 @@ class ToolHubCard(QFrame):
             event.accept()
         else:
             super().mousePressEvent(event)
+
+
+class WatchdogRepairBudget:
+    """自愈预算: 固定窗口内的修复次数上限 (缺陷 W5, 2026-10-04)
+
+    为什么必须有: 看门狗每 8 秒巡检一次, 而对 ECH 隧道 / h3 腿 / NRPT 解析器三条
+    路径**无条件重启**。若某个组件因为环境原因起不来 (端口被占、DoH 不可达、权限
+    不足), 就会形成**无限重启循环** —— 每 8 秒拉起一次、失败一次、再拉起; 用户机器
+    被持续打扰, 且**永远等不到一句"这条路走不通"**。
+
+    判据: **一次失败是事件, 反复失败是打斗**。
+      · 一次崩溃/被强杀是事件, 修它是对的, 一小时后修也是对的;
+      · 要限制的是"起来多快就死多快" —— 此时每次修复立刻被推翻, 继续修只是在花机器
+        的时间把这件事瞒着用户。诚实的结局是**停下来、说出来**。
+    用固定窗口而不是滑动窗口: 要回答的问题是"这是不是一场风暴", 一个在安静窗口后
+    重置的计数就能回答, 不必保存历史。
+
+    **刻意做成模块级纯对象而不是窗口的方法**: 决策逻辑不该依赖 Qt 窗口能否构造,
+    否则它只能靠"起一个假窗口"来测 —— 而那正是本项目 UI 测试的痛点。把 `now` 做成
+    参数而不是内部读时钟, 也让窗口边界可以被精确断言。
+    """
+
+    def __init__(self, max_repairs: int = 5, window_sec: float = 60.0,
+                 on_exhausted=None):
+        self.max_repairs = int(max_repairs)
+        self.window_sec = float(window_sec)
+        self.on_exhausted = on_exhausted
+        self._state: Dict[str, Tuple[float, int]] = {}
+        self._told: Set[str] = set()
+
+    def allow(self, key: str, now: float) -> bool:
+        """本窗口内是否还允许对 `key` 做一次修复; 耗尽时**只回调一次**
+
+        `key` 用组件名 (ech / h3 / nrpt), 使三条路径各有独立预算 —— 一条路走不通
+        不该耗尽另一条的额度。
+        """
+        win_start, used = self._state.get(key, (None, 0))
+        if win_start is None or (now - win_start) >= self.window_sec:
+            self._state[key] = (now, 1)
+            self._told.discard(key)
+            return True
+        if used >= self.max_repairs:
+            if key not in self._told:
+                self._told.add(key)
+                if self.on_exhausted is not None:
+                    try:
+                        self.on_exhausted(key, used)
+                    except Exception:
+                        pass
+            return False
+        self._state[key] = (win_start, used + 1)
+        return True
+
+
+# 每个实例一份预算 (用 id(owner) 作键: 不强求宿主对象有 __dict__, 于是"假窗口"
+# 测试替身也能走同一条代码路径 —— 本项目 UI 测试长期靠替身驱动真实逻辑)。
+# 常量放在模块级: 类属性与下面的告警文案必须引用**同一个数字**, 不允许各写一份。
+WATCHDOG_REPAIR_MAX = 5              # 窗口内允许的修复次数上限 (与参考实现 5 次/60s 同量级)
+WATCHDOG_REPAIR_WINDOW_SEC = 60.0    # 固定窗口长度 (秒)
+_WATCHDOG_BUDGETS: Dict[int, "WatchdogRepairBudget"] = {}
+
+
+def _watchdog_budget_allow(owner, key: str, now: float) -> bool:
+    """看门狗自愈的预算闸门 (模块级, 缺陷 W5)
+
+    为什么是模块级函数而不是 owner 的方法: 三条自愈路径必须能在**任意宿主对象**上
+    跑同一条逻辑。做成方法就得要求宿主有那个方法, 于是所有 UI 测试替身都要跟着补
+    —— 而"测试替身跟不上真实接口"正是本项目 UI 测试反复失效的原因之一。
+    """
+    b = _WATCHDOG_BUDGETS.get(id(owner))
+    if b is None:
+        def _exhausted(k: str, used: int) -> None:
+            names = {"ech": "ECH 隧道", "h3": "h3 上游腿", "nrpt": "本机 DNS 解析器"}
+            label = names.get(k, k)
+            print(f"[Watchdog] {label} 在 {WATCHDOG_REPAIR_WINDOW_SEC:.0f}s 内已修复 "
+                  f"{used} 次仍未稳定, 停止自愈 (这不是自愈能解决的问题)")
+            try:
+                owner.notify_tray(
+                    "自愈已停止",
+                    f"{label} 在 {WATCHDOG_REPAIR_WINDOW_SEC:.0f} 秒内反复失败 {used} 次，"
+                    f"已停止自动重启以免无休止打扰。\n"
+                    f"请检查该组件依赖的端口 / 网络 / 权限，或手动重启本程序。",
+                    QSystemTrayIcon.Warning, 8000)
+            except Exception:
+                pass
+
+        b = WatchdogRepairBudget(max_repairs=WATCHDOG_REPAIR_MAX,
+                                 window_sec=WATCHDOG_REPAIR_WINDOW_SEC,
+                                 on_exhausted=_exhausted)
+        _WATCHDOG_BUDGETS[id(owner)] = b
+    return b.allow(key, now)
 
 
 class MainWindow(QMainWindow):
@@ -5287,6 +5381,40 @@ class MainWindow(QMainWindow):
             self.lbl_port_detail.setText("端口状态: 80 (HTTP) 与 443 (HTTPS) 正常就绪")
             self.lbl_port_detail.setStyleSheet(f"font-size: 12px; color: {success_val_c};")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # 自愈预算接线 (缺陷 W5, 2026-10-04) —— 决策逻辑在模块级 WatchdogRepairBudget,
+    # 常量也在模块级 (WATCHDOG_REPAIR_MAX / _WINDOW_SEC), 这里不另写一份。
+    # ══════════════════════════════════════════════════════════════════════════
+    def watchdog_repair_allowed(self, key: str, now: Optional[float] = None) -> bool:
+        """本窗口内是否还允许对 `key` 做一次自愈 (纯粹委托, 不依赖 Qt)"""
+        return _watchdog_budget_allow(self, key, time.time() if now is None else float(now))
+
+    def _heal_nrpt_resolver(self, reason: str) -> bool:
+        """NRPT 解析器无法监听时撤规则回退 Hosts (受自愈预算约束, 见 §watchdog_repair)
+
+        走的就是既有的 `_remove_redirect` 路径, 不另写一套撤规则逻辑 ——
+        撤规则涉及 hosts / NRPT / PAC / 系统代理四处, 必须只有一个实现。
+        """
+        try:
+            self._remove_redirect()
+            ok = True
+            msg = "已撤除重定向规则"
+        except Exception as e:
+            ok, msg = False, f"{type(e).__name__}: {e}"
+        if ok:
+            print(f"[Watchdog] NRPT 解析器异常 ({reason}), {msg}")
+        else:
+            print(f"[Watchdog] NRPT 解析器异常 ({reason}), 撤除规则失败: {msg}")
+        try:
+            self.notify_tray(
+                "解析器异常",
+                f"本机解析器无法监听 53 ({reason})，已{'撤除' if ok else '尝试撤除'} NRPT 规则"
+                f"{'。' if ok else '但未成功，请手动检查。'}",
+                QSystemTrayIcon.Warning, 4000)
+        except Exception:
+            pass
+        return ok
+
     def watchdog_auto_heal(self):
         if getattr(self, "_startup_flow_in_progress", False):
             return
@@ -5300,14 +5428,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 dns_alive = False
             if not dns_alive:
+                if not _watchdog_budget_allow(self, "nrpt", time.time()):
+                    return
                 ok, msg = local_dns_server.ensure_bind(NRPT_DNS_PORT)
                 if ok:
                     print(f"[Watchdog] NRPT 解析器已恢复监听 53: {msg}")
                 else:
                     print(f"[Watchdog] NRPT 解析器无法监听 53 ({msg}), 撤除规则回退 Hosts")
-                    self._remove_redirect()
-                    self.notify_tray("解析器异常", f"本机解析器无法监听 53 ({msg})，已撤除 NRPT 规则。",
-                                     QSystemTrayIcon.Warning, 4000)
+                    self._heal_nrpt_resolver(msg)
                     return
 
         # ECH 隧道存活兜底: 上游已指向隧道 (upstream-dynamic.conf 里写着 127.0.0.1:<隧道端口>)
@@ -5321,6 +5449,8 @@ class MainWindow(QMainWindow):
         except Exception:
             ech_in_use = False
         if ech_in_use and not ech_tunnel.is_running():
+            if not _watchdog_budget_allow(self, "ech", time.time()):
+                return
             ok, msg = self._start_ech_tunnel()
             print(f"[Watchdog] ECH 隧道未运行, 已尝试重启: {ok} {msg}")
             if ok:
@@ -5342,6 +5472,8 @@ class MainWindow(QMainWindow):
         except Exception:
             h3_in_use = False
         if h3_in_use and not h3_proxy.is_healthy():
+            if not _watchdog_budget_allow(self, "h3", time.time()):
+                return
             ok, msg = self._start_h3_upstream()
             print(f"[Watchdog] h3 上游腿未就绪, 已尝试重启: {ok} {msg}")
             if ok:
