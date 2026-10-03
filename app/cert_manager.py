@@ -235,6 +235,9 @@ class CertManager:
         self._cached_thumbprint: Optional[str] = None
         self._cached_installed: Optional[bool] = None
         self._last_harden_report: Dict[str, Any] = {}
+        # `http.sslBackend` 被我们覆盖前的原值 (缺陷 W9, 2026-10-04)。
+        # None = "还没注入过/不知道原值"; "" = 原本未设置该键 (还原时应 unset)。
+        self._git_sslbackend_backup: Optional[str] = None
 
     def _ensure_dirs(self):
         """确保证书输出目录存在, 并把目录 ACL 先收紧
@@ -1028,10 +1031,33 @@ class CertManager:
         report["message"] = "; ".join(parts)
         return report
 
+    def _git_global_get(self, key: str) -> Optional[str]:
+        """读一个 git 全局配置值; 未设置/读不到/无 git 一律返回 None"""
+        try:
+            r = subprocess.run(
+                ["git", "config", "--global", "--get", key],
+                capture_output=True, text=True, timeout=2, shell=False,
+                errors="replace", **get_silent_startup_kwargs()
+            )
+            if r.returncode == 0:
+                return (r.stdout or "").strip() or None
+        except Exception:
+            pass
+        return None
+
     def inject_dev_environments(self) -> bool:
-        """为 Git / Node.js 等开发工具挂载作用域证书 (仅针对 GitHub / GitLab 域名生效)"""
+        """为 Git / Node.js 等开发工具挂载作用域证书 (仅针对 GitHub / GitLab 域名生效)
+
+        ⚠ `http.sslBackend` 会被**覆盖**(不是新增), 所以注入前必须记下用户原值
+        (缺陷 W9, 2026-10-04)。原实现直接写 `schannel` 且退出时**从不还原**,
+        于是用户自己的 `sslBackend` 设置被永久改掉 —— 这属于"改变了用户全部 Git
+        仓库的行为"却没有留退路。两个 `sslCAInfo` 是**新增**的键, 卸载即可, 无需备份。
+        """
         try:
             cer_str = str(self.cer_path.resolve()).replace("\\", "/")
+            # 0. 记下被覆盖的那个键的原值 (None = 原本未设置 ⇒ 还原时应当 unset)
+            if self._git_sslbackend_backup is None:
+                self._git_sslbackend_backup = self._git_global_get("http.sslBackend") or ""
             # 1. 配置 Git 优先使用 SChannel (原生读取 Windows 根证书库)
             subprocess.run(
                 ["git", "config", "--global", "http.sslBackend", "schannel"],
@@ -1053,7 +1079,15 @@ class CertManager:
             return False
 
     def restore_dev_environments(self) -> bool:
-        """清理开发工具的证书注入 (退出时调用)"""
+        """清理开发工具的证书注入 (退出/卸载时调用)
+
+        `http.sslBackend` 按注入前记下的原值还原 (缺陷 W9, 2026-10-04):
+          · 有备份且原值非空  -> 写回原值;
+          · 有备份且原值为空  -> unset (原本没设过这个键);
+          · **没有备份** (例如卸载路径: 清理发生在新进程里, 内存备份自然不存在)
+            -> 只有当现值确实是**我们写的** `schannel` 时才 unset。绝不无条件 unset ——
+            那会把用户自己主动设的 `openssl`/`schannel` 一起抹掉, 把"还原"做成新的破坏。
+        """
         try:
             subprocess.run(
                 ["git", "config", "--global", "--unset-all", "http.https://github.com.sslCAInfo"],
@@ -1063,6 +1097,31 @@ class CertManager:
                 ["git", "config", "--global", "--unset-all", "http.https://gitlab.com.sslCAInfo"],
                 capture_output=True, timeout=2, shell=False, **get_silent_startup_kwargs()
             )
+
+            # ── http.sslBackend 的还原 ──────────────────────────────────────
+            backup = self._git_sslbackend_backup
+            if backup is not None:
+                if backup:
+                    subprocess.run(
+                        ["git", "config", "--global", "http.sslBackend", backup],
+                        capture_output=True, timeout=2, shell=False,
+                        **get_silent_startup_kwargs()
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "config", "--global", "--unset-all", "http.sslBackend"],
+                        capture_output=True, timeout=2, shell=False,
+                        **get_silent_startup_kwargs()
+                    )
+                self._git_sslbackend_backup = None
+            elif self._git_global_get("http.sslBackend") == "schannel":
+                # 无备份但现值是我们的值 ⇒ 安全地收回它
+                subprocess.run(
+                    ["git", "config", "--global", "--unset-all", "http.sslBackend"],
+                    capture_output=True, timeout=2, shell=False,
+                    **get_silent_startup_kwargs()
+                )
+
             os.environ.pop("NODE_EXTRA_CA_CERTS", None)
             return True
         except Exception:

@@ -6148,8 +6148,85 @@ def show_already_running_message() -> None:
         pass
 
 
+def _uninstall_cleanup() -> None:
+    """卸载前的一次性清理 (缺陷 W7, 2026-10-04)
+
+    覆盖六处残留, 每一处都复用**已经过测试**的代码路径而不是新写一套:
+      1. 系统代理 (AutoConfigURL / ProxyEnable / ProxyServer / ProxyOverride) ——
+         `redirect_manager` 的还原路径, 含读回校验;
+      2. Hosts 规则块;
+      3. NRPT 规则 (若用户用过该模式);
+      4. 自签根证书 (两张存储都要摘) —— `cert_manager.uninstall_cert()`;
+      5. 自启计划任务 / 启动文件夹快捷方式 / 旧 Run 键 —— `set_autostart(False)`;
+      6. `git config --global` 的改写 —— `restore_dev_environments()`。
+
+    顺序刻意固定: **先摘信任根与系统级状态, 再谈文件**。因为卸载器紧接着就会删
+    `{app}` 目录 (含 `nginx/ca`), 而信任库里的根**不会随文件消失** —— 删了私钥却把
+    一个受信任签发者留在机器上, 是最难让用户自己查清的一类残留。
+
+    每一步独立 try/except 且**逐条打印**: 卸载是不可重来的动作, 一条失败不应该
+    让其余五条一起不执行; 同时用户/支持人员需要知道到底哪一条没成功。
+    """
+    def _step(label: str, fn) -> None:
+        try:
+            fn()
+        except Exception as e:
+            print(f"[UninstallCleanup] {label} 失败: {type(e).__name__}: {e}")
+
+    # 1+2+3. 重定向 (系统代理 / Hosts / NRPT)。
+    # 用 cleanup_orphans 而不是 fast_remove_redirect: 它才是"把机器还原"的那条路径
+    # (包含系统代理还原与落盘备份清理), 且已有回归测试守着它的语义。
+    def _redirect() -> None:
+        from redirect_manager import cleanup_orphans
+        res = cleanup_orphans(load_config(), hosts_mgr, nrpt_mgr, local_dns_server,
+                              data_plane_alive=False)
+        print(f"[UninstallCleanup] 重定向: {res.get('detail', '')}"
+              + (f" | 系统代理: {res.get('proxy_detail')}" if res.get("proxy_detail") else ""))
+    _step("重定向还原", _redirect)
+
+    # 4. 信任根。必须在删文件之前 —— 名字来自 cert_manager 的自有 CN 白名单。
+    def _certs() -> None:
+        ok, msg = cert_mgr.uninstall_cert()
+        print(f"[UninstallCleanup] 证书: {msg}")
+        if not ok:
+            print("[UninstallCleanup] ⚠ 证书未完全摘除, 请手工检查受信任根存储")
+    _step("摘除自签根", _certs)
+
+    # 5. 自启 (计划任务 + 启动文件夹快捷方式 + 旧 Run 值)。
+    # 漏掉这一步的后果是"卸载了但每次登录仍会静默启动一个已经不存在的程序",
+    # 或更糟: 任务还在、exe 已被删, 每次登录报一次错。
+    def _autostart() -> None:
+        from win_utils import set_autostart
+        ok, msg = set_autostart(False)
+        print(f"[UninstallCleanup] 自启: {msg}")
+    _step("移除自启", _autostart)
+
+    # 6. git 全局配置。原先只 unset 两个域级 sslCAInfo, 其余改写永不还原。
+    def _git() -> None:
+        cert_mgr.restore_dev_environments()
+        print("[UninstallCleanup] git 全局配置: 已尝试还原")
+    _step("还原 git 配置", _git)
+
+
 def main():
     # 0. 命令行极速静默响应 (安装包/卸载器/脚本调用，无界面 0.1s 极速还原)
+    if "--clean-all-silent" in sys.argv:
+        # ★ 卸载专用一次性清理 (缺陷 W7, 2026-10-04)。
+        #
+        # 为什么必须一次性做完, 且必须在**卸载器删文件之前**跑:
+        # 原先卸载器只调用 `--clean-hosts-silent`, 于是卸载会留下六处残留, 其中
+        # 系统代理的残留最伤人 —— `AutoConfigURL` 仍指着 `http://127.0.0.1:44501/proxy.pac`,
+        # 而该端口随程序一起消失 ⇒ **所有 WinINET 应用**(不只浏览器, 还有 IE 内核的
+        # 老软件、部分安装器与自更新器)每次取自动配置都要对着一个死端口等到超时,
+        # 用户感知为"卸载之后上网就变卡/时好时坏, 重装浏览器也没用"。
+        # 其余五处: NRPT 规则、已装进信任库的自签根、自启计划任务、启动文件夹快捷方式、
+        # git 全局配置改写。
+        #
+        # 这个分支**不做任何别的初始化** (不建 QApplication、不注册退出清理、不碰单实例
+        # 闸门): 它的唯一目的是把机器还原干净, 即便程序此刻被强杀也只损失清理本身。
+        _uninstall_cleanup()
+        sys.exit(0)
+
     if "--clean-hosts-silent" in sys.argv or "--clean-hosts" in sys.argv:
         try:
             from hosts_manager import HostsManager

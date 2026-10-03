@@ -67,7 +67,7 @@ begin
   Result := True;
 end;
 
-// 2. 卸载前初始化: 关闭进程，并静默执行 Hosts 规则还原
+// 2. 卸载前初始化: 关闭进程，并静默执行**完整**还原
 function InitializeUninstall(): Boolean;
 var
   ResultCode: Integer;
@@ -77,14 +77,35 @@ begin
   KillProcess('GameArtToolkit.exe');
   KillProcess('PixivToolkit.exe');
   KillProcess('nginx.exe');
-  
-  // 静默还原系统 Hosts，杜绝卸载后断网残留
+
+  // ★ 卸载必须还原**全部六处**系统级改动, 而且必须在下面的 [UninstallDelete]/
+  //   CurUninstallStepChanged 删掉 {app} 之前执行 (缺陷 W7, 2026-10-04)。
+  //
+  //   原先这里只调用 `--clean-hosts-silent`, 于是卸载会留下:
+  //     · 系统代理 AutoConfigURL 仍指着 http://127.0.0.1:44501/proxy.pac, 而该端口
+  //       随程序一起消失 ⇒ **所有 WinINET 应用**(不只浏览器)每次取自动配置都对着
+  //       死端口等到超时, 用户感知为"卸载之后上网变卡/时好时坏";
+  //     · NRPT 规则 (用过该模式的话) —— 残留会把整机解析指向已停止的本地解析器;
+  //     · 已装进信任库的自签根 —— 文件被删而根还在, 留下一个"私钥已丢失的受信任
+  //       签发者", 这是用户最难自查的一类残留;
+  //     · 自启计划任务与启动文件夹快捷方式 —— 登录时静默启动一个已不存在的 exe;
+  //     · git 全局配置的改写。
+  //   一次性调用 `--clean-all-silent` 覆盖以上全部; 该 CLI 分支复用已测试的清理路径,
+  //   且每步独立、逐条打印, 一条失败不影响其余。
   AppExePath := ExpandConstant('{app}\GameArtToolkit.exe');
   if FileExists(AppExePath) then
   begin
-    Exec(AppExePath, '--clean-hosts-silent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(AppExePath, '--clean-all-silent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else
+  begin
+    // exe 已不在 (例如上一次卸载中断): 尽力清掉系统代理残留, 它是唯一会让用户
+    // "卸载后上不了网"的一项。用 reg 直接删, 不依赖 {app} 下任何文件。
+    Exec('reg.exe',
+         'delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v AutoConfigURL /f',
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
-  
+
   Result := True;
 end;
 
