@@ -65,7 +65,7 @@ from win_utils import (
     is_autostart_enabled, set_autostart, register_shutdown_handler,
     fast_terminate_pid, check_proxy_alive, flush_dns_native, hide_console_window,
     is_windows_dark_mode, get_port_process_info, get_critical_ports_status, kill_process_by_pid_safe,
-    get_pids_by_name
+    get_pids_by_name, select_own_image_pids
 )
 from ip_pool import (
     SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES,
@@ -185,17 +185,24 @@ def emergency_fast_cleanup() -> Dict[str, Any]:
         pass
 
     try:
-        # 原生终止全部本地 Nginx 进程。必须杀"全部 nginx.exe"而非 pid 文件里的
+        # 原生终止本地 Nginx 进程。必须按**全部同名进程**枚举, 而不是只用 pid 文件里的
         # 单个 PID: fast_terminate_pid 是 TerminateProcess, 不连带终止子进程,
         # 只杀 master 会留下孤儿 worker 占着 80/443 —— 它能继续服务请求, 却
         # 永远无法 reload/stop (信号通道以已死的 master 为基准), 并阻塞下次启动。
+        # 但"按名字全杀"会误伤用户自己另装的 nginx (开发/测试用), 故再按**完整镜像
+        # 路径**过滤一层 (2026-10-04): 只杀镜像等于我们 nginx.exe 的进程; 路径取不到
+        # 时保守照杀 (漏放一个无关进程 << 漏掉一个孤儿 worker)。策略见 win_utils 顶部。
         # 仍保持本函数"不启动子进程"的约束 (不用 taskkill/nginx -s stop)。
         pids = get_pids_by_name("nginx.exe")
         if not pids:
             # 进程名枚举失败时退回 pid 文件 (至少中断 master)
             fallback = nginx_mgr.get_pid()
             pids = [fallback] if fallback > 0 else []
-        for pid in pids:
+        kill_pids, foreign_pids = select_own_image_pids(pids, nginx_mgr.nginx_exe)
+        result["foreign_skipped"] = len(foreign_pids)
+        if foreign_pids:
+            print(f"[Cleanup] 跳过 {len(foreign_pids)} 个不属于本程序的同名进程: {foreign_pids}")
+        for pid in kill_pids:
             fast_terminate_pid(pid)
     except Exception:
         pass

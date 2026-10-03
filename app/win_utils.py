@@ -3,6 +3,7 @@
 GameArt Toolkit - Windows 原生 API 工具集 (进程与端口探测)
 """
 
+import os
 import socket
 import ctypes
 from ctypes import wintypes
@@ -434,6 +435,89 @@ def fast_terminate_pid(pid: int) -> bool:
     except Exception:
         pass
     return False
+
+
+# ==================== 进程镜像路径识别 (2026-10-04) ====================
+# 为什么需要: 退出清理原先按**进程名**枚举并终止全部 `nginx.exe`, 会连带杀掉用户
+# 自己另装的 nginx (开发/测试用)。改为按**完整镜像路径**判定, 两头都要:
+#   · 路径 == 我们的 nginx.exe       -> 杀 (含无法识别 pid 的孤儿 worker)
+#   · 路径取得到但不等于我们的        -> 跳过 (保护用户自己的程序)
+#   · 路径取不到 (权限不足 / 已退出)  -> **照杀**
+# 最后一条是刻意的取舍: 宁可放过一个无关进程, 也不能漏掉一个孤儿 worker ——
+# 后者会占着 80/443、能服务请求却永远无法 reload/stop, 并阻塞下次启动, 是更坏的结局。
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_IMAGE_PATH_BUF_CHARS = 32768
+
+
+def query_process_image_path(pid: int) -> str:
+    """取进程完整镜像路径 (宽字符, 不受非 ASCII 安装路径影响); 失败返回空串
+
+    用 `QueryFullProcessImageNameW` + `PROCESS_QUERY_LIMITED_INFORMATION` —— 后者是
+    能取到路径的**最小权限**, 无需 PROCESS_QUERY_INFORMATION (那要求更高完整性级别,
+    对部分进程会直接拒绝)。本函数**绝不抛异常**: 取不到就返回空串, 由调用方按上面的
+    策略决定杀还是跳过。
+    """
+    if pid <= 0:
+        return ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h_proc:
+            return ""
+        try:
+            size = wintypes.DWORD(_IMAGE_PATH_BUF_CHARS)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                return ""
+            return buf.value or ""
+        finally:
+            kernel32.CloseHandle(h_proc)
+    except Exception:
+        return ""
+
+
+def _normalize_image_path(path: str) -> str:
+    """镜像路径归一化: 去引号 / 去 `\\\\?\\` 长路径前缀 / 统一分隔符与大小写"""
+    s = (path or "").strip().strip('"')
+    if s.startswith("\\\\?\\"):
+        s = s[4:]
+        if s.upper().startswith("UNC\\"):
+            s = "\\\\" + s[4:]
+    try:
+        return os.path.normcase(os.path.normpath(s))
+    except Exception:
+        return s.lower()
+
+
+def is_same_image(path: str, expected_exe) -> bool:
+    """两个路径是否指向**同一个可执行文件**
+
+    优先 `os.path.samefile` (按卷+文件索引比较, 天然免疫大小写与 8.3 短路径差异);
+    任一路径不可达时退回归一化字符串比较 (此时仍可能因短路径形式不同而误判, 故
+    调用方在"路径取不到"时选择保守照杀, 见文件顶部说明)。
+    """
+    try:
+        if path and os.path.exists(path) and os.path.exists(str(expected_exe)):
+            return os.path.samefile(path, str(expected_exe))
+    except OSError:
+        pass
+    return _normalize_image_path(path) == _normalize_image_path(str(expected_exe))
+
+
+def select_own_image_pids(pids: List[int], expected_exe) -> Tuple[List[int], List[int]]:
+    """按镜像路径把候选 pid 分成 (属于本程序的, 属于他人的)
+
+    返回 (ours, foreign): `ours` 含"路径取不到"的 pid (保守照杀), 理由见文件顶部说明。
+    """
+    ours: List[int] = []
+    foreign: List[int] = []
+    for pid in pids or []:
+        path = query_process_image_path(pid)
+        if not path or is_same_image(path, expected_exe):
+            ours.append(pid)
+        else:
+            foreign.append(pid)
+    return ours, foreign
 
 
 def is_windows_dark_mode() -> bool:

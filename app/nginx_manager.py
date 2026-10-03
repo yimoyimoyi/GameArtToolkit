@@ -354,12 +354,23 @@ class NginxManager:
             for sub in ["logs", "temp", "cache"]:
                 (self.nginx_dir / sub).mkdir(parents=True, exist_ok=True)
 
-            # 必须显式指定 -p 前缀。缺省时 nginx 使用编译期默认 prefix, 而 pid 文件
-            # (logs/nginx.pid) 与 reload/stop 依赖的 Global\ngx_reload_<master_pid>
-            # 事件对象都以 prefix 为基准, 于是全部与项目目录错位 —— 实测表现为
-            # master 启动后随即退出、只剩一个孤儿 worker 占着 80/443 (能服务请求但
-            # 永远无法 reload/stop, OpenEvent 恒报错), 且该状态会长期残留。
-            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-c", "conf/nginx.conf"]
+            # prefix 必须等于项目目录 (pid 文件 logs/nginx.pid 与 reload/stop 依赖的
+            # 信号通道都以它为基准), 但**不能用 `-p <绝对路径>` 来表达** —— nginx 的
+            # Windows 入口是 ANSI 的 main(argc, argv), 带非 ASCII 的 `-p` 会在
+            # UTF-16→ANSI 往返中失真。实测 (2026-10-04, 临时中文目录 + 全量 conf):
+            #   · `-p <中文绝对路径>`   → exit 1: CreateFile(.../logs/error.log) failed
+            #                             (1113: No mapping for the Unicode character
+            #                             exists in the target multi-byte code page)
+            #                             —— 连 error log 都开不了, 配置更读不到
+            #   · cwd=中文目录 + `-p .` → exit 0
+            #   · cwd=中文目录 + 不给 -p → exit 0, pid 解析为完整中文绝对路径
+            #   · cwd=C:\ + 不给 -p     → 去找 `C:\/conf/nginx.conf`
+            #     ⇒ **prefix 实测取自 cwd** (不是 exe 所在目录), 即 cwd 本身就是前缀。
+            # 因此这里只传 `-c` 并把 cwd 设为 nginx_dir —— 与 `nginx -t` 预检路径
+            # (_stage_conf_dir 同样是"cwd 即 prefix") 口径统一。
+            # ⚠ start / reload / stop / quit 四处必须一致: 前缀不同则 nginx 会去别的
+            #   目录找 pid 文件, 报 OpenEvent failed, 表现为"能服务但永远无法 reload/stop"。
+            cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf"]
             # CREATE_BREAKAWAY_FROM_JOB: 让 nginx master 脱离本进程的 Job Object。
             # Windows 下 subprocess 创建的子进程默认继承调用方的 Job, 一旦本进程退出、
             # Job 关闭, master 会被连带终止 (worker 反而存活), 结果只剩一个孤儿 worker
@@ -394,10 +405,11 @@ class NginxManager:
 
         pid = self.get_pid()
 
-        # 1. 优先优雅停止 (-p 同 start/reload: 信号通道以 prefix 为基准)
+        # 1. 优先优雅停止 (cwd 即 prefix, 与 start/reload 一致 —— 见 start() 里的实测说明;
+        #    绝不能传非 ASCII 的 `-p`)
         try:
             subprocess.run(
-                [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "stop"],
+                [str(self.nginx_exe), "-s", "stop"],
                 cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                 **get_silent_startup_kwargs()
             )
@@ -421,7 +433,7 @@ class NginxManager:
         if self.is_running():
             try:
                 subprocess.run(
-                    [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "quit"],
+                    [str(self.nginx_exe), "-s", "quit"],
                     cwd=str(self.nginx_dir), capture_output=True, timeout=2,
                     **get_silent_startup_kwargs()
                 )
@@ -452,9 +464,10 @@ class NginxManager:
             return False, test_msg
 
         try:
-            # -p 必须与 start() 一致, 否则 nginx 会去默认 prefix 下找 pid 文件,
-            # 找不到 master 就报 OpenEvent failed, 热重载永远失败
-            cmd = [str(self.nginx_exe), "-p", str(self.nginx_dir), "-s", "reload"]
+            # cwd 必须与 start() 一致 (cwd 即 prefix, 见 start() 的实测说明): 前缀不同
+            # 时 nginx 会去别的目录找 pid 文件, 找不到 master 就报 OpenEvent failed,
+            # 热重载永远失败。同样**不得**传非 ASCII 的 `-p`。
+            cmd = [str(self.nginx_exe), "-s", "reload"]
             proc = subprocess.run(
                 cmd, cwd=str(self.nginx_dir), capture_output=True,
                 text=True, errors="ignore", timeout=3, **get_silent_startup_kwargs()
