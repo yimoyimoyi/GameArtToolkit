@@ -49,12 +49,13 @@ from nrpt_manager import NrptManager, NRPT_DNS_PORT
 from redirect_manager import (
     apply_redirect, remove_redirect, fast_remove_redirect, is_redirect_applied,
     normalize_mode as normalize_redirect_mode,
-    MODE_HOSTS, MODE_NRPT, MODE_PAC, MODE_PAC_AUTO
+    MODE_HOSTS, MODE_NRPT, MODE_PAC, MODE_PAC_AUTO,
+    is_pac_mode,
 )
 from nginx_manager import NginxManager
 from cdn_optimizer import CDNOptimizer, CDNHealthMonitor, is_internet_available
 from l4_relay import relay_server
-from ech_tunnel import ech_tunnel
+from ech_tunnel import ech_tunnel, build_ech_targets
 from h3_upstream import h3_proxy, check_preconditions as check_h3_preconditions
 from pac_redirect import launch_browser
 from dns_server import local_dns_server
@@ -66,8 +67,11 @@ from win_utils import (
     is_windows_dark_mode, get_port_process_info, get_critical_ports_status, kill_process_by_pid_safe,
     get_pids_by_name
 )
-from ip_pool import SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES, TOTAL_SERVICES_COUNT, CANDIDATE_IPS
-from service_profile import NAVIGATOR_SERVICES, get_profile_by_domain, ServiceMode
+from ip_pool import (
+    SERVICE_GROUPS, SERVICES_LIST, SERVICES_BY_ID, DEFAULT_ENABLED_SERVICES,
+    TOTAL_SERVICES_COUNT, CANDIDATE_IPS, GATED_GROUPS, gated_group_enabled,
+)
+from service_profile import NAVIGATOR_SERVICES, get_profile_by_domain, ServiceMode, PROFILES
 from reverse_search import (
     SEARCH_ENGINES, ImageSearchWorker, get_image_from_clipboard, save_image_to_temp
 )
@@ -804,14 +808,19 @@ class NavigatorCard(QFrame):
 
 
 class CoverSniCard(QFrame):
-    """Google / YouTube 掩护 SNI 通道状态卡片
+    """掩护 SNI 通道状态卡片 (多通道)
 
     为什么必须有这块界面 (方案 §8 降级链末行 + §10 验收标准第 6 条):
       方案把"不可用"明确列为降级链的最后一行, 并要求「**显式标记失败并在 UI 可见,
       宁可报错也不静默白屏**」; §10 第 6 条也要求「掩护 SNI 失效时能在无人干预下降级,
       且 UI 状态可见」。掩护 SNI 是整套方案里唯一无法用代码修好的外部依赖 (§6.4) ——
-      Google 一旦关闭域名前置, 没有这块卡片, 用户只会看到"页面打不开", 完全无从判断
+      一旦厂商关闭域名前置, 没有这块卡片, 用户只会看到"页面打不开", 完全无从判断
       是哪一环失效、有没有自动降级、现在用的是哪条通路。
+
+    为什么是"多通道"而不是只有 Google (2026-10-02): reddit 也接入了同一套运行时回归
+    (`cover_sni_channel="reddit"`, 掩护域 www.fastly.com)。实测该通道同样是分钟级时变,
+    因此同样必须"可见"。**一条通道一块文案**, 因为两条通道的失败模式、可用节点、
+    证书判据都不同 (Fastly 按 IP 选证书, Google 按 SNI) —— 合并成一行会掩盖谁挂了。
 
     展示三层信息: ① 当前层级(降级链第几级) ② 首选策略是否仍有效 ③ 不可用时显式报错。
     """
@@ -833,7 +842,7 @@ class CoverSniCard(QFrame):
         icon_lbl.setPixmap(SvgIconFactory.get_pixmap("shield", icon_c, 20))
         head.addWidget(icon_lbl)
 
-        title = QLabel("Google / YouTube 通道状态")
+        title = QLabel("掩护 SNI 通道状态")
         title.setProperty("class", "ItemTitle")
         head.addWidget(title)
         head.addStretch()
@@ -860,62 +869,101 @@ class CoverSniCard(QFrame):
 
     # ------------------------------------------------------------------
     def refresh(self, state=None):
-        """按当前运行时状态刷新 (state 为 None 时只读缓存, 不触发网络探测)"""
+        """按当前运行时状态刷新 (state 为 None 时只读缓存, 不触发网络探测)
+
+        state 可以是单个 VendorState (测试/单通道回填用) 或 {通道: VendorState} 字典;
+        两者都支持, 是为了让"启动回归"能一次性把多条通道的结果交给卡片。
+        """
         try:
             import cover_sni
         except Exception:
             self.lbl_level.setText("掩护 SNI 探测模块不可用")
             return
+
         if state is None:
-            state = cover_sni.get_state(cover_sni.GOOGLE_VENDOR)
-        if state is None:
+            states = list(cover_sni.all_states().values())
+        elif isinstance(state, dict):
+            states = [s for s in state.values() if s is not None]
+        else:
+            states = [state]
+
+        if not states:
             self.lbl_level.setText(
                 "尚未探测 —— 启动加速时会自动回归一次; 当前按画像写死的 SNI 运行")
             self.lbl_detail.setText("")
             return
 
-        if not state.available:
+        try:
+            labels = {name: cover_sni.channel_label(name) for name in cover_sni.CHANNELS}
+        except Exception:
+            labels = {}
+
+        def _name(s):
+            return labels.get(getattr(s, "channel", "") or s.vendor, s.vendor)
+
+        bad = [s for s in states if not s.available]
+        if bad:
             # 显式失败: 方案 §8 明确要求不得静默白屏, 这里用红色警示文案点明后果
+            who = "、".join(_name(s) for s in bad)
             self.lbl_level.setText(
-                f"⚠ 通道不可用 —— 候选池 {len(state.results)} 个策略全部失效")
-            tried = "、".join(r.strategy or "(空)" for r in state.results)
-            self.lbl_detail.setText(
-                f"已尝试: {tried}\n"
-                f"Google/YouTube 的网页与静态资源将无法经本机加速访问; "
-                f"请检查网络, 或稍后点「立即复检」。")
+                f"⚠ 通道不可用 —— {who}: 候选池 {len(bad[0].results)} 个策略全部失效")
+            lines = []
+            for s in states:
+                if not s.available:
+                    tried = "、".join(r.strategy or "(空)" for r in s.results)
+                    lines.append(f"{_name(s)} 已尝试: {tried}\n"
+                                 f"{_name(s)} 的网页与静态资源将无法经本机加速访问; "
+                                 f"请检查网络, 或稍后点「立即复检」。")
+                else:
+                    lines.append(f"{_name(s)}: {s.level_label} (策略={s.strategy})")
+            self.lbl_detail.setText("\n".join(lines))
             return
 
-        age = state.age()
-        fresh = "刚刚" if age < 60 else f"{int(age // 60)} 分钟前"
-        detail = []
-        cur = next((r for r in state.results if r.strategy == state.strategy), None)
-        if cur:
-            detail.append(f"节点 TLS 通过 {cur.tls_ok}/{cur.total}, "
-                          f"真实 Host 探活 {cur.http_ok}/{cur.total}")
-            if cur.verify_possible:
-                detail.append("该策略下证书名匹配真实域名 (具备开启上游证书校验的条件)")
-            else:
-                detail.append("掩护策略下证书名必然不匹配真实域名 —— 运行期必须关闭上游证书校验 "
-                              "(伪 SNI 的固有代价, 由探测阶段的证书族门槛补偿)")
-        self.lbl_level.setText(f"当前通路: {state.level_label} (策略={state.strategy}) · {fresh} 复检")
-        if state.notes:
-            detail.append(state.notes)
-        down = [r.strategy for r in state.results if not r.passed and r.strategy != state.strategy]
-        if down:
-            detail.append(f"已淘汰: {'、'.join(down)}")
+        levels, detail = [], []
+        for s in states:
+            age = s.age()
+            fresh = "刚刚" if age < 60 else f"{int(age // 60)} 分钟前"
+            levels.append(f"{_name(s)}: {s.level_label} (策略={s.strategy}) · {fresh} 复检")
+            cur = next((r for r in s.results if r.strategy == s.strategy), None)
+            if cur:
+                detail.append(f"[{_name(s)}] 节点 TLS 通过 {cur.tls_ok}/{cur.total}, "
+                              f"真实 Host 探活 {cur.http_ok}/{cur.total}")
+                if getattr(cur, "passing_ips", None):
+                    detail.append(f"  可用节点: {'、'.join(cur.passing_ips)}")
+                if cur.verify_possible:
+                    detail.append("  该策略下证书名匹配真实域名 (具备开启上游证书校验的条件)")
+                else:
+                    detail.append("  掩护策略下证书名必然不匹配真实域名 —— 运行期必须关闭上游证书校验 "
+                                  "(伪 SNI 的固有代价, 由探测阶段的证书门槛补偿)")
+            if s.notes:
+                detail.append(f"  {s.notes}")
+            down = [r.strategy for r in s.results if not r.passed and r.strategy != s.strategy]
+            if down:
+                detail.append(f"  已淘汰: {'、'.join(down)}")
+        self.lbl_level.setText("当前通路 —— " + " | ".join(levels))
         self.lbl_detail.setText("\n".join(detail))
 
     def recheck(self):
-        """后台跑一次强制回归 (网络探测不能放 UI 线程, 否则界面冻结)"""
+        """后台跑一次强制回归 (网络探测不能放 UI 线程, 否则界面冻结)
+
+        只探**已启用服务确实在用**的通道 —— 每条通道都是一次真实网络探测 (整池 × 候选数),
+        与用户无关的通道没必要探。
+        """
         try:
             import cover_sni
+            from config_store import load_config
         except Exception:
+            return
+        services = set(load_config().get("enabled_services") or [])
+        names = cover_sni.enabled_channels(services)
+        if not names:
+            self.lbl_level.setText("当前没有启用任何使用掩护 SNI 的服务")
             return
         self.btn_recheck.setEnabled(False)
         self.lbl_level.setText("正在复检掩护 SNI 候选池...")
 
         def _job():
-            return cover_sni.check_google_channel(force=True)
+            return cover_sni.check_enabled_channels(services, force=True)
 
         self._worker = BackgroundTaskWorker(_job)
         self._worker.done.connect(self._on_recheck_done)
@@ -927,12 +975,13 @@ class CoverSniCard(QFrame):
             self.lbl_level.setText(f"复检失败: {result}")
             return
         self.refresh(result)
-        if self.parent_window:
-            ok = bool(getattr(result, "available", False))
-            show_toast(self.parent_window,
-                       getattr(result, "summary", lambda: "复检完成")()
-                       if callable(getattr(result, "summary", None)) else "复检完成",
-                       toast_type="success" if ok else "error", duration=4500)
+        if self.parent_window and isinstance(result, dict):
+            for name, st in result.items():
+                ok = bool(getattr(st, "available", False))
+                show_toast(self.parent_window,
+                           getattr(st, "summary", lambda: "复检完成")()
+                           if callable(getattr(st, "summary", None)) else "复检完成",
+                           toast_type="success" if ok else "error", duration=4500)
 
 
 class ToolHubCard(QFrame):
@@ -1593,15 +1642,15 @@ class MainWindow(QMainWindow):
             grp_card = self._build_service_group_card(grp_id, grp_info, cfg_services)
             layout.addWidget(grp_card)
 
-        # 4.5 Google / YouTube 掩护 SNI 通道状态卡
-        #     仅当该通道确实在用 (有 Google 系画像处于启用状态) 时才出现 —— 一个只服务
-        #     Google 的状态块不该出现在完全没启用 Google 的界面上。
+        # 4.5 掩护 SNI 通道状态卡 (多通道: Google/YouTube + Reddit/Fastly)
+        #     仅当至少一条通道确实在用 (有对应画像处于启用状态) 时才出现 —— 状态块不该出现
+        #     在完全没用到掩护 SNI 的界面上。
         #     方案 §10 第 6 条要求"掩护 SNI 失效时能在无人干预下降级, 且 UI 状态可见",
         #     这块卡片就是那个"可见"。
         self.cover_sni_card = None
         try:
             import cover_sni as _cs
-            if set(_cs.google_profile_ids()) & cfg_services:
+            if _cs.enabled_channels(cfg_services):
                 self.cover_sni_card = CoverSniCard(self)
                 layout.addWidget(self.cover_sni_card)
         except Exception as e:
@@ -1680,6 +1729,16 @@ class MainWindow(QMainWindow):
         items_flow = FlowLayout(margin=0, h_spacing=12, v_spacing=10, min_item_width=320, max_item_width=520)
 
         grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
+
+        # 空分组的如实说明 (2026-10-03): "adult" 受控分组目前还没有任何画像落地。
+        # 不写这一句, 用户打开总闸后只会看到一张空卡片, 无从判断是"没接入"还是"坏了" ——
+        # 本项目一贯要求"宁可说明白, 也不要静默"。
+        if not grp_services:
+            lbl_empty = QLabel("暂未接入任何服务（画像落地后会自动出现在这里）")
+            lbl_empty.setProperty("class", "ItemDesc")
+            lbl_empty.setWordWrap(True)
+            grp_content_layout.addWidget(lbl_empty)
+
         for idx, srv in enumerate(grp_services):
             sid = srv["id"]
             s_item = QFrame()
@@ -1740,6 +1799,11 @@ class MainWindow(QMainWindow):
 
         if is_collapsed:
             grp_content.setVisible(False)
+
+        # 受控分组总闸 (2026-10-03): 未放开时整个分组卡片不显示。
+        # 判定取自 ip_pool.gated_group_enabled (与配置清洗共用同一份真源), 不在这里另判一次。
+        if grp_info.get("gated") and not gated_group_enabled(grp_id):
+            grp_card.setVisible(False)
 
         return grp_card
 
@@ -1854,7 +1918,9 @@ class MainWindow(QMainWindow):
             for s_card in self.service_cards.values():
                 s_card.setVisible(True)
             for gid, g_card in self.group_cards.items():
-                g_card.setVisible(True)
+                # 受控分组即使清空搜索词也不显示 —— 总闸优先于搜索 (否则用户一清空关键词
+                # 就能把默认隐藏的分组"搜"出来, 闸门形同虚设)
+                g_card.setVisible(gated_group_enabled(gid))
                 # 恢复用户持久化的折叠状态
                 is_col = (gid in self.collapsed_sections)
                 if gid in self.group_content_widgets:
@@ -1893,13 +1959,25 @@ class MainWindow(QMainWindow):
 
         for gid, grp_card in self.group_cards.items():
             has_match = group_has_visible.get(gid, False)
-            grp_card.setVisible(has_match)
+            # 总闸优先: 受控分组未放开时, 搜索命中也不显示 (见上)
+            grp_card.setVisible(bool(has_match) and gated_group_enabled(gid))
             # 若该组有匹配结果，自动临时展开内容以便用户即时查看与操作
             if has_match and gid in self.group_content_widgets:
                 self.group_content_widgets[gid].setVisible(True)
 
     def toggle_group_services(self, group_id: str, enable: bool):
-        """批量启用或关闭某生态分组全量服务，并即刻同步 Hosts 与界面胶囊"""
+        """批量启用或关闭某生态分组全量服务，并即刻同步 Hosts 与界面胶囊
+
+        ★ 受控分组总闸 (2026-10-03): 未放开时**拒绝整组启用**。该分组的卡片此时本就不可见,
+        这条是纵深防御 —— 批量入口不设防的话, 任何能触达它的路径 (快捷键/脚本/未来新增的
+        "全部启用"按钮) 都会绕过闸门。关闭方向永远允许 (关闭从来不该被拦住)。
+        """
+        if enable and not gated_group_enabled(group_id):
+            show_toast(self, f"[{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] "
+                             f"为受控分组，默认不可启用 —— 请先在「设置 → 内容分组」中打开它的开关",
+                       toast_type="warning", duration=6000)
+            return
+
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
 
@@ -1940,6 +2018,29 @@ class MainWindow(QMainWindow):
         """
         if checked:
             _profile = SERVICES_BY_ID.get(service_id)
+            # ★ 受控分组总闸 (2026-10-03): 分组未放开时拒绝启用。
+            # 放在所有检查之前: 这是"内容/合规"层面的门槛, 与下面"当前解析后端能否生效"
+            # 是完全不同的两件事, 先判前者才能给出正确的理由 (不然会把用户引向排查代理配置)。
+            _group_id = (_profile or {}).get("group", "")
+            if not gated_group_enabled(_group_id):
+                self._update_service_icon(service_id, False)
+                _sw = getattr(self, "service_switches", {}).get(service_id)
+                if _sw is not None:
+                    try:
+                        _sw.blockSignals(True)
+                        # 回弹必须走 service_switches 注册表 (并没有 sw_<id> 这种属性;
+                        # 第一版写成 getattr(self, "sw_%s" % id) 时回弹静默失效)
+                        _sw.setCheckedNoAnim(False)
+                        _sw.blockSignals(False)
+                    except Exception:
+                        pass
+                show_toast(
+                    self,
+                    f"无法开启 [{( _profile or {}).get('name', service_id)}]: "
+                    f"它属于受控分组「{SERVICE_GROUPS.get(_group_id, {}).get('name', _group_id)}」，"
+                    f"默认隐藏且不可启用 —— 请先在「设置 → 内容分组」中打开该分组的开关",
+                    toast_type="warning", duration=7000)
+                return
             try:
                 from h3_upstream import blocked_services
                 _blocked = blocked_services(
@@ -1974,6 +2075,20 @@ class MainWindow(QMainWindow):
                     f"({'/'.join(_gaps[service_id])}) —— 页面可开, 而这些子域仍会走真实解析"
                     f"(可能超时, 如 Gemini 的会话端点)。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                     toast_type="warning", duration=9000)
+            # 软告警 2 (2026-10-03): 走 HTTP/3 上游腿的服务 (googlevideo) —— 它的可用性是
+            # **节点级、分钟级时变**的, 且实测"每个节点只有一个可用地址"(别名域答案逐字相同、
+            # 只有一个干净 DoH 来源), 所以既拦不住也修不好, 只能**如实告知且不阻断**。
+            # 数据源 = 节点成绩单 (浏览器真实播放的跨会话统计), **离线读取**, 不做实时探测:
+            # 实时探测要数十秒会冻结界面, 且合成请求读不出"能不能播"(见文档 §5)。
+            try:
+                from h3_upstream import gvs_health_hint
+                _hint = gvs_health_hint([service_id])
+            except Exception:
+                _hint = ""
+            if _hint:
+                _name2 = (_profile or {}).get("name", service_id)
+                show_toast(self, f"[{_name2}] 已开启, 但当前并不稳定 —— {_hint}",
+                           toast_type="warning", duration=10000)
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -3560,6 +3675,143 @@ class MainWindow(QMainWindow):
         g_layout.addLayout(row_notif)
         return gen_card
 
+    # ==========================================================================
+    # 内容分组 (受控分组总闸) —— 2026-10-03 新增
+    # ==========================================================================
+    def _build_settings_content_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """卡片: 内容分组可见性 (受控分组总闸)
+
+        为什么单列一张卡: 它决定的是"某些内容是否出现在控制台、以及能否被启用" ——
+        属于内容/合规开关, 塞进"常规偏好与系统外观"里会让人找不到, 也和主题/清理无关。
+
+        ★ 开关由 GATED_GROUPS **动态生成**, 不写死 "adult": 将来新增受控分组 (例如把某个
+        高风险平台单列) 时, 这里与配置默认值都会自动跟上, 不需要两处各改一遍。
+        """
+        card = QFrame()
+        card.setProperty("class", "MDCard")
+        c_layout = QVBoxLayout(card)
+        c_layout.setContentsMargins(20, 16, 20, 16)
+        c_layout.setSpacing(14)
+
+        c_title_box = QHBoxLayout()
+        c_icon = QLabel()
+        c_icon.setPixmap(SvgIconFactory.get_pixmap("lock", primary_icon_c, 18))
+        self.settings_icon_labels.append((c_icon, "lock"))
+        lbl_c_title = QLabel("内容分组与可见性")
+        lbl_c_title.setProperty("class", "SectionHeaderTitle")
+        lbl_c_title.setWordWrap(True)
+        c_title_box.addWidget(c_icon)
+        c_title_box.addWidget(lbl_c_title)
+        c_title_box.addStretch()
+        c_layout.addLayout(c_title_box)
+
+        lbl_c_hint = QLabel(
+            "受控分组默认不显示且不可启用。关闭开关时会同时收回该分组下已启用的服务"
+            "（配置、Hosts 与 DNS 规则一并同步），不会留下「看着开着、实际已停」的残留状态。")
+        lbl_c_hint.setProperty("class", "ItemDesc")
+        lbl_c_hint.setWordWrap(True)
+        c_layout.addWidget(lbl_c_hint)
+
+        gates = dict(cfg.get("gated_groups_enabled") or {})
+        self.gated_group_switches: dict = {}
+
+        if not GATED_GROUPS:
+            lbl_none = QLabel("当前没有受控分组。")
+            lbl_none.setProperty("class", "ItemDesc")
+            lbl_none.setWordWrap(True)
+            c_layout.addWidget(lbl_none)
+        for gid, ginfo in GATED_GROUPS.items():
+            row = QHBoxLayout()
+            txt = QVBoxLayout()
+            txt.setSpacing(2)
+            lbl_t = QLabel(f"显示并允许启用「{ginfo.get('name', gid)}」分组")
+            lbl_t.setProperty("class", "ItemTitle")
+            lbl_t.setWordWrap(True)
+            lbl_d = QLabel(str(ginfo.get("gate_note") or ginfo.get("desc") or ""))
+            lbl_d.setProperty("class", "ItemDesc")
+            lbl_d.setWordWrap(True)
+            txt.addWidget(lbl_t)
+            txt.addWidget(lbl_d)
+            row.addLayout(txt)
+            row.addStretch()
+
+            sw = MDSwitch(checked=bool(gates.get(gid, False)))
+            sw.toggled.connect(lambda c, g=gid: self.set_gated_group_enabled(g, c))
+            self.gated_group_switches[gid] = sw
+            row.addWidget(sw)
+            c_layout.addLayout(row)
+
+        # 留痕可见: 上次加载配置时若因总闸关闭剔除了服务, 必须说出来 (而不是静默少掉几个)
+        dropped = cfg.get("gated_services_dropped") or []
+        if dropped:
+            lbl_drop = QLabel(
+                f"注意：上次加载配置时，有 {len(dropped)} 个受控分组的服务因总闸关闭被自动停用"
+                f"（{', '.join(dropped[:4])}{'…' if len(dropped) > 4 else ''}）。")
+            lbl_drop.setProperty("class", "ItemDesc")
+            lbl_drop.setWordWrap(True)
+            c_layout.addWidget(lbl_drop)
+
+        return card
+
+    def set_gated_group_enabled(self, group_id: str, enabled: bool):
+        """受控分组总闸开关: 决定该分组是否显示、能否启用, 并在关闭时**立即收回**已启用服务
+
+        为什么关闭方向要做这么多事 (而不仅是写一个 bool): 总闸的语义是"这些服务不许生效" ——
+        只改标志位会让已启用的服务继续被劫持 (界面还显示着"已开启"), 即"看着关了、其实还在跑"。
+        本项目的红线是"宁可响亮失败, 也不静默假状态", 所以关闭时必须:
+          ① 从 enabled_services 移除该分组全部服务;
+          ② 界面开关回弹为关闭 (否则用户下次打开总闸会看到一堆"已开启"的假状态);
+          ③ 若加速正在运行, 立刻重下发 Hosts/DNS 规则, 让劫持当场失效。
+        """
+        cfg = load_config()
+        gates = dict(cfg.get("gated_groups_enabled") or {})
+        gates[group_id] = bool(enabled)
+
+        services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
+        group_service_ids = [s["id"] for s in SERVICES_LIST if s.get("group") == group_id]
+        if not enabled:
+            services -= set(group_service_ids)
+            for sid in group_service_ids:
+                sw = self.service_switches.get(sid)
+                if sw is not None:
+                    try:
+                        sw.blockSignals(True)
+                        sw.setCheckedNoAnim(False)
+                        sw.blockSignals(False)
+                    except Exception:
+                        pass
+                self._update_service_icon(sid, False)
+
+        cfg["enabled_services"] = sorted(services)
+        cfg["gated_groups_enabled"] = gates
+        save_config(cfg)
+
+        # 刷新分组显示与搜索过滤状态 (搜索态下直接 setVisible 会被下一次输入覆盖, 这里统一走一遍)
+        try:
+            self.on_service_search_changed(self.txt_service_search.text())
+        except Exception:
+            pass
+
+        if not enabled and (nginx_mgr.is_running() or self._is_redirect_active()):
+            self._apply_redirect(sorted(services))
+
+        # 受控分组下的 ECH 画像要跟着进出隧道白名单 (总闸 = "这些服务不许生效",
+        # 白名单是"允许转发到哪些目标"的前置面, 两者必须同步; 见 _start_ech_tunnel)。
+        # 尽力而为: 隧道未运行/启动失败都不该阻断开关本身 (服务启用与否已由配置层决定)。
+        try:
+            if any(getattr(p, "ech_enabled", False) and p.group == group_id
+                   for p in PROFILES):
+                self._start_ech_tunnel()
+        except Exception as e:
+            print(f"[UI] 受控分组切换后刷新 ECH 隧道失败 (不影响其它服务): {e}")
+
+        _gname = SERVICE_GROUPS.get(group_id, {}).get("name", group_id)
+        show_toast(
+            self,
+            f"已{'开启' if enabled else '关闭'}受控分组「{_gname}」"
+            + ("" if enabled else f"，并已停用该分组下 {len(group_service_ids)} 个服务"),
+            toast_type="info" if enabled else "warning", duration=4000)
+
     def _build_settings_hosts_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
         """卡片 2: Hosts 托管与退出清理"""
         hosts_card = QFrame()
@@ -3944,7 +4196,7 @@ class MainWindow(QMainWindow):
         icon_lbl.setFixedSize(22, 22)
         icon_lbl.setPixmap(SvgIconFactory.get_pixmap("shield", primary_icon_c, 20))
         head.addWidget(icon_lbl)
-        lbl_title = QLabel("Google / YouTube 通道")
+        lbl_title = QLabel("掩护 SNI 通道 (Google/YouTube · Reddit)")
         lbl_title.setProperty("class", "ItemTitle")
         head.addWidget(lbl_title)
         head.addStretch()
@@ -3958,8 +4210,9 @@ class MainWindow(QMainWindow):
         lb1.setProperty("class", "ItemTitle")
         lb1.setWordWrap(True)
         d1 = QLabel(
-            "启动加速前实测掩护域名是否仍然有效 (证书族门槛 + 真实 Host 探活); "
-            "失效时按候选池自动切换: g.cn → 其它 Google 自有域 → 真实域名 → 空 SNI。"
+            "启动加速前逐通道实测掩护域名是否仍然有效 (证书门槛 + 真实 Host 探活); "
+            "失效时按各自候选池自动切换: Google 走 g.cn → 其它 Google 自有域 → 真实域名 → 空 SNI, "
+            "Reddit 走 www.fastly.com → 其它 Fastly 自有域 → 真实域名 → 空 SNI。"
             "关闭后一律使用画像里写死的 SNI, 便于排障时排除自动切换这一变量"
         )
         d1.setProperty("class", "ItemDesc")
@@ -3981,9 +4234,11 @@ class MainWindow(QMainWindow):
         lb2.setProperty("class", "ItemTitle")
         lb2.setWordWrap(True)
         d2 = QLabel(
-            "空 SNI 时对端返回占位证书 invalid2.invalid, 上游证书完全无法校验 —— 实测链校验 0/8 通过。"
+            "空 SNI 是最后手段: Google 通道上对端回占位证书 invalid2.invalid, 上游证书完全无法校验 "
+            "(实测链校验 0/8); Fastly 通道上虽仍回目标真证书 (该厂商按 IP 选证书), 但"
+            "\"不发 SNI\"本身就是异常形态, 不应作为常规通路。"
             "关闭后, 掩护域与真实域名全部失效时直接判为【不可用】并在界面显式报错, "
-            "而不会静默降到一条没有任何证书保障的通路上"
+            "而不会静默降到一条没有证书保障的通路上"
         )
         d2.setProperty("class", "ItemDesc")
         d2.setWordWrap(True)
@@ -4429,6 +4684,8 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_settings_env_card(primary_icon_c))
         layout.addWidget(self._build_settings_general_card(primary_icon_c, cfg))
+        # 内容分组总闸 (受控分组: 默认隐藏且不可启用) —— 紧邻常规偏好, 便于找到
+        layout.addWidget(self._build_settings_content_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_hosts_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_cover_sni_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_speedtest_card(primary_icon_c, cfg))
@@ -5251,19 +5508,23 @@ class MainWindow(QMainWindow):
             return result
 
     def _regress_cover_sni(self, services):
-        """启动加速前做一次掩护 SNI 回归, 返回 VendorState (跳过时返回 None)
+        """启动加速前做一次掩护 SNI 回归, 返回 {通道: VendorState} (跳过时返回 None)
 
-        阻塞调用, 因此只在"确有 Google 系服务启用且开关打开"时才跑; 常规路径 (首选
-        掩护域 g.cn 仍然有效) 只探一个策略的整池节点, 8 个 IP 并行约 1 秒。任何异常都
-        吞掉并返回 None —— 探测失败绝不能阻断加速启动, 此时生成器沿用画像写死的 SNI。
+        阻塞调用, 因此只在"确有使用掩护 SNI 的服务启用且开关打开"时才跑; 常规路径 (首选
+        掩护域仍然有效) 只探一个策略的整池节点 —— Google 8 个 IP 并行约 1 秒, reddit
+        2 个节点约 1 秒。任何异常都吞掉并返回 None —— 探测失败绝不能阻断加速启动, 此时
+        生成器沿用画像写死的 SNI。
+
+        为什么按"已启用服务"过滤而不是无条件探所有通道: 每条通道都是真实网络探测
+        (整池 × 候选数), 没启用的服务不该产生流量与延迟。
         """
         try:
             import cover_sni
             if not cover_sni.auto_regress_enabled():
                 return None
-            if not (set(cover_sni.google_profile_ids()) & set(services or ())):
+            if not cover_sni.enabled_channels(services or ()):
                 return None
-            return cover_sni.check_google_channel()
+            return cover_sni.check_enabled_channels(services or ())
         except Exception as e:
             print(f"[CoverSNI] 回归探测失败 (沿用画像写死的 SNI): {e}")
             return None
@@ -5302,9 +5563,18 @@ class MainWindow(QMainWindow):
             try:
                 cs_state = result.get("cover_sni")
                 self.cover_sni_card.refresh(cs_state)
-                if cs_state is not None and not getattr(cs_state, "available", True):
+                # 不可用时逐通道弹错误提示 —— 方案 §8 末行要求"显式标记失败",
+                # 只在卡片里写一行小字不算"显式"; 多通道时还必须**指名**是哪条挂了。
+                if isinstance(cs_state, dict):
+                    for name, st in cs_state.items():
+                        if st is not None and not getattr(st, "available", True):
+                            show_toast(self,
+                                       f"⚠ {name} 通道不可用: 掩护 SNI 候选池全部失效 "
+                                       f"({len(getattr(st, 'results', []))} 个策略)",
+                                       toast_type="error", duration=7000)
+                elif cs_state is not None and not getattr(cs_state, "available", True):
                     show_toast(self,
-                               f"⚠ Google/YouTube 通道不可用: 掩护 SNI 候选池全部失效 "
+                               f"⚠ 掩护 SNI 通道不可用: 候选池全部失效 "
                                f"({len(getattr(cs_state, 'results', []))} 个策略)",
                                toast_type="error", duration=7000)
             except Exception as e:
@@ -5336,6 +5606,13 @@ class MainWindow(QMainWindow):
                        f"相关功能可能超时。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                        toast_type="warning", duration=10000)
 
+        # 软告警 3 (2026-10-03): HTTP/3 上游腿的**节点级**可用性 —— 与上面两道闸门同一形态
+        # (都是"已经开了, 但必须说出来")。数据来自节点成绩单, 不触发任何探测。
+        _h3_note = getattr(self, "_gvs_health_note", "") or ""
+        if _h3_note:
+            show_toast(self, f"⚠ YouTube 视频流(googlevideo) 当前不稳定 —— {_h3_note}",
+                       toast_type="warning", duration=11000)
+
         self._start_status_probe()
         self.refresh_tray_steam_menu()
 
@@ -5345,23 +5622,25 @@ class MainWindow(QMainWindow):
         域名白名单同时起到安全边界作用 —— 隧道只转发名单内的目标, 避免被当作
         通用代理滥用。IP 池取自各服务的 candidate_ips, 作为 DoH 被投毒时的兜底
         (实测境内 DoH 对受限域名的解析是间歇性污染的)。
+
+        ★ 受控分组 (2026-10-03): 分组未放开时, 该分组下的 ECH 画像**不进白名单** ——
+        总闸的语义是"这些服务不许生效", 而隧道白名单是"允许转发到哪些目标"的前置面,
+        把默认关闭的成人域名预先放进去与闸门语义矛盾 (它也确实是可被利用的放宽面)。
+        放开/关闭总闸后由 set_gated_group_enabled 重新调用本方法刷新
+        (ech_tunnel.start 会比对白名单, 未变化时不重启进程)。
         """
         from service_profile import PROFILES
 
-        ech_services = [p for p in PROFILES if getattr(p, "ech_enabled", False)]
-        if not ech_services:
+        # 聚合逻辑抽到 ech_tunnel.build_ech_targets (纯函数, 可单测): 受控分组未放开时
+        # 该分组的画像不进白名单 —— 判据只看"是否 ech_enabled"曾让默认关闭的成人域名
+        # 预先进入可转发清单, 与总闸语义矛盾。同时产出**每主机 IP 池**(见该函数注释:
+        # 对权威解析不是 CF 的主机, 它决定拿不拿得到本 zone 的真实边缘)。
+        domains, ip_pool, host_ip_pool = build_ech_targets(
+            PROFILES, allow_fn=lambda p: gated_group_enabled(p.group))
+        if not domains:
             return True, "无服务启用 ECH 隧道"
 
-        domains: List[str] = []
-        ip_pool: List[str] = []
-        for p in ech_services:
-            domains.extend(p.domains)
-            ip_pool.extend(p.candidate_ips)
-        # 去重保序 (多个服务可能共享域名, 如 source.pixiv.net)
-        domains = list(dict.fromkeys(domains))
-        ip_pool = list(dict.fromkeys(ip_pool))
-
-        return ech_tunnel.start(domains=domains, ip_pool=ip_pool)
+        return ech_tunnel.start(domains=domains, ip_pool=ip_pool, host_ip_pool=host_ip_pool)
 
     def _start_h3_upstream(self) -> Tuple[bool, str]:
         """启动本地 HTTP/3 上游腿 (仅当存在 h3_upstream 画像时)
@@ -5388,6 +5667,13 @@ class MainWindow(QMainWindow):
         if not h3_services:
             return True, "无已启用的服务使用 HTTP/3 上游腿"
         ok, msg = h3_proxy.start()
+        # 节点成绩单的健康提示 (离线读取, 不阻塞): 与启用边界的软告警同一口径,
+        # 在启动收尾处再提示一次 —— 用户往往是在"已经开始加速"之后才发现视频卡。
+        try:
+            from h3_upstream import gvs_health_hint
+            self._gvs_health_note = gvs_health_hint()
+        except Exception:
+            self._gvs_health_note = ""
         # 前置条件校验: 不阻断启动 (代理本身可用), 但必须**如实告知** —— 否则用户会在
         # Hosts 模式下得到一个静默失效的 googlevideo (详见 check_preconditions 注释)
         try:
@@ -5585,20 +5871,27 @@ class MainWindow(QMainWindow):
     def on_launch_pac_browser(self):
         """启动 PAC 后端并以 --proxy-pac-url 打开浏览器 (免管理员方案的用户入口)"""
         try:
-            from redirect_manager import _PAC as _pac, build_domain_targets
+            from redirect_manager import (_PAC as _pac, pac_redirectable_domains,
+                                          _pac_fallback_directive_safe)
         except Exception as e:
             show_toast(self, f"PAC 模块加载失败: {e}", toast_type="warning", duration=4000)
             return
 
         cfg = load_config() or {}
         services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
-        domains = sorted(build_domain_targets(services).keys())
+        # ★ H6: 必须按 profile.mode 过滤 (DIRECT/QUIC_DIRECT 在 nginx 侧没有 server 块,
+        #   交给 PAC 会落到默认 server 拿到不相干的内容), 且与 apply_redirect 用**同一个**
+        #   推导入口 —— 原先这里各写一份 `.keys()`, 于是 GUI 与后端覆盖面不同。
+        domains = pac_redirectable_domains(services)
         if not domains:
             show_toast(self, "没有需要重定向的域名（请先启用服务）",
                        toast_type="warning", duration=3000)
             return
 
-        ok, msg = _pac.start(domains)
+        # ★ H6 现象 B: 必须传 fallback。`pac.start()` 默认值是 DIRECT, 而 PAC 优先于
+        #   用户的固定代理 ⇒ 不传就等于"点一下按钮把用户的代理旁路掉"
+        #   (实测事故 b1693ed: 用户代理收到的 CONNECT 数为 0)。
+        ok, msg = _pac.start(domains, fallback=_pac_fallback_directive_safe())
         if not ok:
             show_toast(self, msg, toast_type="warning", duration=6000)
             self.refresh_pac_status_label()
@@ -5638,7 +5931,7 @@ class MainWindow(QMainWindow):
         self.refresh_nrpt_status_label()
         self.refresh_pac_status_label()
 
-        if mode in (MODE_PAC, MODE_PAC_AUTO):
+        if is_pac_mode(mode):   # 族查询, 不写死成员
             # 免管理员后端: 顺带启动 PAC 服务并展示地址, 让用户知道下一步做什么
             pass
         if not (nginx_mgr.is_running() or self._is_redirect_active()):

@@ -8,7 +8,7 @@ import json
 import shutil
 import threading
 from path_utils import BASE_DIR
-from ip_pool import DEFAULT_ENABLED_SERVICES, SERVICES_BY_ID
+from ip_pool import DEFAULT_ENABLED_SERVICES, SERVICES_BY_ID, GATED_GROUPS
 
 CONFIG_FILE = BASE_DIR / "config.json"
 CONFIG_BAK = BASE_DIR / "config.json.bak"
@@ -32,6 +32,12 @@ DEFAULT_CONFIG = {
 
     # 服务与路由规则 (默认开启预设服务)
     "enabled_services": list(DEFAULT_ENABLED_SERVICES),
+    # 受控分组总闸 (2026-10-03): 分组 id -> 是否放开。
+    #   默认全部 False ⇒ 该分组在控制台**不显示**, 且其中任何服务**不可启用**。
+    #   默认值由 GATED_GROUPS 动态生成 (而非写死 "adult"), 这样新增受控分组时
+    #   配置默认值与代码不会漂移 —— 本项目已多次因"两处各写一份"翻车。
+    #   真正生效的判定在 ip_pool.gated_group_enabled / _sanitize_config 的 2.2。
+    "gated_groups_enabled": {gid: False for gid in GATED_GROUPS},
     "steam_account_aliases": {},
     "custom_steam_path": "",
     "steam_launch_args": ["-tcp"],
@@ -74,6 +80,12 @@ DEFAULT_CONFIG = {
 
     # QUIC(HTTP/3) 直连服务的优选 IP 顺序 (由 quic_probe 用真实 QUIC 握手测速生成)
     "quic_optimal_ips": {},
+
+    # googlevideo 的**节点成绩单** (2026-10-03): 由 h3 上游腿按浏览器真实播放请求累加,
+    # 键 = 节点名 (`rr1---sn-xxxx`), 值 = {ok, fail, classes, bytes, last_ok, last_fail, fb_ms}。
+    # 为什么存这里而不是另开文件: 与 quic_optimal_ips / cached_cdn_full_results 同一模式
+    # (运行时状态都在 config.json), 落盘有节流 (见 NODE_SCORE_FLUSH_SECONDS), 有界 (最多 60 节点)。
+    "gvs_node_scores": {},
 
     # Google/YouTube 掩护 SNI 通道 (方案 §5.1 / §6.4 / §8)
     # auto_regress: 启动加速前自动回归"掩护 SNI 是否仍然有效", 失效时按候选池自动降级
@@ -157,6 +169,32 @@ def _sanitize_config(data: dict) -> dict:
         data["enabled_services"] = list(DEFAULT_ENABLED_SERVICES)
         data["known_service_ids"] = sorted(SERVICES_BY_ID)
 
+    # 2.2 受控分组总闸 (2026-10-03): 分组未放开时, 其中的服务**不得留在启用清单里**。
+    #
+    # 为什么这是必须的一层 (而不是只在界面上置灰): 界面之外还有三条能把这些服务打开的路 ——
+    #   ① 用户手改 config.json (或被别的工具改);
+    #   ② 升级前就在清单里的历史 id (那时还没有总闸);
+    #   ③ `known_service_ids` 的自动接纳 (升级迁移) —— 虽然它只接纳
+    #      DEFAULT_ENABLED_SERVICES, 但默认清单本身也是会变的。
+    # 本项目反复吃过"闸门建在能被绕过的地方"的亏, 所以判定落在**配置加载**这一层:
+    # 任何来源的清单在这里被清洗一次, 之后 hosts/DNS/nginx 拿到的都不含受控服务。
+    # 判定与 ip_pool 共用同一份真源 (GATED_GROUPS + 这份用户配置), 不另判一次。
+    _enabled = data.get("enabled_services")
+    if isinstance(_enabled, list) and GATED_GROUPS:
+        _gate_on = data.get("gated_groups_enabled") or {}
+        _dropped = sorted({
+            sid for sid in _enabled
+            if (SERVICES_BY_ID.get(sid, {}) or {}).get("group") in GATED_GROUPS
+            and not bool((_gate_on or {}).get(
+                (SERVICES_BY_ID.get(sid, {}) or {}).get("group"), False))
+        })
+        if _dropped:
+            data["enabled_services"] = sorted(set(_enabled) - set(_dropped))
+            # 留痕而不静默: 剔除了什么必须能被界面/日志说出来 (与 redirect_mode_invalid 同一取向)
+            data["gated_services_dropped"] = _dropped
+        else:
+            data.pop("gated_services_dropped", None)
+
     # 2. 归一化重定向后端取值
     #    ⚠ 这里刻意区分**"键缺失"与"值非法"** (2026-10-02):
     #      · 键缺失 = 用户还没表达过偏好 ⇒ 用当前默认 pac_auto;
@@ -170,7 +208,18 @@ def _sanitize_config(data: dict) -> dict:
     #         —— 免管理员、不写注册表、不占 53、不动系统 DNS (见 app/pac_redirect.py)
     _raw = data.get("redirect_mode", DEFAULT_CONFIG["redirect_mode"])
     mode = str(_raw if _raw else DEFAULT_CONFIG["redirect_mode"]).strip().lower()
-    data["redirect_mode"] = mode if mode in ("hosts", "nrpt", "pac", "pac_auto") else "hosts"
+    _VALID_MODES = ("hosts", "nrpt", "pac", "pac_auto")
+    if mode in _VALID_MODES:
+        data["redirect_mode"] = mode
+        data.pop("redirect_mode_invalid", None)
+    else:
+        # ★ L5 (2026-10-03): 静默回落 hosts 的理由成立 (见上方注释), 但**静默**本身有害 ——
+        #   降级的后果不是"没反应", 而是**能力降级**: hosts 表达不了通配 ⇒
+        #   googlevideo 被硬拦、Gemini 的 `*.clients6.google.com` 劫持不到,
+        #   而界面上看不出任何异常 (用户只会觉得"某些站点没加速")。
+        #   所以把原始非法值**留痕**, 由界面/日志告知 —— 判据可以保守, 但必须可见。
+        data["redirect_mode"] = "hosts"
+        data["redirect_mode_invalid"] = str(_raw)
 
     return data
 
@@ -200,7 +249,14 @@ def load_config() -> dict:
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
 
-def save_config(config: dict):
+def save_config(config: dict) -> bool:
+    """落盘配置 (原子替换); **返回是否真的写成功**
+
+    ★ 为什么必须有返回值 (2026-10-03 定因): 本函数原先失败只 print, 调用方无从判断。
+    而 `redirect_manager._persist_proxy_backup` 依赖它来判断"用户原有代理设置的备份
+    到底有没有落盘" —— 那是进程被强杀后**唯一**的还原依据。没有返回值时, 备份写失败
+    仍会对外宣称"已自动备份并还原原有代理设置", 把"可恢复"建立在一次静默失败上。
+    """
     with _CONFIG_LOCK:
         tmp_file = CONFIG_FILE.with_suffix(".tmp")
         try:
@@ -220,6 +276,7 @@ def save_config(config: dict):
 
             # 3. 原子替换 (Windows 下原子重命名)
             os.replace(tmp_file, CONFIG_FILE)
+            return True
         except Exception as e:
             if tmp_file.exists():
                 try:
@@ -227,6 +284,7 @@ def save_config(config: dict):
                 except Exception:
                     pass
             print(f"[Config] 保存配置文件失败: {e}")
+            return False
 
 def update_config_key(key: str, value):
     with _CONFIG_LOCK:

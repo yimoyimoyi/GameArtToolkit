@@ -142,6 +142,13 @@ docs/
 # 探测/审计的结果数据 (脚本可上传, 结果属本机实测数据)
 scripts/*_results.json
 scripts/_probe_*
+# 根目录的候选节点探测报告 (本机实测数据: 逐服务候选 IP / 延迟 / 可用性)
+ipv4_report.json
+ipv6_report.json
+# 探测脚本落盘的一次性产物: 抓取的页面/响应头转储/图片与模型分片
+scripts/*.html
+scripts/*.txt
+scripts/*.bin
 tools/audit_result.txt
 # 测试与调试留下的临时文件
 temp_fast_hosts
@@ -169,3 +176,23 @@ scripts/clean_extra_root.py
 # tools 下的开发脚本 (运行时必需的 tools/ech_tunnel/ 不受影响: 只匹配 tools/*.py)
 tools/*.py
 scripts/*.json
+# Go 黑盒测试台 (仅测试用, 与 tests/ 同口径: 本地留存, 不上传)
+tools/h3_legtest/
+# 候选池探测三件套 (无运行时引用: 工具 + 生成的候选池描述 + 重生成/校验脚本)
+app/probe_pool.py
+app/pools.json
+scripts/regen_pools.py
+# 分组站点配置: **生成物**, 不入库 —— NginxManager.test_config() 会在 `nginx -t`
+# 之前按 service_profile.SITE_FILE_FOR_GROUP 重新渲染, 并只在预检通过后才原子
+# 提交回 conf/ (2026-10-04 实测: 四个文件全删后调用 test_config() 仍返回 True,
+# 并报 "已更新: site-acg/adult/dev/gaming.conf")。故全新 clone 首次启动会自愈,
+# nginx.conf 里那四条显式 include 不会因此失效。
+nginx/conf/site-*.conf
+
+# ── 编译产物 (2026-10-03) ──────────────────────────────────────────────
+# ECH 隧道的源码在 tools/ech_tunnel/ (echconfig.go / main.go / resolver.go),
+# 由 build.ps1 编译。二进制不入库 —— 但**源码必须留**。
+tools/ech_tunnel/ech-tunnel.exe
+tools/ech_tunnel/ech-tunnel.exe~
+tools/**/*.exe
+tools/**/*.exe~

@@ -14,7 +14,8 @@ from typing import Tuple, Dict
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
 from win_utils import is_process_running, is_port_in_use, get_pids_by_name, get_silent_startup_kwargs
-from nginx_generator import NginxConfGenerator
+from nginx_generator import NginxConfGenerator, _atomic_write_text
+import cert_manager
 from cert_manager import CertManager
 
 NGINX_EXE = NGINX_DIR / "nginx.exe"
@@ -104,23 +105,71 @@ class NginxManager:
           改写全机受信任存储"。这与"预检不得有副作用"直接冲突, 也是 4 次"在用根被删"
           事故里那一步的触发面。现在把它显式化: 预检只读, 证书准备由 start() 调用一次。
 
-        注意与"信任库"的分工: 本方法只负责**本目录**的证书文件 (叶证书按 SAN 重签),
-        不动受信任存储 —— 装机/清理那条路径在 app/cert_manager.py 的 install_cert /
-        prune_stale_trust_roots, 两者刻意分开。
+        ★ 分工已变更 (2026-10-03, 按用户定的不变式): 本方法现在**也负责收敛信任库** ——
+        调用 `cert_manager.ensure_single_usable_ca()`, 使状态满足"任一刻恰好有一个可用的根":
+          叶子由当前 ca.cer 签发 + 当前根已装机 + 其它自有根已清理 (三者皆幂等)。
+        为什么必须放在启动路径上: `nginx -t` 与 `curl -k` **都测不出**断链, 而断链的表现是
+          "所有本地域名不受信"; 实测本机出现过"源码树 ca.cer 不在信任库"的状态。
+        为什么仍与 test_config() 分开: 那是**只读预检**, 不得有副作用 —— 这条分界没变。
+        信任库操作需要管理员; 无权限时**不阻断**(如实报告), 以免把程序锁死在起不来的状态。
         """
         try:
-            return CertManager(cer_path=self.nginx_dir / "ca.cer",
-                               nginx_dir=self.nginx_dir).ensure_certificates()
+            _cm = CertManager(cer_path=self.nginx_dir / "ca.cer", nginx_dir=self.nginx_dir)
+            ok, msg = cert_manager.ensure_single_usable_ca(_cm)
         except Exception as e:
             return False, f"本地证书自检失败: {type(e).__name__}: {e}"
 
+        # ★ 运行清单校验 (2026-10-03): 证书文件齐了**不等于链是通的**。
+        #   分两类, 因为它们的"能不能立刻修"完全不同:
+        #     · **本地不变量** (文件齐全 / ca.key 与 ca.cer 配套 / 叶子由本目录的 CA 签发)
+        #       —— 任何环境下都必须成立 ⇒ **阻断**;
+        #     · **信任库** (签发叶子的根是否已装进系统信任库) —— 依赖环境 (是否装过机、
+        #       打包版是否换过根) ⇒ **告警**, 不阻断。沙箱测试里 CA 是现生成的、并未装机,
+        #       把它也当阻断会让测试无辜变红。
+        #   ⚠ 验签本身曾经写错并**恒返回 False**, 导致我据此虚报过一次"证书事故";
+        #     修正后的 _is_signed_by 用 verify_directly_issued_by, 详见其 docstring。
+        try:
+            import runtime_manifest
+            local = list(runtime_manifest.check(self.nginx_dir, include_trust=False))
+            trust = [p for p in runtime_manifest.check(self.nginx_dir) if p not in local]
+        except Exception as e:                  # 校验本身绝不该把启动带崩
+            local, trust = [], [f"运行清单校验本身失败: {type(e).__name__}: {e}"]
+        self.runtime_problems = local + trust
+        if local and ok:
+            return False, "运行清单校验未通过: " + "; ".join(local)
+        if trust:
+            msg = f"{msg} | ⚠ 运行清单(信任库): " + "; ".join(trust)
+        return ok, msg
+
     def test_config(self) -> Tuple[bool, str]:
-        """执行 nginx -t 进行语法与 upstream 预检 (包含前置模板渲染)"""
+        """执行 nginx -t 预检: **渲染 → 语法预检 → 通过才提交** (原缺陷 M1)
+
+        ## 原实现的两个问题 (2026-10-03 定因)
+
+        ① **自称只读却会改被跟踪文件**: 它内部直接调
+           `NginxConfGenerator.generate_all(self.nginx_dir / "conf")`,
+           于是每次启动、每次 `reload()` 都重写 `nginx/conf/site-*.conf` 三个**被 git 跟踪**
+           的文件 —— 而 `generate_all` 旧实现又是三次裸 `write_text`(非原子)。
+           这把"看一眼配置对不对"变成了"改动工作树"。
+        ② **先落盘再预检**: 万一新增画像渲染出的配置非法, 磁盘上已经是被改坏的版本,
+           nginx 下次 reload 会直接拒载 (而 site 与 upstream 是一对, 混合状态尤其危险)。
+
+        ## 现在的流程
+
+          1. 备齐 `upstream-dynamic.conf` 与缺失的 upstream 块 (这一步本来就必要);
+          2. 把**正式 conf 目录**整体复制到 `<cache>/precheck/<pid>/conf`, 在那里渲染;
+          3. 用该临时 prefix 跑 `nginx -t`;
+          4. **只有预检通过**才把渲染结果 `os.replace` 提交回正式目录 (单文件原子)。
+
+        ⚠ 写在 `cache/` 下、且每次调用带 PID 后缀, 是为了不进入被跟踪路径、
+          也不与并发的另一次预检互相踩 (本函数可能被 UI 线程与看门狗同时调用)。
+        """
         if not self.nginx_exe.exists():
             return False, "未找到 nginx.exe"
         try:
             from cdn_optimizer import CDNOptimizer
-            upstream_conf = self.nginx_dir / "conf" / "upstream-dynamic.conf"
+            conf_dir = self.nginx_dir / "conf"
+            upstream_conf = conf_dir / "upstream-dynamic.conf"
 
             # 1. 先确保 upstream-dynamic.conf 就绪 —— site 配置里 proxy_pass 的协议
             #    以该文件实际写入的后端为准 (走 ECH 隧道是回环明文 HTTP 入口, 退化
@@ -131,9 +180,6 @@ class NginxManager:
                 if not ok_apply:
                     return False, "自动补全 upstream 配置失败 (缺失: 文件缺失)"
 
-            # 2. 自动从 ServiceProfile 单源渲染三大站点配置
-            NginxConfGenerator.generate_all(self.nginx_dir / "conf")
-
             # ⚠ 证书生成**已从这里移走** (2026-10-02 定因):
             #   `test_config()` 的语义是"`nginx -t` 语法预检" —— 一个**看起来只读**的动作。
             #   而它原先会在里面调用 `CertManager(...).ensure_certificates()`, 也就是
@@ -142,36 +188,119 @@ class NginxManager:
             #   那一步的触发面 (生成发生在非预期目录时, 旧根会被当陈旧清除)。
             #   现在改由启动流程在调用 test_config() **之前**显式确保一次, 见 start()。
 
-            # 4. site 引用的 upstream 未定义时自动补全
+            # 2. site 引用的 upstream 未定义时自动补全
             #    (新增 ServiceProfile 后 site 配置会引用新 upstream, 若未重新测速则 nginx 无法启动;
             #    增量合并保留既有已优选节点, 仅补充缺失服务块)
-            missing_refs = []
             try:
                 text = upstream_conf.read_text(encoding="utf-8", errors="ignore")
                 defined = set(re.findall(r"upstream (upstream_[a-z0-9_]+)", text))
                 refs = CDNOptimizer(upstream_conf)._scan_site_upstream_refs()
                 missing_refs = sorted(refs - defined)
             except Exception:
-                pass
+                missing_refs = []
             if missing_refs:
                 ok_apply, _ = CDNOptimizer(upstream_conf).apply_optimal({})
                 if not ok_apply:
                     return False, f"自动补全 upstream 配置失败 (缺失: {missing_refs})"
-                # upstream 内容已变: 重新渲染一次, 让 proxy_pass 的协议跟上
-                NginxConfGenerator.generate_all(self.nginx_dir / "conf")
 
-            # 3. 执行 Nginx 语法预检 (不传 -p 以避免 Windows 下中文路径 ANSI 转换 1113 错误，以 cwd 为 prefix)
-            cmd = [str(self.nginx_exe), "-c", "conf/nginx.conf", "-t"]
-            proc = subprocess.run(
-                cmd, cwd=str(self.nginx_dir), capture_output=True,
-                text=True, errors="ignore", timeout=4, **get_silent_startup_kwargs()
-            )
-            if proc.returncode == 0 or "syntax is ok" in proc.stderr.lower() or "syntax is ok" in proc.stdout.lower():
-                return True, "Nginx 配置语法预检通过"
-            err_msg = (proc.stderr or proc.stdout).strip()
-            return False, f"Nginx 配置语法错误: {err_msg}"
+            # 3. 渲染 + 预检 + 提交
+            return self._render_precheck_and_commit(conf_dir)
         except Exception as e:
             return False, f"预检 Nginx 配置异常: {e}"
+
+    def _stage_conf_dir(self, src_conf: Path) -> Path:
+        """把正式 conf 目录复制到一个**临时 prefix** 下, 返回该 prefix 的 conf 路径
+
+        为什么不就地渲染再预检: 见 test_config() 的说明 —— 就地渲染等于
+        "先改被跟踪文件、再检查改得对不对"。
+        为什么整个复制而不是只复制 .conf: nginx 的 `-c` 是相对 prefix 的路径,
+        且 conf 里含 `ca/` 证书 (预检需要能读到它们)。conf 只有 ~0.1MB, 复制很便宜。
+
+        ⚠ **必须补齐 prefix 的骨架目录** (logs / cache / temp / html)。实测教训:
+          nginx 启动时会先去开 `logs/error.log`, 目录不存在就直接
+          `[alert] could not open error log file ... (3: The system cannot find the path specified)`
+          并**预检失败** —— 而我最初的实现把它当成"配置语法错", 于是预检永不通过,
+          修正后的配置再也提交不出去 (磁盘上留下的是更早那次坏渲染)。
+          这个坑的形态值得记住: **"预检环境的缺陷"会伪装成"被测对象的缺陷"**。
+        """
+        import os as _os
+        import shutil as _shutil
+        import tempfile as _tempfile
+        base = self.nginx_dir / "cache" / "precheck"
+        base.mkdir(parents=True, exist_ok=True)
+        tmp = Path(_tempfile.mkdtemp(prefix=f"t{_os.getpid()}_", dir=str(base)))
+        _shutil.copytree(src_conf, tmp / "conf")
+        # 骨架目录: 只要存在即可, nginx 会自己往里写 / 自己建需要的子目录
+        for sub in ("logs", "cache", "temp", "html"):
+            (tmp / sub).mkdir(parents=True, exist_ok=True)
+        self._precheck_tmp = tmp
+        return tmp / "conf"
+
+    def _cleanup_precheck(self) -> None:
+        tmp = getattr(self, "_precheck_tmp", None)
+        if tmp is not None:
+            try:
+                shutil.rmtree(tmp, ignore_errors=True)
+            except Exception:
+                pass
+            self._precheck_tmp = None
+
+    def _render_precheck_and_commit(self, conf_dir: Path) -> Tuple[bool, str]:
+        """在临时 prefix 里渲染并 `nginx -t`; 通过才把渲染结果提交回正式目录
+
+        ⚠ **关键顺序**: 必须先把渲染结果**写进临时目录**, 再跑 `nginx -t`。
+          实测踩到过反过来的写法: 只拿到渲染出的文本、没写进临时 conf, 于是
+          `nginx -t` 校验的是**临时目录里从正式目录复制过来的旧内容** ——
+          预检"通过", 然后坏内容被提交到正式目录。
+          这个坑的形态很值得记住: **预检对象与提交对象不是同一份**时,
+          预检通过与否与"要提交的东西合不合法"毫无关系。
+        """
+        staged_conf = self._stage_conf_dir(conf_dir)
+        try:
+            # 1) 在临时目录里渲染并**落盘到临时目录** (正式目录此刻一个字节都没动)
+            try:
+                rendered = NginxConfGenerator.render_all(staged_conf)
+            except Exception as e:
+                return False, f"站点配置渲染失败: {e}"
+            for name, content in rendered.items():
+                try:
+                    _atomic_write_text(staged_conf / name, content)
+                except Exception as e:
+                    return False, f"临时站点配置写入失败 ({name}): {e}"
+
+            # 2) 用临时 prefix 预检 —— 此刻校验的正是**将要提交的那份内容**。
+            #    cwd 即 prefix (不传 -p, 以避免 Windows 下中文路径 ANSI 转换 1113 错误,
+            #    与旧实现同一口径)。
+            prefix = staged_conf.parent
+            proc = subprocess.run(
+                [str(self.nginx_exe), "-c", "conf/nginx.conf", "-t"],
+                cwd=str(prefix), capture_output=True,
+                text=True, errors="ignore", timeout=8, **get_silent_startup_kwargs()
+            )
+            ok = (proc.returncode == 0
+                  or "syntax is ok" in (proc.stderr or "").lower()
+                  or "syntax is ok" in (proc.stdout or "").lower())
+            if not ok:
+                err_msg = (proc.stderr or proc.stdout or "").strip()
+                return False, f"Nginx 配置语法错误: {err_msg}"
+
+            # 3) 预检通过 ⇒ 提交 (每个文件 tmp + os.replace, 不会出现半截内容)
+            dirty = []
+            for name, content in rendered.items():
+                target = conf_dir / name
+                try:
+                    if target.exists() and target.read_text(
+                            encoding="utf-8", errors="ignore") == content:
+                        continue          # 内容没变就不动文件 (避免无意义的 mtime 抖动)
+                except Exception:
+                    pass
+                _atomic_write_text(target, content)
+                dirty.append(name)
+            if dirty:
+                return True, f"Nginx 配置语法预检通过 (已更新: {', '.join(sorted(dirty))})"
+            return True, "Nginx 配置语法预检通过 (无变更)"
+        finally:
+            self._cleanup_precheck()
 
     def check_port_occupancy(self, port: int) -> Dict:
         """诊断指定端口是否被占用"""

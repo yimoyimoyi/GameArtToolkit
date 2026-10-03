@@ -32,6 +32,7 @@ GameArt Toolkit - HTTP/3 上游腿 (nginx 明文回环 → 本模块 → HTTP/3 
 import asyncio
 import collections
 import concurrent.futures
+import functools
 import queue
 import socket
 import ssl
@@ -106,6 +107,151 @@ MAX_TOTAL_ATTEMPTS = 6
 # 为什么必须有它: 仅靠"次数上限"挡不住长尾 —— 6 次 × 8s = 48s 仍然太久。
 # 流式/有状态协议需要的是"要么成功, 要么尽快失败"。
 RETRY_TIME_BUDGET = 12.0
+
+
+# ── pre-emit 单次上限 (2026-10-03) ──────────────────────────────────────────────
+# 实测症状: 一次挂住的尝试吃满**整个**请求预算 (失败耗时精确等于 12.0s = 客户端上限),
+#   于是候选里的好地址轮不到。
+# 为什么 A/B 两条路线都失败 (各自实测 20 个用例红):
+#   它们只改了"档用在哪", 而问题在于**时间截断会丢掉阶段信息** —— 超时只说"超时",
+#   而族跳过要的是"握手失败"。阶段一丢, 同族地址全被尝试 (2→4 次), 越改越慢。
+# 本实现补上两件缺的东西:
+#   1. **只截断"输出开始之前"那一段** —— 一旦 emitted 就换成完整预算等完,
+#      否则会把成功但较大的传输一起砍掉 (4MB 分段必然超过该上限), 那是灾难性的;
+#   2. **把阶段补回来** —— 被截断时按当时阶段归类 (握手/首头), 于是族跳过照常生效。
+#
+# ⚠⚠ 结论: 该机制**当前不启用** (2026-10-03 真机实测, 四方对照)
+#   技术上可行 —— 测试全绿 (10 个新用例 + h3 全部 124 个, 含 A/B 打破的那 20 个族跳过用例),
+#   因为"被截断时按当时阶段归类"确实补回了 A/B 丢掉的信息。
+#   但它在**真实链路上有害**, 且任何"有用的取值"都有害:
+#     同一节点名、同一批候选地址 (2607:f8b0:4007:4::6 / 74.125.157.70), 各 24 次交错:
+#       启用本上限 (2.5s)   →  成功  0/24 (0%)    失败耗时 p50=p95=max=5.1s (=2×2.5s)
+#       回退(单次用满预算)  →  成功 22/24 (92%)   失败耗时 p50=9.2s
+#   原因就在 DEFAULT_FIRST_BYTE_TIMEOUT 的注释里: **gvs 服务端自己就慢** —— 实测两次
+#   真实成功要 5.5s / 7.2s, 那正是 first_byte 档设为 8s 的理由。
+#   ⇒ 能把 12s 停顿压下去的档 (2~3s) 必然短于合法的首字节耗时, 于是**杀掉本来会成功的请求**;
+#     而不会误杀的那些档 (≥8s) 相对 12s 预算几乎没有收益。
+#   ⇒ 四种方案里最好的是**现状** (单次尝试用满预算)。保留本段仅为记录结论:
+#     调用点已回退, 机制不生效; 若要重新评估, 必须先有"成功请求的首字节耗时分布"。
+ATTEMPT_PRE_EMIT_CAP = 2.5
+
+# 往响应队列里推一项时的**单次有界等待** (秒)。队列满就等这么久, 然后回到循环顶部
+# 重新检查"客户端是否已走" —— 见 _forward.emit 的 H4 注释。
+# 取值理由: 够长以免在高吞吐下空转; 够短以免客户端消失后白等 (它只影响放弃的延迟)。
+_EMIT_PUT_TIMEOUT = 0.5
+
+# 成绩单健康分档阈值 —— **从 gvs_h3_probe 取**, 不在这里各写一份 (原缺陷 M10)。
+# 为什么用 try/except 而不是无条件 import: gvs_h3_probe 是带 CLI 的诊断模块,
+# 让"腿能否加载"依赖它、并因此把失败级联到整个加速器, 代价不对等。
+# 因此取不到常量时退回**字面量相同的默认值**, 但把那件事记进事件环 (见 _health_constants_ok),
+# 而不是静默漂移 —— 判据可以退回, 但"我退回了"必须可见。
+try:
+    from gvs_h3_probe import FLAKY_THRESHOLD as _PROBE_FLAKY_THRESHOLD
+    from gvs_h3_probe import OK_THRESHOLD as _PROBE_OK_THRESHOLD
+    _PROBE_THRESHOLDS_FROM_MODULE = True
+except Exception:                                   # pragma: no cover - 依赖缺失时的退路
+    _PROBE_OK_THRESHOLD = 0.8
+    _PROBE_FLAKY_THRESHOLD = 0.3
+    _PROBE_THRESHOLDS_FROM_MODULE = False
+
+
+class ClientGone(Exception):
+    """客户端已放弃该请求 (连接中断 / 队列无人消费) —— 用于让 _forward 协程立刻解栈
+
+    为什么必须是**独立异常类型**而不是复用 OSError: forward() 需要区分
+    "上游失败(可以换候选重试)" 与 "客户端没了(重试毫无意义, 而且会污染成绩单)"。
+    把它混进普通 Exception 会让腿在客户端已经取消之后继续烧候选与预算。
+    """
+
+# ---------------------------------------------------------------------------
+# 地址级失败记忆 (跨请求) —— 2026-10-02 节点实测逼出来的
+#
+# `scripts/probe_gvs_nodes.py` 经**生产腿**对 12 个真实节点 × 4 轮交错采样:
+#   · 失败是**按 (节点, 地址) 粘滞**的, 不是随机的:
+#       rr5---sn-ajaig5-5h → 每轮都失败在 2a00:1450:4009...  (3/3)
+#       rr1---sn-5hne6nzk  → 每轮都失败在 2a00:1450:400e...  (3/3)
+#       rr1---sn-p5qddn7k / rr1---sn-p5qlsn6s → 每轮都失败在 2607:f8b0:4004... (3/3)
+#     而同族里另一些节点在**同一时刻** 0.4~2.0s 就拿到真 gvs 响应 (403 + server: gvs)。
+#   · 一次首头失败要烧掉 **8.3s** (首头预算 DEFAULT_FIRST_BYTE_TIMEOUT=8s),
+#     而一次请求的重试墙钟预算只有 RETRY_TIME_BUDGET=12s ⇒ 连续两个死地址就会把预算耗尽。
+#   · 同一个节点在不同轮次给出**相反结论** (rr1---sn-p5qs7nd7: 502 → 403 → 502) ——
+#     这正是"卡顿/降码率"的机理: 解析出的候选里既有死地址也有活地址, 每次请求**掷硬币**
+#     决定先试哪个; 掷到死地址就白等 8s 再可能被预算掐断。
+#
+# 对策 = 给每个**地址**记一笔失败账 (带冷却与衰减), 排序时把冷却中的地址往后放:
+#   · 首头阶段失败 (STAGE_HEADERS) 才记账 —— 握手失败已由 B1 的族级逻辑处理, 重复记账
+#     会让"整族抖动"被放大成"地址全黑"。
+#   · **只降权, 不禁用**: 冷却地址仍然在候选里 (排后), 且当全部候选都在冷却时按原顺序试 ——
+#     绝不允许"记忆"造出永久盲区 (本项目对"假可用"的红线同样适用于"假不可用")。
+#   · 一成功即清零 (reward), 因此它是**近期可用性**而非终身判决。
+ADDR_COOLDOWN_SECONDS = 90.0        # 首次首头失败后的冷却时长
+ADDR_COOLDOWN_MAX_SECONDS = 600.0   # 连续失败时的冷却上限 (指数增长到此封顶)
+
+# ⚠ 默认 **关闭** —— 这是同刻交错 A/B 的结论, 不是保守取值 (2026-10-02):
+#   `python scripts/probe_gvs_nodes.py --ab --rounds 4` (每个 (轮, 节点) 先发一条启用记忆的
+#   请求, 紧接着发一条关闭记忆的请求, 8 节点 × 4 轮 × 2 臂 = 64 条):
+#       记忆 ON : 成功 13/32 (40.6%), 成功样本中位延迟 464ms
+#       记忆 OFF: 成功 17/32 (53.1%), 成功样本中位延迟 377ms
+#   即**没有观察到收益**。机理也解释了为什么不该有收益 —— 同一时刻对 5 个节点各解析 4 次,
+#   每个节点**只有一种答案** `(1 个 v6, 1 个 v4)`, 且 v6 就是那个时好时坏的地址:
+#       rr5---sn-ajaig5-5h → 恒定 2a00:1450:4009:1e::5 + 173.194.129.85
+#     于是"族内把失败地址后移"在这套拓扑下是**空操作** (族内只有一个地址, 无处可移)。
+#   保留代码而不删除的理由: 它的收益条件是"同一族内 ≥2 个地址且其中一个是坏的" ——
+#   本轮 12 个节点都不是这种形态, 但换 IP 段/换节点名后可能出现; 届时应**先用 --ab 复测**
+#   再打开, 与本项目对 DEFAULT_RETRY_SAME_NODE 的处置口径一致 (无证据不默认开启)。
+ADDR_HEALTH_ENABLED_DEFAULT = False
+
+# ---------------------------------------------------------------------------
+# 节点成绩单 (跨会话) —— 见 _NodeScoreboard docstring
+NODE_SCORE_KEY = "gvs_node_scores"      # config.json 键 (沿用 quic_optimal_ips 的存储模式)
+NODE_SCORE_MAX = 60                     # 有界: 只保留最近见过的 60 个节点
+NODE_SCORE_MIN_SAMPLES = 6              # 低于该样本数不下"可用率"结论 (只报 NO_DATA)
+NODE_SCORE_HEALTHY_RATE = 0.5           # 单节点"健康"的可用率门槛
+NODE_SCORE_FLUSH_SECONDS = 120.0        # 落盘节流: 不在请求路径上频繁写配置
+
+
+# 慢 / 活 / 死 **三态** (2026-10-03)
+#   为什么必须是三态: 二值判据(健康与否)会把"慢但能通"的节点算成不健康而**永久跳过** ——
+#   这恰好是"快速失败"的单点失效模式 (短档判死 -> 慢节点被拉黑 -> 候选越用越少)。
+#   与腿里 rank 3 把"可疑"和"没数据"混成一个值, 是同一类错误: **用二值去表达三态事实**。
+#   各态都有明确的可操作含义:
+#     healthy    快档即通             -> 优先
+#     slow_alive 能通但首字节很慢      -> 可用, 排后面(最后手段), **不该被拉黑**
+#     dead       多数失败             -> 跳过 + 退避
+#     no_data    样本不足             -> **必须单独一态**, 不能并进 dead
+#                                        (否则新节点一上来就被当死节点跳过)
+#   好消息: **无需新增埋点** —— ok/fail 计数与成功时的首字节耗时 fb_ms 都已采集。
+NODE_SLOW_FIRST_BYTE_MS = 2500.0
+
+
+def node_state(entry: Dict[str, Any],
+               min_samples: int = NODE_SCORE_MIN_SAMPLES,
+               healthy_rate: float = NODE_SCORE_HEALTHY_RATE,
+               slow_ms: float = NODE_SLOW_FIRST_BYTE_MS) -> str:
+    """由成绩单记录推导节点状态 (纯函数: 便于单测, 也便于别处复用同一判据)
+
+    数据全部来自已有采集, 不引入新字段。坏数据(手改坏的 fb_ms)按"不慢"处理, 不让
+    一个坏值把判据打崩 —— 成绩单是落盘数据, 必须假设它可能被改坏。
+    """
+    try:
+        ok = int(entry.get("ok", 0) or 0)
+        fail = int(entry.get("fail", 0) or 0)
+    except (TypeError, ValueError):
+        return "no_data"
+    total = ok + fail
+    if total < min_samples:
+        return "no_data"
+    if ok <= 0:
+        return "dead"
+    if ok / total < healthy_rate:
+        return "dead"
+    fb = entry.get("fb_ms")
+    try:
+        if fb is not None and float(fb) >= slow_ms:
+            return "slow_alive"
+    except (TypeError, ValueError):
+        pass
+    return "healthy"
 
 # 不允许携带消息体的状态码 (RFC 9110 §6.4.1 / §15.3.5 / §15.4.5):
 # 204 与 304 的头部之后就结束, **既不得带 Content-Length 也不得带 Transfer-Encoding**。
@@ -343,6 +489,215 @@ def plan_http1_response(status: Optional[int],
             "strip_length_headers": False}
 
 
+class _NodeScoreboard:
+    """节点级成绩单 (跨会话) —— 从**浏览器真实流量**零成本采集
+
+    ## 为什么是它 (2026-10-03 节点探查方案的 L1)
+
+    实测把"地址多样性"两条路都否掉了:
+      · 4 个别名域 (gvt1/snap.gvt1/bdn.dev/gcpcdn.gvt1) 对同一节点名**答案逐字相同**;
+      · 多解析器里只有 `doh.pub` 给 Google 段答案 (alidns/360 回投毒地址, 其余不可达)。
+    ⇒ **每个节点只有一个可用地址**, 所以"哪个节点此刻能用"是唯一可探查的维度,
+      而探查它的最佳数据源不是合成探测 (受 `n=`/UMP 体限制, 上轮 failover 实验已栽),
+      而是**浏览器自己的播放请求** —— 腿的 `_RequestTap` 三个记录点已经在记录
+      `host`(节点名) / `status` / `first_byte_ms` / `bytes` / `err`, 成功失败都记。
+
+    本类只做一件事: 把这些**已经存在**的记录按节点名累加, 并落盘跨会话保留。
+
+    ## 口径 (必须与"播放可用"对齐, 否则又是一次自欺)
+
+    · 只要**拿到了 HTTP 响应**就算该节点活着 —— 包括 gvs 对普通 GET 回的 403/400
+      (`server: gvs 1.0` 说明确实打到了真视频服务)。按状态码<500 判定即可。
+    · 失败按**原因分类**, 因为三类对应完全不同的处置:
+        resolve_empty -> 该节点名从本机拿不到 Google 段答案 (strict 解析的正确答案, 换名才有用)
+        handshake     -> 地址族整体不可达 (已有 B1 族级跳过)
+        headers       -> 连上了但等不到首头 (`upstream_no_response`, 本篇的主角: 时变)
+    · **客户端自己的错不算节点头上** (body_too_large / bad_content_length / 断流) ——
+      否则会把"我们读体失败"记成"节点坏"。
+    · 有界: 只保留最近见过的 N 个节点; 落盘节流 (见 NODE_SCORE_FLUSH_SECONDS),
+      避免每个请求都写配置文件。
+    """
+
+    def __init__(self, max_nodes: int = NODE_SCORE_MAX, autoload: bool = True,
+                 persist: bool = True):
+        self.max_nodes = int(max_nodes)
+        # persist=False 供**命令行探测工具**用: 它们会造大量合成请求 (403/502),
+        # 若写进同一份 config 键, 会污染"浏览器真实播放统计"这个口径 —— 而健康门正是读它的。
+        self.persist = bool(persist)
+        self._lock = threading.Lock()
+        self._nodes: Dict[str, Dict[str, Any]] = {}
+        self._dirty = False
+        self._last_flush = 0.0
+        if autoload:
+            self.load()
+
+    # ---------------------------------------------------------------- 采集
+    @staticmethod
+    def _classify(status: Optional[int], err: str) -> Optional[str]:
+        """-> "ok" / "resolve_empty" / "handshake" / "headers" / "other" / None(不记账)"""
+        e = str(err or "").lower()
+        # 客户端侧错误: 不是节点的错, 不记账
+        if any(k in e for k in ("body_too_large", "bad_content_length",
+                                "chunked_body_truncated", "client")):
+            return None
+        if isinstance(status, int) and status < 500:
+            return "ok"
+        if "resolve_empty" in e:
+            return "resolve_empty"
+        if "resolve_failed" in e:
+            return "resolve_empty"
+        if "handshake" in e:
+            return "handshake"
+        if "no_response" in e:
+            return "headers"
+        return "other" if status is None else "ok"
+
+    def record(self, host: str, status: Optional[int] = None, err: str = "",
+               first_byte_ms: Optional[float] = None, bytes_: int = 0) -> None:
+        """记一条真实请求结果 (节点名须属 GVS 家族; 其余忽略)"""
+        node = node_name_from_host(host or "")
+        if not node or not is_gvs_family_host(host or ""):
+            return
+        kind = self._classify(status, err)
+        if kind is None:
+            return
+        now = time.time()
+        with self._lock:
+            e = self._nodes.get(node)
+            if e is None:
+                if len(self._nodes) >= self.max_nodes:
+                    # 淘汰最久未见的节点 (有界: 成绩单不该无界增长)
+                    worst = min(self._nodes, key=lambda k: self._nodes[k].get("last_seen", 0))
+                    self._nodes.pop(worst, None)
+                e = {"ok": 0, "fail": 0, "classes": {}, "bytes": 0,
+                     "first_seen": now, "last_seen": now,
+                     "last_ok": 0.0, "last_fail": 0.0}
+                self._nodes[node] = e
+            e["last_seen"] = now
+            if kind == "ok":
+                e["ok"] += 1
+                e["last_ok"] = now
+                e["bytes"] = int(e.get("bytes", 0)) + int(bytes_ or 0)
+                if first_byte_ms:
+                    e["fb_ms"] = round(float(first_byte_ms), 1)
+            else:
+                e["fail"] += 1
+                e["last_fail"] = now
+                e["classes"][kind] = e["classes"].get(kind, 0) + 1
+            self._dirty = True
+        self.save()          # 内部按 NODE_SCORE_FLUSH_SECONDS 节流; 失败静默
+
+    # ---------------------------------------------------------------- 读出
+    def ranked(self, min_samples: int = 1) -> List[Dict[str, Any]]:
+        """按可用率排序 (样本不足的排在后面, 但**不隐藏** —— 它们正是"待观察"名单)"""
+        with self._lock:
+            rows = []
+            for node, e in self._nodes.items():
+                total = e["ok"] + e["fail"]
+                if total < min_samples:
+                    continue
+                rows.append({"node": node, "ok": e["ok"], "fail": e["fail"],
+                             "total": total, "rate": round(e["ok"] / total, 3),
+                             # 三态随行给出 (见 node_state): 调用方不必再自写一份判据
+                             "state": node_state(e),
+                             "classes": dict(e["classes"]),
+                             "last_ok": round(e.get("last_ok", 0.0), 1),
+                             "last_fail": round(e.get("last_fail", 0.0), 1),
+                             "fb_ms": e.get("fb_ms")})
+            rows.sort(key=lambda r: (-r["rate"], -r["ok"], r["node"]))
+            return rows
+
+    def summary(self, min_samples: int = NODE_SCORE_MIN_SAMPLES) -> Dict[str, Any]:
+        """给健康门/UI 用的一句话结论 (样本不足时如实说"样本不足", 不猜)"""
+        with self._lock:
+            nodes = list(self._nodes.items())
+        total = sum(e["ok"] + e["fail"] for _n, e in nodes)
+        ok = sum(e["ok"] for _n, e in nodes)
+        healthy = [n for n, e in nodes
+                   if (e["ok"] + e["fail"]) >= min_samples and e["ok"] > 0
+                   and e["ok"] / max(1, e["ok"] + e["fail"]) >= NODE_SCORE_HEALTHY_RATE]
+        return {"nodes": len(nodes), "samples": total, "ok": ok,
+                "rate": round(ok / total, 3) if total else None,
+                "healthy_nodes": len(healthy), "enough_samples": total >= min_samples,
+                "state": self.state(min_samples=min_samples)}
+
+    def state(self, min_samples: int = NODE_SCORE_MIN_SAMPLES) -> str:
+        """OK / FLAKY / UNSTABLE / NO_DATA —— 阈值**从 gvs_h3_probe 导入**, 不再各写一份
+
+        ★ M10 (2026-10-03): 原实现这里硬编码 `0.8` / `0.3`, 而 docstring 却声称
+        "阈值与 app/gvs_h3_probe 对齐" —— 注释是唯一的规格说明, 于是两边会静默漂移
+        (改了一处忘了另一处, 界面显示的门槛与探针闸门的门槛就不是一回事)。
+        现在直接从 gvs_h3_probe 取常量: 单一来源, 改了必然一起改。
+        """
+        with self._lock:
+            total = sum(e["ok"] + e["fail"] for e in self._nodes.values())
+            ok = sum(e["ok"] for e in self._nodes.values())
+        if total < min_samples:
+            return "NO_DATA"
+        rate = ok / total
+        if rate >= _PROBE_OK_THRESHOLD:
+            return "OK"
+        if rate >= _PROBE_FLAKY_THRESHOLD:
+            return "FLAKY"
+        return "UNSTABLE"
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._nodes.items()}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._nodes.clear()
+            self._dirty = True
+
+    # ---------------------------------------------------------------- 落盘
+    def to_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._nodes.items()}
+
+    def load(self) -> None:
+        """从配置读回 (失败一律静默: 成绩单是"锦上添花", 绝不能因此挡住腿启动)"""
+        try:
+            from config_store import load_config
+            data = (load_config() or {}).get(NODE_SCORE_KEY) or {}
+            if not isinstance(data, dict):
+                return
+            with self._lock:
+                for k, v in list(data.items())[:self.max_nodes]:
+                    if isinstance(v, dict):
+                        self._nodes[str(k)] = {
+                            "ok": int(v.get("ok", 0) or 0), "fail": int(v.get("fail", 0) or 0),
+                            "classes": dict(v.get("classes") or {}),
+                            "bytes": int(v.get("bytes", 0) or 0),
+                            "first_seen": float(v.get("first_seen", 0) or 0),
+                            "last_seen": float(v.get("last_seen", 0) or 0),
+                            "last_ok": float(v.get("last_ok", 0) or 0),
+                            "last_fail": float(v.get("last_fail", 0) or 0),
+                            "fb_ms": v.get("fb_ms")}
+        except Exception:
+            pass
+
+    def save(self, force: bool = False) -> bool:
+        """节流落盘 (force=True 用于退出/停止时) —— 任何异常都不得影响请求路径"""
+        if not self.persist:
+            return False
+        now = time.time()
+        with self._lock:
+            if not self._dirty:
+                return False
+            if not force and (now - self._last_flush) < NODE_SCORE_FLUSH_SECONDS:
+                return False
+            payload = {k: dict(v) for k, v in self._nodes.items()}
+            self._dirty = False
+            self._last_flush = now
+        try:
+            from config_store import update_config_key
+            update_config_key(NODE_SCORE_KEY, payload)
+            return True
+        except Exception:
+            return False
+
+
 class _RequestTap:
     """请求级诊断 tap —— 回答"浏览器到底发了什么、gvs 怎么回的"
 
@@ -355,14 +710,29 @@ class _RequestTap:
       method, path_prefix (去掉查询串), body_len, status, first_byte_ms, total_ms, bytes
     另附 SABR 线索: 请求头/响应头里是否出现 ump / sabr 关键字 (只看关键字, 不落全文)。
     有界 (deque maxlen) —— 诊断数据不该无界增长, 也不该留存任何查询串内容 (含签名参数)。
+
+    ⚠ 2026-10-03: 同时把每条记录喂给 `_NodeScoreboard` (见其 docstring) —— 这样
+    "节点成绩单"不需要任何新代码路径去采集, 用**同一份**已经存在的诊断数据即可。
     """
 
-    def __init__(self, maxlen: int = TAP_RING_MAX):
+    def __init__(self, maxlen: int = TAP_RING_MAX, scores: Optional["_NodeScoreboard"] = None):
         self._dq: "collections.deque" = collections.deque(maxlen=maxlen)
+        self._scores = scores
 
     def record(self, **kw) -> None:
         kw.setdefault("t", round(time.time(), 2))
         self._dq.append(kw)
+        # 同一份记录顺带喂给节点成绩单 (零额外采集成本, 见 _NodeScoreboard docstring)。
+        # 任何异常都吞掉: 诊断/统计绝不能影响请求路径。
+        if self._scores is not None:
+            try:
+                self._scores.record(host=str(kw.get("host") or ""),
+                                    status=kw.get("status"),
+                                    err=str(kw.get("err") or ""),
+                                    first_byte_ms=kw.get("first_byte_ms"),
+                                    bytes_=int(kw.get("bytes") or 0))
+            except Exception:
+                pass
 
     def snapshot(self) -> List[Dict[str, Any]]:
         return list(self._dq)
@@ -491,6 +861,91 @@ def attempt_order(ips: Sequence[str], limit: int = 4) -> List[str]:
     return out[:limit]
 
 
+def order_candidates(ips: Sequence[str], cooling: Optional[Callable[[str], bool]] = None,
+                     limit: int = 4) -> List[str]:
+    """在 `attempt_order` 的族交替基础上, 把"冷却中"的地址在**本族内**后移
+
+    为什么是"本族内后移"而不是整体重排: `attempt_order` 的族交替是 B1 的实测成果
+    (googlevideo 只有 v6 通、Cloudflare 只有 v4 通)。若把冷却地址整体挪到队尾, 就可能
+    出现 [v4_死族, v6_冷却, v6_活] —— 反而先撞整个不可达的族。族内后移两头的性质都保住:
+     每个族仍有代表靠前, 而"刚失败过的地址"不会被优先重试。
+
+    cooling(ip) 为 None 或全部候选都在冷却时, 行为与 `attempt_order` 逐字一致 (不留盲区)。
+    """
+    ordered = attempt_order(ips, limit=len(ips) or limit)
+    if cooling is None or not ordered:
+        return ordered[:limit]
+    v6 = [ip for ip in ordered if ":" in ip]
+    v4 = [ip for ip in ordered if ":" not in ip]
+    if not any(cooling(ip) for ip in ordered):
+        return ordered[:limit]
+    v6 = [ip for ip in v6 if not cooling(ip)] + [ip for ip in v6 if cooling(ip)]
+    v4 = [ip for ip in v4 if not cooling(ip)] + [ip for ip in v4 if cooling(ip)]
+    out: List[str] = []
+    for i in range(max(len(v6), len(v4))):
+        if i < len(v6):
+            out.append(v6[i])
+        if i < len(v4):
+            out.append(v4[i])
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+class _AddrHealth:
+    """地址级失败记忆 (跨请求, 线程安全) —— 见 ADDR_COOLDOWN_SECONDS 上方的实测依据
+
+    只降权不禁用: 冷却中的地址仍会排在候选里 (族内靠后), 且一成功即清零。
+    """
+
+    def __init__(self, base: float = ADDR_COOLDOWN_SECONDS,
+                 cap: float = ADDR_COOLDOWN_MAX_SECONDS,
+                 enabled: bool = ADDR_HEALTH_ENABLED_DEFAULT):
+        self.base = float(base)
+        self.cap = float(cap)
+        self.enabled = bool(enabled)
+        self._lock = threading.Lock()
+        self._fails: Dict[str, int] = {}
+        self._until: Dict[str, float] = {}
+        self._last_ok: Dict[str, float] = {}
+
+    def cooling(self, ip: str, now: Optional[float] = None) -> bool:
+        if not self.enabled:
+            return False
+        now = time.time() if now is None else now
+        with self._lock:
+            return self._until.get(ip, 0.0) > now
+
+    def penalty(self, ip: str) -> float:
+        """记一次首头失败, 返回本次冷却时长 (指数增长, 封顶 cap)"""
+        if not self.enabled:
+            return 0.0
+        with self._lock:
+            n = self._fails.get(ip, 0) + 1
+            self._fails[ip] = n
+            secs = min(self.cap, self.base * (2 ** (n - 1)))
+            self._until[ip] = time.time() + secs
+            return secs
+
+    def reward(self, ip: str) -> bool:
+        """记一次成功; 返回是否**之前处于冷却/失败态** (用于产出"已恢复"事件)"""
+        with self._lock:
+            was = bool(self._fails.get(ip))
+            self._fails.pop(ip, None)
+            self._until.pop(ip, None)
+            self._last_ok[ip] = time.time()
+            return was
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            return {ip: {"fails": self._fails.get(ip, 0),
+                         "cooling_for_s": round(max(0.0, self._until.get(ip, 0.0) - now), 1),
+                         "last_ok_s_ago": (round(now - self._last_ok[ip], 1)
+                                           if ip in self._last_ok else None)}
+                    for ip in set(self._fails) | set(self._until) | set(self._last_ok)}
+
+
 def is_reusable(proto: Any) -> bool:
     """连接是否仍可复用
 
@@ -588,7 +1043,8 @@ class H3Forwarder:
                  connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
                  idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
                  target_port: int = 443,
-                 retries: int = DEFAULT_RETRY_SAME_NODE):
+                 retries: int = DEFAULT_RETRY_SAME_NODE,
+                 persist_scores: bool = True):
         self.resolver = resolver
         self.sni_for = sni_for or (lambda h: h)
         self.connect_timeout = connect_timeout
@@ -601,7 +1057,13 @@ class H3Forwarder:
         self._conn_lock: Optional["asyncio.Lock"] = None   # 惰性创建 (必须在事件循环内)
         self.stats = {"requests": 0, "reused": 0, "new_conn": 0, "errors": 0}
         self.events = _EventRing()          # 有界事件环 (盲区自陈, 见 _EventRing)
-        self.tap = _RequestTap()            # 请求级诊断 tap (见 _RequestTap)
+        # 节点成绩单 (跨会话, 见 _NodeScoreboard): 由 tap 的同一份记录喂数据。
+        # 位置在 tap 之前 —— tap 需要持有它, 才能做到"零额外采集路径"。
+        self.node_scores = _NodeScoreboard(persist=persist_scores)
+        self.tap = _RequestTap(scores=self.node_scores)   # 请求级诊断 tap (见 _RequestTap)
+        # 地址级失败记忆 (见 ADDR_HEALTH_ENABLED_DEFAULT 上方的同刻 A/B 实测): 默认**关闭**,
+        # 因此生产行为与引入前逐字一致; 打开后才让"最近失败过的地址"在本族内后移。
+        self.addr_health = _AddrHealth(enabled=ADDR_HEALTH_ENABLED_DEFAULT)
 
     async def _get_conn(self, ip: str, sni: str):
         from aioquic.asyncio.client import connect
@@ -618,12 +1080,18 @@ class H3Forwarder:
         if self._conn_lock is None:
             self._conn_lock = asyncio.Lock()
         async with self._conn_lock:
+            stale = None
             with self._pool_lock:
                 ent = self._pool.get(key)
                 if ent is not None and is_reusable(ent[0]):
                     self.stats["reused"] += 1
                     return ent[0]
-                self._pool.pop(key, None)
+                # 不可复用/不存在的条目必须**取出并关闭**, 不能只 pop (见 _discard_conn)。
+                # 注意这里不能直接调 self._discard_conn(): 它内部会再取一次 _pool_lock,
+                # 而我们已经持有它 (threading.Lock 不可重入) ⇒ 会死锁。
+                stale = self._pool.pop(key, None)
+            if stale is not None:
+                await self._aclose_conn(stale)
 
             cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN,
                                     verify_mode=ssl.CERT_NONE)
@@ -648,19 +1116,86 @@ class H3Forwarder:
                 self._pool[key] = (proto, cm)
             return proto
 
+    def _await_attempt(self, fut, phase, budget) -> None:
+        """等到本次尝试结束; **单次上限只作用于"输出开始之前"那一段**
+
+        为什么上限只覆盖 pre-emit (2026-10-03 实测定因):
+          · 实测一次挂住的尝试吃满整个请求预算 (失败耗时精确等于 12.0s = 客户端上限),
+            于是候选里的好地址轮不到 —— 而"挂住"发生在**首头之前**;
+          · 但若把上限作用于**整个**尝试, 会连"成功但较大"的传输一起截断
+            (4MB 分段必然超过 2.5s) —— 那是灾难性的;
+          · 所以一旦 phase 里出现 emitted, 就改用完整预算等完。
+        为什么必须把阶段补回来 (A/B 两条路线各自实测 20 个用例红, 就死在这里):
+          时间截断本身只给出"超时", 而族跳过要的是"握手失败";
+          不按当时阶段归类, 同族地址就会全被尝试 (实测 2→4 次), **越改越慢**。
+        """
+        deadline = time.perf_counter() + ATTEMPT_PRE_EMIT_CAP
+        while True:
+            try:
+                fut.result(timeout=0.05)
+                return
+            except TimeoutError:
+                if phase.get("emitted"):
+                    # 已开始输出: 不得再截断, 用完整预算等完 (行为与改动前一致)
+                    fut.result(budget.max_duration)
+                    return
+                if time.perf_counter() >= deadline:
+                    raise UpstreamStageError(
+                        phase.get("stage") or UpstreamStageError.STAGE_HANDSHAKE,
+                        f"attempt_pre_emit_cap({ATTEMPT_PRE_EMIT_CAP:g}s)")
+
     async def _forward(self, ip: str, sni: str, authority: str, method: str, path: str,
                        headers: Sequence[Tuple[str, str]], body: bytes,
-                       out: "queue.Queue", budget: TimeoutBudget) -> None:
+                       out: "queue.Queue", budget: TimeoutBudget,
+                       abandoned: "Optional[threading.Event]" = None,
+                       phase: "Optional[Dict[str, Any]]" = None) -> None:
+        # phase: 供**调用侧**读取本次尝试当时的阶段/是否已开始输出 (跨线程可见的 dict)。
+        # 它是"被上限放弃时还能正确归类"的唯一依据 —— 见 ATTEMPT_PRE_EMIT_CAP。
         from aioquic.h3.events import DataReceived, HeadersReceived
 
         loop = asyncio.get_running_loop()
 
         async def emit(item):
-            """带背压地推入队列 (满时把阻塞 put 丢到线程池, 不卡事件循环)"""
-            if out.full():
-                await loop.run_in_executor(None, out.put, item)
-            else:
-                out.put_nowait(item)
+            """带背压地推入队列, 且**永不无限期阻塞** (2026-10-03 定因, 原缺陷 H4)
+
+            ## 为什么原实现会永久泄漏
+
+            原实现只有一句 `if out.full(): await loop.run_in_executor(None, out.put, item)` ——
+            无界阻塞。而客户端中途取消请求时, 消费端(HTTP 线程)**直接从异常分支 return 走了**,
+            ⇒ 队列从此没有读者 ⇒ 一旦队列满 64, `_forward` 就永久卡在默认线程池里。
+            泄漏的是 {1 个 HTTP 线程 + 1 个协程 + 1 个默认线程池工作线程 + 1 条永不 ack 的
+            HTTP/3 流}。线程池默认 `min(32, cpu+4)`, 泄漏满即整条腿对**所有**并发请求
+            停止推进; 被遗弃的流不再 acknowledge_data, 还占着同一条 QUIC 连接的
+            `max_stream_data` 窗口, 可饿死同连接上的其他视频分段。
+
+            ## 修法: 有界尝试 + 放弃信号
+
+              · `put_nowait` 成功即返回 (快路径, 不涉线程池);
+              · 队列满时用**有界** `out.put(timeout=0.5)` 跑在线程池里 —— 关键区别是
+                它会**返回**, 不会永久占住工作线程;
+              · 每轮先查 `abandoned` (客户端已走 ⇒ 抛 ClientGone, 协程立刻解栈);
+              · 没有放弃信号时 (旧调用方/单测) 退化为原来的阻塞语义, 保持兼容。
+            """
+            while True:
+                if abandoned is not None and abandoned.is_set():
+                    raise ClientGone()
+                try:
+                    out.put_nowait(item)
+                    return
+                except queue.Full:
+                    pass
+                # 队列满: 用**有界** put 让出一段时间。关键区别在于它会返回 —— 原先的
+                # `out.put` 没有超时, 一旦队列没有读者就永久占住一个线程池工作线程。
+                try:
+                    await loop.run_in_executor(
+                        None, functools.partial(out.put, item, True, _EMIT_PUT_TIMEOUT))
+                    return
+                except queue.Full:
+                    # 这半秒内没排上: 回到循环顶部重新检查放弃信号
+                    continue
+                except Exception:
+                    # 队列本身出问题 (不该发生): 不要因为它把整条腿拖死
+                    raise ClientGone()
 
         # 建连失败必须**向上抛**, 不能吞进队列: forward() 靠它来改用下一个候选地址。
         # 若在这里吞掉, forward() 会以为"这次调用成功了"而直接返回 ——
@@ -672,6 +1207,8 @@ class H3Forwarder:
         #   流式所需的 300s (见 _get_conn), 建连就会等满 300s —— 实测这正是让
         #   "候选不可达 → 换下一个" 那三条回归用例挂住的原因。
         #   两件事必须分开: **握手**用 connect 档限时, **已建连后的静默**用 idle_read 档。
+        if phase is not None:
+            phase["stage"] = UpstreamStageError.STAGE_HANDSHAKE
         try:
             proto = await asyncio.wait_for(self._get_conn(ip, sni), timeout=budget.connect)
         except Exception as e:
@@ -681,6 +1218,18 @@ class H3Forwarder:
             raise UpstreamStageError(UpstreamStageError.STAGE_HANDSHAKE,
                                      _describe_exc(e)) from e
 
+        # ★★ `headers_sent` 是"能否重试"的**唯一**判据 (2026-10-03 定因, 原缺陷 H1)。
+        #   原先靠 `except` 的**位置**来推断, 而注释写着"走到这里说明已经写了响应头" ——
+        #   那个前提不成立: `STAGE_HEADERS` 的异常(首头超时, 即 E2 实测的**主失败模式**
+        #   `upstream_no_response`)必然发生在首次 emit 头部**之前**。
+        #   而下面的 except 既入队错误、又**不重新抛出**, 于是调用侧 `fut.result()` 认为
+        #   这次调用**成功**并直接 return —— 换候选/重解析那整条容错链对主失败模式
+        #   **从未执行过**(腿还会把这次记成 recovered/addr_recovered)。
+        #   ⇒ 必须用显式标志, 而不是靠位置推断。
+        if phase is not None:
+            # 握手已成功 -> 之后的失败属于**首头阶段**, 不能用来推断整族不可达
+            phase["stage"] = UpstreamStageError.STAGE_HEADERS
+        headers_sent = False
         try:
             sid = proto._quic.get_next_available_stream_id()
             q = proto.register(sid)
@@ -728,6 +1277,11 @@ class H3Forwarder:
                             pass
 
                 await emit(("headers", status, filter_response_headers(resp_headers)))
+                # ★ 头部一旦入队, 就**再也没有"换下一个候选"这个选项**了 —— 否则会把两个
+                #   上游的响应拼在一起。这一行是 H1 的分界线。
+                headers_sent = True
+                if phase is not None:
+                    phase["emitted"] = True  # 之后不得再截断 (见 ATTEMPT_PRE_EMIT_CAP)
                 # CORS 归因探针: 记下上游**原始**头里有没有跨源头。
                 # 这决定修法是"补白名单"(上游有、我们丢了) 还是"兜底注入"(上游没发)。
                 if cors_headers_present(resp_headers):
@@ -737,6 +1291,19 @@ class H3Forwarder:
                         self.stats.get("cors_missing_upstream", 0) + 1
                     self.events.add("no_cors_upstream",
                                     f"{ip} {path.split('?')[0][:28]} 上游未带 access-control-*")
+
+                # ★ 无体状态码 (204/304/1xx): **头部即结束**, 立即收尾, 绝不进入正文循环。
+                #
+                # 为什么必须在这里收 (2026-10-03, 由 Go 黑盒测试台实测抓出):
+                #   旧实现的收尾在**调用侧**, 而调用侧只能"等队列出现非 data 事件" ——
+                #   上游 204 的流不会自己关, 于是每条 204/304 都要一直等到**逐读静默预算**
+                #   耗尽才结束: 实测在 --idle-read=4 下是 4.0s, 而**生产预算是 300s**。
+                #   而 SABR 会话里 gvs 恰恰用 204 当 ack (见 plan_http1_response 注释) ⇒
+                #   每条 ack 占住一个 HTTP 线程 + 一条上游流, 最长 5 分钟 —— 与"卡顿/降码率"
+                #   的症状完全一致, 且会随播放时长累积。
+                if status in BODYLESS_STATUSES or 100 <= status < 200:
+                    await emit(("end", None))
+                    return
                 # 正文: 流式推送, 直到 stream_ended
                 #
                 # 必须**合并小包**: aioquic 每个 DataReceived 只有 ~1.2KB, 若逐包入队再逐个
@@ -747,17 +1314,32 @@ class H3Forwarder:
                 # 服务端"缓冲已满"时的合法静默不得被当成流结束 —— 否则响应会以 200/206
                 # **静默截断**, 且与"通道被掐"无法区分。截断时记事件环, 不再无声无息。
                 buf = bytearray()
+                # ★ `cut` 区分"正常结束"与"通道被掐" (2026-10-03 定因, 原缺陷 H2)。
+                #   原实现两种收尾都以 `("end", None)` 结束 ⇒ 调用侧无法区分, 于是:
+                #     · 给**截断**的响应补上了合法的 chunked 终止符 `0\r\n\r\n`,
+                #       断流产生的响应在语法上**完全合法** —— nginx 与浏览器都无法区分
+                #       "截断"与"完整", 播放器把半截分段当成功;
+                #     · tap 仍记 `status=200, err=""`, 成绩单 `_classify` 记为 `ok`,
+                #       把"通道被掐"统计成"节点健康"。
+                #   上游不给 Content-Length 时 (SABR / 大文件最可能走的路) 后果最重。
+                cut = ""
                 while True:
                     if proto.terminated.is_set():
-                        self.events.add("stream_cut", f"{ip} connection_terminated")
+                        cut = f"connection_terminated ({len(buf)}B 未刷)"
+                        self.events.add("stream_cut", f"{ip} {cut}")
                         break
                     try:
                         ev = await asyncio.wait_for(q.get(), timeout=budget.idle_read)
                     except asyncio.TimeoutError:
-                        self.events.add("stream_cut",
-                                        f"{ip} idle>{budget.idle_read:g}s 静默超限 (已发 {len(buf)}B 未刷)")
+                        cut = f"idle>{budget.idle_read:g}s 静默超限 ({len(buf)}B 未刷)"
+                        self.events.add("stream_cut", f"{ip} {cut}")
                         break
                     if not isinstance(ev, DataReceived):
+                        # ⚠ trailers (HeadersReceived) 可能携带 stream_ended:
+                        #   原先 `continue` 直接丢掉, 于是**正常结束被记成 stream_cut**,
+                        #   客户端还要白等一整个逐读预算 (生产 300s)。见 M9。
+                        if getattr(ev, "stream_ended", False):
+                            break
                         continue
                     if ev.data:
                         buf += ev.data
@@ -773,13 +1355,28 @@ class H3Forwarder:
                         break
                 if buf:
                     await emit(("data", bytes(buf)))
-                await emit(("end", None))
+                # ★ 把"是否被截断"如实告诉调用侧: 它据此决定**不补** chunked 终止符
+                #   并记下真实错误。这是 H2 与 M9 的共同出口。
+                await emit(("error", f"stream_cut: {cut}") if cut else ("end", None))
             finally:
                 proto.unregister(sid)
+        except ClientGone:
+            # 客户端已放弃该请求: 不该计入 "errors"(那是上游的错), 队列也没有读者。
+            self.events.add("client_gone", f"{ip} 客户端中断, 已取消该流")
+            raise
         except Exception as e:
-            # 走到这里说明**已经写了响应头**(正文中途出错), 不能再换节点重试 ——
-            # 否则会把两个上游的响应拼在一起。如实收尾即可。
             self.stats["errors"] += 1
+            if not headers_sent:
+                # ★★ 头部还没写入 ⇒ **必须向上抛**, 让 forward() 换下一个候选/重解析。
+                #   这是 H1 的核心修复: 原实现无条件吞进队列且不重抛, 于是首头失败
+                #   (主失败模式) 永远走不到换候选那条路, 而腿还把它记成 recovered。
+                try:
+                    proto.unregister(sid)
+                except Exception:
+                    pass
+                raise
+            # 已经写了响应头: 不能再换节点重试 —— 否则会把两个上游的响应拼在一起。
+            # 如实收尾即可。
             try:
                 out.put_nowait(("error", f"{type(e).__name__}: {e}"))
             except Exception:
@@ -793,8 +1390,12 @@ class H3Forwarder:
                 timeout: "Optional[Union[float, TimeoutBudget]]" = None,
                 idle_read: Optional[float] = None,
                 max_duration: Optional[float] = None,
-                retries: Optional[int] = None) -> None:
+                retries: Optional[int] = None,
+                abandoned: "Optional[threading.Event]" = None) -> None:
         """同步入口 (供 HTTP 线程调用): 解析目标 → 逐个候选地址尝试 → (必要时)重解析再试
+
+        :param abandoned: 客户端放弃信号。消费端 (HTTP 线程) 在连接中断时 set 它,
+            本方法据此**停止烧候选/预算**并让 _forward 协程立刻解栈 (原缺陷 H4)。
 
         重试语义: 只要**尚未写入任何东西**, 就可以再试。
         这对本场景很关键 —— 同一域名常常同时解析出 IPv6 与 IPv4, 而两者的可达性
@@ -829,6 +1430,32 @@ class H3Forwarder:
         authority = strip_port(host)
         sni = self.sni_for(authority)
         self.stats["requests"] += 1
+
+        # ★★ 非幂等方法**不得跨地址重放** (2026-10-03 定因, 原缺陷 H7)
+        #
+        # 原实现里候选遍历与重试**完全不看 method**, 每次尝试都
+        # `send_data(sid, body, end_stream=True)` 发给**另一个地址** (round0 ≤4 候选 +
+        # 重解析 round ≤4, 受 MAX_TOTAL_ATTEMPTS=6 约束); nginx 侧同一个 POST 也会被
+        # 再次投给腿 (`non_idempotent` + `tries 4`)。三方独立指向同一条链 ⇒
+        # **最坏 24 次投递**。
+        #
+        # 后果: SABR/UMP 是**有状态**协议 (项目自己这么定性),
+        # `generativelanguage.googleapis.com/...:streamGenerateContent` 这类端点是
+        # **按 token 计费**的生成调用 ⇒ 一次操作可能在上游产生两次生成。
+        # 这是本项目唯一一条可能造成**用户直接经济损失**的缺陷。
+        #
+        # 口径: 幂等方法 (GET/HEAD/OPTIONS/TRACE) 照旧换候选重试 —— 那是本腿的核心容错。
+        # 非幂等**只禁"换地址"**, 不禁"同地址重试" (2026-10-03 收窄后的口径):
+        #   · SABR POST 的**同节点重试**是 2026-10-02 E2 实测的成果, 且实测显示默认
+        #     retries=0, 该路径本就没开; 但**不能**用"非幂等"去关掉它 —— 那会把一条
+        #     经过实测论证的容错与一条未经验证的策略混为一谈。
+        #   · 真正会造成重复副作用的是**把同一个体投给另一个上游**: 那才是"一次操作
+        #     产生两次生成"。所以只砍掉"轮 1 重解析换一批地址"与"多候选逐个试"。
+        non_idem = str(method or "GET").upper() not in ("GET", "HEAD", "OPTIONS", "TRACE")
+        if non_idem:
+            self.events.add("non_idempotent_method",
+                            f"{authority} {method} 非幂等: 不换地址(不重解析/不多候选)")
+
         try:
             ips = self.resolver(authority)
         except Exception as e:
@@ -848,8 +1475,23 @@ class H3Forwarder:
         for rnd in range(2):
             # B1 的族级失效集合 —— **每轮重置** (见 docstring: 一轮 = 一份 DNS 快照)
             dead_families: set = set()
+            if non_idem and rnd > 0:
+                # 非幂等请求**不允许**跨地址重放 (见 non_idem 的推导), 所以第二轮
+                # (重解析 = 再换一批地址) 直接不做。
+                self.events.add("non_idempotent_no_addr_change",
+                                f"{authority} {method} 非幂等, 跳过重解析换地址")
+                break
             if rnd == 0:
-                cands = [ip for ip in attempt_order(ips) if ip not in tried]
+                cands = [ip for ip in order_candidates(ips, self.addr_health.cooling)
+                         if ip not in tried]
+                if non_idem:
+                    # 只留**第一个**候选: 换地址 = 把同一个 POST 投给另一个上游,
+                    # 可能在上游产生第二次副作用 (按 token 计费的生成调用会真花钱)。
+                    if len(cands) > 1:
+                        self.events.add("non_idempotent_single_candidate",
+                                        f"{authority} {method} 非幂等, 候选 "
+                                        f"{len(cands)} 个只用首个 ({cands[0]})")
+                    cands = cands[:1]
             else:
                 # 重解析本身也要受预算约束: DoH 最坏可能串行花掉几十秒, 若在失败路径上
                 # 无约束地再来一次, 502 会被推得比不重试还晚 —— 与设 RETRY_TIME_BUDGET 的
@@ -858,7 +1500,8 @@ class H3Forwarder:
                     self.events.add("retry_budget_exhausted",
                                     f"{authority} 预算用尽, 跳过重解析")
                     break
-                cands = [ip for ip in attempt_order(self._reresolve(authority))
+                cands = [ip for ip in order_candidates(self._reresolve(authority),
+                                                       self.addr_health.cooling)
                          if ip not in tried]
                 if not cands:
                     break
@@ -892,13 +1535,25 @@ class H3Forwarder:
                     # 推事件: ① HTTP 线程正在 out.get(), 拿到第二个 ("headers", …) 会因
                     # "不是 data"而 break ⇒ 流被提前掐断; ② 被遗弃的协程在队列满 64 后, 经
                     # run_in_executor(None, out.put, item) **永久阻塞** ⇒ 吃掉线程池线程。
+                    phase: Dict[str, Any] = {}
                     fut = self._bridge.submit(self._forward(
-                        ip, sni, authority, method, path, headers, body, out, budget))
+                        ip, sni, authority, method, path, headers, body, out, budget,
+                        abandoned, phase))
                     try:
+                        # ⚠ 已回退单次上限 (2026-10-03 真机实测): 见 ATTEMPT_PRE_EMIT_CAP
+                        #   上方记录 —— 任何"有用的短档"都会杀掉**本来会成功**的尝试。
+                        #   此处保持原语义: 单次尝试用满整体预算。
                         fut.result(budget.max_duration)
+                        if self.addr_health.enabled and self.addr_health.reward(ip):
+                            self.events.add("addr_recovered", f"{authority} 地址 {ip} 已恢复")
                         if attempts > 1:
                             self.events.add("recovered",
                                             f"{authority} 第 {attempts} 次尝试成功 ({ip})")
+                        return
+                    except ClientGone:
+                        # ★ 客户端已放弃: 换候选/重试**毫无意义** (没有读者), 而且会污染
+                        #   成绩单(把客户端取消记成节点失败)并继续烧预算。直接收尾。
+                        self.events.add("client_gone", f"{authority} 客户端中断, 停止重试")
                         return
                     except Exception as e:         # 未写入任何内容 -> 可以再试
                         # 阶段标记优先: 拆档后 _forward 会抛 UpstreamStageError, 它的
@@ -911,7 +1566,8 @@ class H3Forwarder:
                         # B1: 只有**握手阶段**失败才说明该地址族整体不可达 (见
                         # UpstreamStageError 注释); 首头阶段失败在**可用**地址上也会发生,
                         # 拿它推断整个族会把抖动误判成死族。
-                        if getattr(e, "stage", None) == UpstreamStageError.STAGE_HANDSHAKE:
+                        stage = getattr(e, "stage", None)
+                        if stage == UpstreamStageError.STAGE_HANDSHAKE:
                             fam = ip_family(ip)
                             if fam not in dead_families:
                                 dead_families.add(fam)
@@ -919,14 +1575,64 @@ class H3Forwarder:
                                     "family_unreachable",
                                     f"{authority} {fam} 首个地址 {ip} 握手失败, "
                                     f"本轮跳过同族其余地址")
+                        elif (stage == UpstreamStageError.STAGE_HEADERS
+                              and self.addr_health.enabled):
+                            # 地址级记账 (跨请求): 实测首头失败是**按地址粘滞**的,
+                            # 而每次要烧 8s 首头预算 (见 ADDR_COOLDOWN_SECONDS 上方依据)。
+                            # 只降权不禁用 —— 冷却地址仍在本族内排在后面。
+                            secs = self.addr_health.penalty(ip)
+                            self.stats["addr_cooled"] = self.stats.get("addr_cooled", 0) + 1
+                            self.events.add(
+                                "addr_cooled",
+                                f"{authority} 地址 {ip} 首头失败, 冷却 {secs:.0f}s "
+                                f"(后续请求把它在本族内后移; 仍会尝试, 不拉黑)")
                         try:
                             fut.cancel()           # 让 _forward 在 await 点收到 CancelledError
                         except Exception:
                             pass
                         self._drain(out)           # 丢弃半成品, 避免污染下一次
-                        with self._pool_lock:
-                            self._pool.pop((ip, sni), None)
+                        # ★ H9: pop 出来的连接必须**真的关掉** (见 _discard_conn)。
+                        #   原实现只 pop 不 __aexit__ ⇒ 每次可恢复的失败永久丢一条已建立的
+                        #   QUIC 连接 + 一个已 bind 的 UDP 套接字 (回收延迟是 aioquic 空闲
+                        #   计时器量级, 最长 600s)。close() 只遍历**仍在池里**的条目, 救不回它。
+                        self._discard_conn((ip, sni))
+        # 走到这里说明所有候选都失败了。但若客户端已经走了, 入队错误没有意义 ——
+        # 队列没有读者, 而且 put 在满队列上会阻塞(即使有超时, 也是白等一轮)。
+        if abandoned is not None and abandoned.is_set():
+            self.events.add("client_gone", f"{authority} 全部候选失败时客户端已中断")
+            return
         out.put(("error", last_err))
+
+    def _discard_conn(self, key) -> None:
+        """把池里的连接**取出并真正关闭** (原缺陷 H9)
+
+        为什么不能只 `pop`: `_get_conn` 刻意用 `cm.__aenter__()` 进入 aioquic 的 connect()
+        上下文并**不退出** (那是池化手段, 见其注释)。因此一旦只把它从池里 pop 掉,
+        `__aexit__` 就永远不会被调用 ⇒ `transport.close()` 永不执行 ⇒ 每次可恢复的失败
+        都泄漏一条已建立的 QUIC 连接与一个已 bind 的 UDP 套接字。
+        (aioquic 自己的 idle 计时器最终会关掉它, 但那是 600s 量级的延迟回收。)
+        """
+        if key is None:
+            return
+        with self._pool_lock:
+            ent = self._pool.pop(key, None)
+        if ent is None:
+            return
+        self._bridge.submit(self._aclose_conn(ent))
+
+    @staticmethod
+    async def _aclose_conn(ent) -> None:
+        """在事件循环里关闭一个 (proto, cm) 池条目 —— best-effort, 绝不抛出"""
+        proto, cm = ent
+        try:
+            await cm.__aexit__(None, None, None)
+            return
+        except Exception:
+            pass
+        try:
+            proto._quic.close()
+        except Exception:
+            pass
 
     def _reresolve(self, authority: str) -> List[str]:
         """重解析一次 (返回空列表表示拿不到新答案)
@@ -1070,14 +1776,25 @@ def make_handler(forwarder: H3Forwarder,
             req_sabr = _has_marker(req_ctype, "yt-ump", "ump", "sabr")
 
             out: "queue.Queue" = queue.Queue(maxsize=MAX_RESPONSE_QUEUE)
+            # ★ 客户端放弃信号 (2026-10-03, 原缺陷 H4): 连接中断时消费端**不再有读者**,
+            #   必须把这个事实告诉生产者, 否则 _forward 会在满队列上白白占住线程池线程,
+            #   同时泄漏协程与一条永不 acknowledge 的 HTTP/3 流。
+            abandoned = threading.Event()
             threading.Thread(
                 target=forwarder.forward,
+                # ⚠ `abandoned` 必须用**关键字**传: 它是 2026-10-03 新增的参数, 而
+                #   测试里的 forwarder 替身只接受 (host, method, path, headers, body,
+                #   out, timeout, idle_read, max_duration) —— 位置参数会把它打成
+                #   TypeError 并让整条请求挂住 (实测: 该线程一炸, out 永远为空,
+                #   客户端等到超时)。关键字形式让新旧替身都能工作。
+                kwargs=dict(
+                    idle_read=getattr(forwarder, "idle_timeout", None),
+                    max_duration=getattr(forwarder, "max_duration", None),
+                    abandoned=abandoned),
                 # 逐读静默与整周期上限从 forwarder 读 (生产路径按流式配置, 见 proxy.__init__):
                 # 不再把一个 timeout 同时当建连/逐读/整周期三种角色用。
                 args=(host, self.command, self.path, list(self.headers.items()),
-                      body, out, timeout,
-                      getattr(forwarder, "idle_timeout", None),
-                      getattr(forwarder, "max_duration", None)),
+                      body, out, timeout),
                 daemon=True).start()
 
             first = out.get()
@@ -1117,23 +1834,57 @@ def make_handler(forwarder: H3Forwarder,
             plan = plan_http1_response(code, headers, self.command)
             if not code:
                 forwarder.events.add("invalid_status", self.path.split("?")[0][:60])
-            self.send_response_only(code)
-            for k, v in headers:
-                if plan["strip_length_headers"] and str(k).lower() in (
-                        "content-length", "transfer-encoding"):
-                    continue
-                self.send_header(k, v)
-            if plan["chunked"]:
-                self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
             bytes_out = [0]
+            end_kind = "end"           # "end" = 正常收尾; "error" = 上游断流/异常
+            end_err = ""
+            # ══════════════════════════════════════════════════════════════════════════
+            # ★★ H3: 整个响应回写必须在**同一个 try 之内** (2026-10-03 定因)
+            #
+            # 原实现的 try 从 `bytes_out = [0]` 之后才开始, 而真正写 socket 的那一步是
+            # `end_headers()` → `flush_headers()` → `wfile.write()` —— **它在任何 try 之外**
+            # (502 分支 :1480 与 body-error 分支 :1437 同样如此)。
+            # 后果: 浏览器在 502 返回前取消请求时抛的 ConnectionAbortedError 会一路穿到
+            # `socketserver.process_request_thread` → `handle_error()`, 打印整段回溯,
+            # 并且 `finally` 里的 `tap.record` **被跳过** —— 丢掉的正是最该看的诊断。
+            # 作者当时记录的触发场景("浏览器会在 502 返回前取消请求")恰好先撞上这第一次写。
+            # ══════════════════════════════════════════════════════════════════════════
             try:
+                self.send_response_only(code)
+                for k, v in headers:
+                    if plan["strip_length_headers"] and str(k).lower() in (
+                            "content-length", "transfer-encoding"):
+                        continue
+                    self.send_header(k, v)
+                if plan["chunked"]:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
                 if not plan["allow_body"]:
-                    # 无正文响应: 不写任何字节, 但要把队列读干净, 避免遗弃协程继续往里推
+                    # 无正文响应: 不写任何字节。终止事件由 forwarder 在**头部之后立即**推入
+                    # (见 _forward 的无体分支) —— 这里再加一道**有界**兜底: 即使将来回归,
+                    # 也绝不允许把客户端挂住。旧行为是无限等 `out.get()`, 而 204 的上游流
+                    # 不会自己关 ⇒ 实测每条要等满逐读预算 (生产 300s)。
+                    deadline = time.perf_counter() + 2.0
                     while True:
-                        kind, _payload = out.get()
+                        remain = deadline - time.perf_counter()
+                        if remain <= 0:
+                            forwarder.events.add("bodyless_wait_timeout",
+                                                 self.path.split("?")[0][:48])
+                            break
+                        try:
+                            kind, _payload = out.get(timeout=remain)
+                        except queue.Empty:
+                            forwarder.events.add("bodyless_wait_timeout",
+                                                 self.path.split("?")[0][:48])
+                            break
                         if kind != "data":
                             break
+                    # ★ M8 (2026-10-03): 无体分支也必须**关闭连接**。
+                    #   原先这里是裸 `return`, 于是跳过了函数末尾的
+                    #   `self.close_connection = True` —— 而 `upstream-dynamic.conf` 的注释
+                    #   明确写着"本腿每条响应后关闭连接 (close_connection=True), 故不声明
+                    #   keepalive"。两者矛盾: 一旦我们声明关连接却又不关, 该连接会带着
+                    #   未消费的字节被复用。204 是 SABR 的 ack 路径 (热的), 所以这条不是理论问题。
+                    self.close_connection = True
                     return
                 while True:
                     kind, payload = out.get()
@@ -1143,21 +1894,43 @@ def make_handler(forwarder: H3Forwarder,
                             self.wfile.write(b"%X\r\n%s\r\n" % (len(payload), payload))
                         else:
                             self.wfile.write(payload)
-                    else:                       # end / error
+                    else:
+                        # ★ H2: 必须区分"上游正常结束"与"上游断流/出错"。
+                        #   原实现把两者写成同一分支 (`else: # end / error`), 于是给**截断**
+                        #   的响应补上了合法的 chunked 终止符 `0\r\n\r\n` —— 断流产生的响应在
+                        #   语法上完全合法, nginx 与浏览器都无法区分"截断"与"完整",
+                        #   播放器把半截分段当成功; 而 tap 仍记 err=""、成绩单记为 ok,
+                        #   把"通道被掐"统计成"节点健康"。
+                        end_kind = kind
+                        if kind != "data":
+                            end_err = str(payload or "")
                         break
-                if plan["chunked"]:
+                # 只在**正常结束**时补终止符。截断时故意不补: 让 nginx/浏览器看到一个
+                # 不完整的 chunked 体(响亮失败), 而不是一个语法合法的半截响应。
+                if plan["chunked"] and end_kind == "end":
                     self.wfile.write(b"0\r\n\r\n")
+                elif end_kind != "end":
+                    # 已声明 chunked 却不补终止符 ⇒ 必须关闭连接, 不能让它继续复用
+                    # (否则下一个请求会读到残留字节)。
+                    self.close_connection = True
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
                     TimeoutError, OSError):
                 # Windows 上客户端中断常抛 ConnectionAbortedError (WinError 10053) 或裸
                 # OSError, 都不在 BrokenPipe/ConnectionReset 里 —— 实测漏网时会在 stderr
                 # 打一整段回溯 (E2 的 CDP 运行里就出现过), 把真正的诊断输出淹没。
                 # 这类中断是**正常事件** (浏览器取消分段请求), 静默收尾即可。
-                pass
+                #
+                # ★ 但"静默"不等于"不管": 必须告诉生产者客户端已经走了 (H4), 否则
+                #   _forward 会继续往一个没有读者的队列里推, 满 64 后永久占住线程池线程。
+                abandoned.set()
+                self._drain_queue(out)
             finally:
                 # 诊断 tap: 文档规定的七项字段 (见 _RequestTap)。放 finally 里, 保证
                 # "无正文提前 return" 与异常路径同样留下记录 —— 否则最需要看的那几类
                 # (204/304、断流) 恰恰不会出现在诊断数据里。
+                #
+                # ★ H2: err 不再恒为空 —— 断流/异常必须记下真实原因, 否则成绩单会把
+                #   "通道被掐"统计成"节点健康"。
                 forwarder.tap.record(
                     method=self.command, path_prefix=_path_prefix(self.path), host=host,
                     body_len=len(body), status=code,
@@ -1165,8 +1938,33 @@ def make_handler(forwarder: H3Forwarder,
                     total_ms=round((time.perf_counter() - t_req) * 1000, 1),
                     bytes=bytes_out[0], req_ctype=req_ctype[:48],
                     req_sabr=req_sabr, resp_ctype=resp_ctype[:48], resp_sabr=resp_sabr,
-                    err="")
+                    err=(end_err[:80] if end_kind != "end" else ""))
             self.close_connection = True
+
+        def _drain_queue(q: "queue.Queue") -> None:
+            """排空响应队列, 让可能还阻塞在 put 上的生产者立刻返回 (H4)
+
+            为什么必须有: 客户端中断后队列没有读者, 生产者即使有超时也会反复回来;
+            排空后它下一次 put_nowait 就能成功退出, 于是协程与线程都能及时回收。
+            """
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    return
+
+        def handle_error(self, request, client_address):
+            """覆盖 socketserver 的默认实现: **不打整段回溯** (H3)
+
+            默认实现会把完整 traceback 打到 stderr。而本腿面对的多是"浏览器取消分段请求"
+            这类**正常事件**, 一条回溯就会把真正的诊断输出淹没 (这正是 E2 运行里发生过的)。
+            这里只留一行有界日志, 并通过事件环暴露给 status()。
+            """
+            try:
+                forwarder.events.add("handler_error",
+                                     f"{client_address} {type(sys.exc_info()[1]).__name__}")
+            except Exception:
+                pass
 
         do_GET = _relay
         do_HEAD = _relay
@@ -1175,6 +1973,24 @@ def make_handler(forwarder: H3Forwarder,
         do_OPTIONS = _relay
 
     return _Handler
+
+
+class _LegHTTPServer(ThreadingHTTPServer):
+    """腿的回环 HTTP 服务器 —— 关键是**抬高 accept backlog**
+
+    为什么必须覆盖默认值 (2026-10-03, 由 Go 黑盒测试台 `tools/h3_legtest` 实测抓出):
+      `socketserver.TCPServer.request_queue_size` 默认只有 **5**。16 并发请求实测
+      **6/16 直接被 connection refused** —— Windows 对溢出 backlog 的处理是 RST 而非排队。
+      生产含义: nginx 侧 upstream 带 `keepalive 32`, 视频播放又天然并发多分段,
+      突发一旦超过排队深度就会被打回 502; 而 `upstream_googlevideo` 只声明了一个 server
+      且 `max_fails=0 fail_timeout=0s` (刻意关熔断), 重试**无处可去** —— 表现为随机卡顿/失败。
+      128 = nginx keepalive 池 32 + 浏览器分段并发 + 突发余量; accept 本身是毫秒级,
+      所以队列深度只是削峰, 不是延迟来源。
+    """
+
+    request_queue_size = 128
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class H3UpstreamProxy:
@@ -1189,7 +2005,8 @@ class H3UpstreamProxy:
                  idle_read: float = DEFAULT_STREAM_IDLE_READ,
                  max_duration: Optional[float] = None,
                  retries: int = DEFAULT_RETRY_SAME_NODE,
-                 first_byte: Optional[float] = None):
+                 first_byte: Optional[float] = None,
+                 persist_scores: bool = True):
         self.port = port
         self.host = host
         self.timeout = timeout
@@ -1210,7 +2027,8 @@ class H3UpstreamProxy:
                         else float(first_byte)))
         self.forwarder = H3Forwarder(resolver or default_resolver, sni_for, timeout,
                                      idle_timeout=idle_read,
-                                     target_port=target_port, retries=retries)
+                                     target_port=target_port, retries=retries,
+                                     persist_scores=persist_scores)
         # QUIC 自身的 idle_timeout 也必须跟上逐读预算, 否则连接会先被 QUIC 关掉
         self.forwarder.max_duration = max_duration
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -1224,9 +2042,8 @@ class H3UpstreamProxy:
         if self.running:
             return True, "已在运行"
         try:
-            self._httpd = ThreadingHTTPServer(
+            self._httpd = _LegHTTPServer(
                 (self.host, self.port), make_handler(self.forwarder, self.budget))
-            self._httpd.daemon_threads = True
             self._thread = threading.Thread(target=self._httpd.serve_forever,
                                             name="h3-upstream-http", daemon=True)
             self._thread.start()
@@ -1236,6 +2053,11 @@ class H3UpstreamProxy:
             return False, f"{type(e).__name__}: {e}"
 
     def stop(self):
+        try:
+            # 退出前把成绩单落盘 (force: 绕过节流) —— 否则跨会话累积就断了
+            self.forwarder.node_scores.save(force=True)
+        except Exception:
+            pass
         if self._httpd is not None:
             try:
                 self._httpd.shutdown()
@@ -1309,6 +2131,13 @@ class H3UpstreamManager:
             "event_counts": fwd.events.counts() if fwd is not None else {},
             # 请求级诊断 tap (E2 的观测面): 浏览器实际发了什么、gvs 怎么回的
             "tap": fwd.tap.snapshot() if fwd is not None else [],
+            # 地址级失败记忆 (2026-10-02 节点实测的落地): 哪些地址刚失败过、冷却多久、
+            # 哪些已恢复。没有它, "为什么这个节点时通时不通"在界面上无从解释。
+            "addr_health": fwd.addr_health.snapshot() if fwd is not None else {},
+            # 节点成绩单 (2026-10-03): 跨会话的真实流量统计 + 排名 —— 让"当前窗口能不能播"
+            # 变成可读状态, 而不是靠人跑命令。
+            "node_scores": fwd.node_scores.summary() if fwd is not None else {},
+            "node_rank": fwd.node_scores.ranked()[:12] if fwd is not None else [],
             "timeouts": {"idle_read": getattr(fwd, "idle_timeout", None),
                          "max_duration": getattr(fwd, "max_duration", None)}
             if fwd is not None else {},
@@ -1376,15 +2205,23 @@ def wildcard_capable(redirect_mode: str) -> bool:
 
 
 def needs_wildcard_resolution(profile) -> bool:
-    """该画像是否**依赖通配解析下发**
+    """该画像是否**依赖通配解析下发** (动态子域必须靠后缀通配覆盖)
 
-    判据: 需要本机 DNS 下发 (requires_dns_backend) **且** 域名里含 `*.` 通配。
-    googlevideo 正是如此 (domains=["*.googlevideo.com"]): 它的节点名是动态且海量的
-    (rr1---sn-xxxx.googlevideo.com), 逐个登记既不可能也不该做。
+    ## ★ 为什么不再做二次推导 (2026-10-03 定因, 原缺陷 M13)
+
+    旧实现是 `requires_dns_backend and any(d.startswith("*."))` —— 把"需要 DNS 后端"
+    与"域名里有通配"**合取**起来推导。而 `requires_dns_backend` 的真实语义是
+    "需要 DNS 下发 HTTPS RR (QUIC 直连)", 与通配毫无关系; 它之所以对 googlevideo 为真,
+    只是因为那个画像当时**借这个字段兼职"不默认启用"**。
+
+    这个合取式的害处不只是"词不达意": 它把 S1 的缺陷藏住了 ——
+    NRPT 后端把 `*.` 条目整条丢空时, 这里的推导仍然回答"需要通配",
+    于是上层以为能力齐备。现在直接读**为这件事专门声明的字段**。
+
+    googlevideo 正是如此 (domains 全是 `*.googlevideo.com` 这类通配): 它的节点名是动态
+    且海量的 (rr1---sn-xxxx.googlevideo.com), 逐个登记既不可能也不该做。
     """
-    if not getattr(profile, "requires_dns_backend", False):
-        return False
-    return any(str(d).startswith("*.") for d in (getattr(profile, "domains", None) or []))
+    return bool(getattr(profile, "needs_wildcard_resolution", False))
 
 
 def wildcard_domains(profile) -> List[str]:
@@ -1454,6 +2291,51 @@ def blocked_services(services, redirect_mode: str, profiles_by_id=None) -> Dict[
                 f"会表现为「页面能开而视频永远转圈」。请改用 PAC 后端 "
                 f"(免管理员, 且 PAC 能在 JS 里表达通配 —— 见 app/pac_redirect.py)。")
     return out
+
+
+def gvs_health(scoreboard: Optional["_NodeScoreboard"] = None) -> Dict[str, Any]:
+    """googlevideo 通道健康度 (**离线读取**, 不发起任何探测)
+
+    供"启用边界软告警"与启动流程使用 —— 它的数据来自 `_NodeScoreboard`:
+    浏览器真实播放留下的节点成绩单 (跨会话持久化)。**刻意不做实时探测**:
+      · 实时探测要几十秒 (整池 × 多轮), 挂在开关回调上会冻结界面;
+      · 更重要的是, 合成探测本身读不出"能不能播" (受 `n=` 与 UMP 体限制, 见
+        docs/googlevideo-node-availability.md §5), 而成绩单是真实播放的直接统计。
+
+    返回 state 与阈值同 `app/gvs_h3_probe` (OK/FLAKY/UNSTABLE/NO_DATA), 便于两处结论互相对照。
+    """
+    sb = scoreboard
+    if sb is None:
+        sb = _NodeScoreboard()          # 仅读配置, 不启动腿
+    try:
+        return sb.summary()
+    except Exception as e:
+        return {"nodes": 0, "samples": 0, "ok": 0, "rate": None, "healthy_nodes": 0,
+                "enough_samples": False, "state": "NO_DATA", "error": str(e)[:120]}
+
+
+def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = None) -> str:
+    """给 UI 的一句话告警 (稳定/样本不足时返回空串 —— 不打扰)
+
+    口径: 只在**确实不稳定**时提示, 与既有的软告警 (blocked/gaps) 同一形态。
+    scoreboard 可注入 (单测用); 省略时读已落盘的成绩单。
+    """
+    try:
+        h = gvs_health(scoreboard)
+    except Exception:
+        return ""
+    state = str(h.get("state") or "NO_DATA")
+    if state in ("OK", "NO_DATA"):
+        return ""
+    total = int(h.get("samples") or 0)
+    ok = int(h.get("ok") or 0)
+    rate = h.get("rate")
+    pct = f"{round(float(rate) * 100)}%" if rate is not None else "-"
+    tail = ("视频可能卡顿/降码率或需要反复重试; 这是**节点级**的分钟级时变问题 "
+            "(各节点只有一个可用地址, 详见 docs/googlevideo-node-availability.md)。")
+    if state == "UNSTABLE":
+        return f"最近 {total} 次视频请求里节点可用率仅 {pct} ({ok}/{total}) —— {tail}"
+    return (f"最近 {total} 次视频请求里节点可用率偏低 {pct} ({ok}/{total}) —— {tail}")
 
 
 def check_preconditions(redirect_mode: str) -> List[str]:
@@ -1734,11 +2616,47 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--selftest", action="store_true",
                     help="启动后经本代理取一个已知 h3 站点的真实文件, 然后退出")
+    # ---- 测试/调试注入面 (2026-10-03) --------------------------------------
+    # 为什么要开这几个口子: 黑盒测试 (tools/h3_legtest, Go) 必须能把腿指向**本地源站**,
+    # 并**缩短预算**才能在秒级内验证"静默不等于流结束""首头超时""中途掐断"这些语义。
+    # 它们只影响 CLI 启动方式, 默认值与生产逐字一致 —— 应用内的启动路径不经过这里。
+    ap.add_argument("--target-port", type=int, default=443,
+                    help="上游 HTTP/3 端口 (默认 443; 测试用: 指向本地源站)")
+    ap.add_argument("--resolve", action="append", default=[], metavar="HOST=IP[,IP...]",
+                    help="静态解析覆盖 (可重复; 测试用: 把节点名指到本地源站)。"
+                         "未命中的名字仍走生产解析链 (别名域 → DoH → 投毒过滤 → Google 段 strict)")
+    ap.add_argument("--connect", type=float, default=None, help="握手预算秒 (默认 4)")
+    ap.add_argument("--first-byte", type=float, default=None, help="首头预算秒 (默认 8)")
+    ap.add_argument("--idle-read", type=float, default=None, help="逐读静默预算秒 (默认 300)")
     args = ap.parse_args(argv)
 
-    proxy = H3UpstreamProxy(port=args.port, host=args.host)
+    static: Dict[str, List[str]] = {}
+    for item in (args.resolve or []):
+        if "=" not in item:
+            continue
+        _name, _ips = item.split("=", 1)
+        static[_name.strip().lower().rstrip(".")] = [x.strip() for x in _ips.split(",") if x.strip()]
+
+    def _resolver(host: str) -> List[str]:
+        """命中 --resolve 就用静态答案, 否则回落到生产解析链"""
+        key = str(host or "").strip().lower().rstrip(".")
+        if key in static:
+            return list(static[key])
+        return default_resolver(host)
+
+    proxy = H3UpstreamProxy(
+        port=args.port, host=args.host,
+        resolver=_resolver if static else None,
+        target_port=args.target_port,
+        timeout=float(args.connect) if args.connect else DEFAULT_CONNECT_TIMEOUT,
+        first_byte=args.first_byte,
+        idle_read=float(args.idle_read) if args.idle_read else DEFAULT_STREAM_IDLE_READ)
     ok, why = proxy.start()
     print(f"h3 上游腿: {'已启动' if ok else '启动失败'}  http://{args.host}:{args.port}  {why}")
+    if ok and (static or args.target_port != 443):
+        print(f"  注入面: 目标端口={args.target_port} 静态解析={static or '(无)'} "
+              f"预算 connect={proxy.budget.connect:g}s first_byte={proxy.budget.first_byte:g}s "
+              f"idle_read={proxy.budget.idle_read:g}s")
     if not ok:
         return 2
     if args.selftest:

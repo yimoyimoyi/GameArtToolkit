@@ -89,14 +89,23 @@ def build_namespace_entries(domains: List[str]) -> List[str]:
       - ".example.com" -> 后缀匹配整个子域树
     两种语义在文档中未明确包含关系, 故两者同时登记, 保证"主域 + 全部子域"都被覆盖,
     避免边界情况下主域自身绕过本地解析器。
+
+    ★ 通配必须**在转换之前**剥掉 `*.` (2026-10-03 定因):
+      `_DOMAIN_RE` 要求首字符 `[a-z0-9]`, 而调用方 (service_profile) 登记的通配域名
+      形如 `*.googlevideo.com`。原实现先校验后转换, 于是**通配域名在这里被整条 continue 丢弃**,
+      而调用方 `apply()` 在条目为空时返回成功 —— 结果是"NRPT 后端下开启通配服务 → 零覆盖 + 报成功",
+      正是本项目两道闸门 (blocked_services / wildcard_gap_warnings) 专门要防的假可用。
+      `*.x` 与 NRPT 的 `.x` 后缀语义**本来就是同一件事**, 故剥离是语义等价变换, 不是放宽校验。
+      ⚠ 校验对象必须是剥离后的 `bare`, 且 `is_valid_domain` 保持严格 —— 注入面不变。
     """
     entries: List[str] = []
     seen = set()
     for raw in domains or []:
         dom = str(raw or "").strip().lower().rstrip(".")
-        if not is_valid_domain(dom):
+        bare = dom[2:] if dom.startswith("*.") else dom
+        if not is_valid_domain(bare):
             continue
-        for entry in (f".{dom}", dom):
+        for entry in (f".{bare}", bare):
             if entry not in seen:
                 seen.add(entry)
                 entries.append(entry)
@@ -358,6 +367,14 @@ class NrptManager:
         """
         entries = build_namespace_entries(domains)
         if not entries:
+            # ★ 区分"没有域名要写"与"给了域名但一个都没活下来" (2026-10-03 定因):
+            #   入参非空而条目为空, 只可能是**全部被校验/转换丢掉** —— 那就是零覆盖。
+            #   此时返回成功正是 S1 假可用的第二个出口: 通配被丢干净后界面显示"已接管"。
+            #   宁可响亮失败, 也不要静默的零覆盖 (与 PAC 分支刻意不回退 Hosts 同一口径)。
+            given = [str(d or "").strip() for d in (domains or []) if str(d or "").strip()]
+            if given:
+                return False, (f"NRPT 无有效命名空间可写入: 收到 {len(given)} 个域名但全部"
+                               f"被解析/校验丢弃 (示例: {given[0]!r}) —— 继续下去等于零覆盖")
             return True, "无加速域名需写入 NRPT 规则"
 
         caps = self.capabilities()

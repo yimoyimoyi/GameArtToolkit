@@ -96,6 +96,18 @@ def pac_fallback_directive() -> str:
     vals = cur.get("values") or {}
     enabled = int((vals.get("ProxyEnable") or (0, 0))[0] or 0) == 1
     server = str((vals.get("ProxyServer") or ("", 0))[0] or "").strip()
+    user_pac = str((vals.get("AutoConfigURL") or ("", 0))[0] or "").strip()
+
+    # ★ M15 (2026-10-03): 用户自己的 **PAC** 也必须在兜底里被复现, 不能只看 ProxyServer。
+    #   原实现只看 ProxyEnable + ProxyServer ⇒ 对"靠自己 PAC 上网"的用户,
+    #   我们的 PAC 一旦未命中就返回 DIRECT, **把他整条 PAC 出口旁路掉** ——
+    #   与本函数要修的 b1693ed 事故是同一个形态, 只是那次是固定代理、这次是 PAC。
+    #   实测依据: 本机用户正是这种状态 —— `upstream_proxy.enabled=False` 且
+    #   ProxyEnable=0, 固定代理端口无人监听, 说明他不是靠固定代理出网的。
+    #   只认**别人的** PAC (我们自己写的 proxy.pac 不算用户设置, 否则会自我循环)。
+    if user_pac and not is_our_pac_url(user_pac):
+        return f"PAC {user_pac}"
+
     if not enabled or not server:
         return "DIRECT"
     # 按协议分别指定的写法
@@ -139,8 +151,39 @@ def _notify_change() -> None:
         pass
 
 
+def _readback_with(winreg) -> Dict[str, Any]:
+    r"""用**调用方注入的** winreg 句柄回读 (与 restore() 的 _readback 同款)
+
+    为什么必须接受 winreg 参数而不是调 read_current(): read_current() 会重新导入
+    **真实** winreg —— 在注入替身的测试里它读的是真实注册表, 于是"校验"本身失真。
+    """
+    now: Dict[str, Any] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY) as k:
+            for name in _BACKUP_VALUES:
+                try:
+                    now[name] = winreg.QueryValueEx(k, name)
+                except FileNotFoundError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return now
+
+
 def set_autoconfig_url(url: str) -> Tuple[bool, str]:
     """把 PAC 地址写入用户级自动配置脚本, 并通知系统
+
+    ## ★ 顺序与读回 (2026-10-03 定因, 与 restore() 的结论对齐)
+
+    `restore()` 的根因结论是 "**WinINET writes its cached proxy config back;
+    notify BEFORE apply**" —— 即必须先通知(让它把缓存吐干净)再落我们的最终状态,
+    否则缓存回写会冲掉刚写的值。而本函数此前恰好相反:
+        先 `SetValueEx` 再 `_notify_change()`, 且**零读回**, 写成功即报成功。
+    于是同一个风险在"每次点击开启加速"的路径上完全没有防护 —— 若缓存回写冲掉新值,
+    程序仍报"已把 PAC 写入系统自动配置脚本", 而系统代理实际没变, 用户只会看到"没反应"。
+
+    现在改为: 通知 → 写 → **同一句柄回读** → 不符则重试一次 → 仍不符**如实返回失败**。
+    与本项目另两处教训同源 (certutil -delstore、NRPT cmdlet): 绝不把"命令没报错"当成"已生效"。
 
     :return: (是否成功, 面向用户的消息)
     """
@@ -150,11 +193,22 @@ def set_autoconfig_url(url: str) -> Tuple[bool, str]:
         return False, f"PAC 地址必须是 http(s) URL: {url!r}"
     winreg = _winreg()
     try:
-        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY, 0,
-                                winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, url)
-        _notify_change()
-        return True, f"已把 PAC 写入系统「自动配置脚本」: {url} (无需管理员)"
+        bad = ""
+        for attempt in (1, 2):
+            # ⚠ 先通知、后写 (见 docstring)。重试时会再通知一次, 这是刻意的:
+            #   重试的前提正是"上一次的写入被缓存回写冲掉了", 需要它再吐一次。
+            _notify_change()
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, url)
+            cur = _readback_with(winreg).get("AutoConfigURL")
+            got = cur[0] if cur else None
+            if got == url:
+                return True, (f"已把 PAC 写入系统「自动配置脚本」: {url} (无需管理员)"
+                              + ("" if attempt == 1 else f" (第 {attempt} 次尝试才生效)"))
+            # 文案与 restore() 的 _mismatch 同款: 指明是哪个值、期望什么、实际什么
+            bad = f"AutoConfigURL 未写成 (期望 {url!r}, 实际 {got!r})"
+        return False, (f"写入自动配置脚本**未真正生效** (命令未报错但回读不符): {bad}")
     except Exception as e:
         return False, f"写入自动配置脚本失败: {type(e).__name__}: {e}"
 
@@ -209,6 +263,46 @@ def restore(backup: Dict[str, Any]) -> Tuple[bool, str]:
                     except FileNotFoundError:
                         pass
 
+    def _failure(surviving: list) -> Tuple[bool, str]:
+        return False, ("系统代理还原**未真正生效** (命令未报错但回读不符): "
+                       + "; ".join(surviving))
+
+    def _reg_delete_fallback() -> Tuple[bool, str]:
+        r"""兜底: 用**独立进程** reg.exe 清除 AutoConfigURL
+
+        ## ★ 为什么这段此前是死代码, 以及它此前为什么即使被跑到也没用 (2026-10-03 定因)
+
+        ① **不可达**: 它原先写在 `except Exception` 的 `return` 之后, 属于同一个 try 的
+           handler 体内 —— 前面已经 return, 这段永远不执行; 而紧随其后的第二个
+           `except Exception` 也永不匹配 (前一个已吃掉 Exception)。
+           提交 `c6d80ab`/`a2fbf9f` 把它称作"**已证实可用的最终保险**", 实际上从未跑过。
+        ② **即使跑到也无效**: key 字面量原先写成 HKCU 前缀再加两个反斜杠, 而 Python
+           里那两个反斜杠求值为**两个**反斜杠, 拼出的 key 是 `HKCU\\Software\...` ——
+           实测 `reg query` 直接回 `ERROR: Invalid key name.`。而那时又用
+           `except Exception: pass` 吞掉一切且**不看返回码** ⇒ 静默什么都没删。
+           一个失效的保险被当成有效保险, 比"没有保险"更危险。
+
+        现在: 正确的单反斜杠前缀 + 检查 returncode + 回读确认。
+        ⚠ 测试必须 patch `subprocess.run`, 否则这条路径会真的改开发者自己的注册表。
+        """
+        _notify_change()          # 同上: 先让它回写, 再删
+        try:
+            # ⚠ reg.exe 要**完整的 hive 前缀**, 而 _SETTINGS_KEY 是 winreg 的相对路径
+            #   —— 少了 HKCU\ 会静默什么都不做 (reg 返回非零但不抛异常)。
+            proc = subprocess.run(["reg", "delete", "HKCU\\" + _SETTINGS_KEY,
+                                   "/v", "AutoConfigURL", "/f"],
+                                  capture_output=True, timeout=5, shell=False,
+                                  **get_silent_startup_kwargs())
+        except Exception as e:
+            return False, f"reg.exe 兜底清除失败: {type(e).__name__}: {e}"
+        # 删除"值不存在"时 reg 也返回非零, 那种情况不是错误 —— 由回读定论。
+        falling = _mismatch(_readback())
+        if not falling:
+            return True, "系统代理设置已还原 (经 reg.exe 兜底清除)"
+        detail = getattr(proc, "returncode", None)
+        return False, (f"reg.exe 兜底清除后回读仍不符 (reg 退出码 {detail}): "
+                       + "; ".join(falling))
+
     try:
         # ★ 为什么是"删 → 通知 → 回读 → 必要时**再删一次**" (2026-10-02 实测定因):
         #   本函数原先无条件返回成功; 实测它在返回"系统代理设置已还原"的同时,
@@ -236,35 +330,18 @@ def restore(backup: Dict[str, Any]) -> Tuple[bool, str]:
             if not surviving:
                 return True, ("系统代理设置已还原"
                               + ("" if attempt == 1 else f" (第 {attempt} 次尝试才生效)"))
-        return False, ("系统代理还原**未真正生效** (命令未报错但回读不符): "
-                       + "; ".join(surviving))
     except Exception as e:
         return False, f"还原系统代理设置失败: {type(e).__name__}: {e}"
-        # ---- 兜底: 走**已证实可用**的路径 (2026-10-02) ----
-        # 实测定因: winreg.DeleteValue 单独用**完全正常** (朴素
-        # CreateKeyEx+KEY_SET_VALUE+DeleteValue 一把就删掉了 AutoConfigURL),
-        # 但在本函数里连删两次都不生效 —— 根因未查明。
-        # 此时不能只"如实报失败"就收手: 留下 AutoConfigURL 指向一个已死的本地 PAC,
-        # 用户的浏览器会一直去取它; 而 pac_auto 现在是**默认后端**, 每次退出都撞这条路。
-        # reg.exe 是独立进程, 不共享本进程的注册表视图, 实测能清除。
-        if any(s.startswith("AutoConfigURL") for s in surviving):
-            _notify_change()          # 同上: 先让它回写, 再删
-            try:
-                # ⚠ reg.exe 要**完整的 hive 前缀**, 而 _SETTINGS_KEY 是 winreg 的相对路径
-                #   —— 少了 HKCU\\ 会静默什么都不做 (reg 返回非零但不抛异常)。
-                subprocess.run(["reg", "delete", "HKCU\\\\" + _SETTINGS_KEY,
-                                "/v", "AutoConfigURL", "/f"],
-                               capture_output=True, timeout=5, shell=False,
-                               **get_silent_startup_kwargs())
-            except Exception:
-                pass
-            surviving = _mismatch(_readback())
-            if not surviving:
-                return True, "系统代理设置已还原 (经 reg.exe 兜底清除)"
-        return False, ("系统代理还原**未真正生效** (命令未报错但回读不符): "
-                       + "; ".join(surviving))
-    except Exception as e:
-        return False, f"还原系统代理设置失败: {type(e).__name__}: {e}"
+
+    # ★ 兜底在正常路径之外 —— 只有"两轮回读仍不符"才走到这里 (原先它被 return 挡住)。
+    #   reg.exe 是独立进程, 不共享本进程的注册表视图, 实测能清除; 但只在
+    #   AutoConfigURL 仍残留时才值得走 (其它值它清不了)。
+    if any(str(s).startswith("AutoConfigURL") for s in surviving):
+        ok_fb, msg_fb = _reg_delete_fallback()
+        if ok_fb:
+            return True, msg_fb
+        return False, msg_fb
+    return _failure(surviving)
 
 
 def is_pointing_at(url: str) -> bool:
@@ -272,3 +349,82 @@ def is_pointing_at(url: str) -> bool:
     cur = read_current()
     v = (cur.get("values") or {}).get("AutoConfigURL")
     return bool(v) and str(v[0]).strip() == str(url).strip()
+
+
+def is_our_pac_url(url: Any) -> bool:
+    """该 AutoConfigURL 是否**看起来是我们写的** (回环地址 + proxy.pac)
+
+    ★ 抽出来是为了让"清理遗留"这条路径也能用**同一条判据** (见 clear_autoconfig_url 的说明)。
+    为什么不用精确比对 `pac.pac_url()`: PAC 服务端口可能变 (测试/回退/端口冲突),
+    而"回环 + proxy.pac"这组特征足以识别"这是我们这一族的产物" —— 与本项目
+    `restore_system_proxy_if_needed` 里既有的判断逐字一致 (不引入第二套标准)。
+    """
+    s = str(url or "").strip()
+    return bool(s) and "127.0.0.1" in s and "proxy.pac" in s
+
+
+def clear_autoconfig_url() -> Tuple[bool, str]:
+    """**只**清除 `AutoConfigURL` 这一个值 (绝不碰用户另外三个值)
+
+    ## ★★ 为什么必须有这个函数 (2026-10-03 实机踩到, 属"补充修复")
+
+    实机测试里出现了这样一幕: 打包程序崩溃/被强杀后, 注册表里只剩下
+    `AutoConfigURL` 指向我们**已死**的本地 PAC, 而落盘备份也丢了。
+    应用自己的恢复入口 `redirect_manager.restore_system_proxy_if_needed()` 走到
+    "没有备份, 但值仍在" 那条分支 —— 它调的是
+
+        proxy_settings.restore({"values": {}})
+
+    而 `restore()` 的语义是"把系统代理**整体**还原成 `values` 描述的状态":
+    传空集 ⇒ 把 `_BACKUP_VALUES`(**四个**值: AutoConfigURL / ProxyEnable /
+    ProxyServer / ProxyOverride) **全部删除**。
+
+    实测后果: 用户原本设着 `ProxyServer=127.0.0.1:7897` (他唯一的代理出口)
+    与 `ProxyEnable`, 只因为"我们没有他的备份", 就被连同 AutoConfigURL 一起删掉了 ——
+    而函数**返回成功**, 文案还是"系统代理设置已还原"。
+    `ProxyServer` 与我们的 PAC 毫无关系, 删它属于**超出授权范围**。
+
+    正确口径: "清理我们自己留下的东西" 这条路径**只能删 AutoConfigURL**;
+    要动另外三个值, 唯一正当依据是**用户原值的备份** (那才走 `restore(backup)`)。
+
+    实现上有意复用 `restore()` 的定因结论 (先 notify 后写、写完回读、不符则 reg 兜底),
+    但作用域收敛到单个值。
+    """
+    if sys.platform != "win32":
+        return True, "非 Windows 平台, 无需清理"
+    winreg = _winreg()
+    try:
+        surviving: list = []
+        for attempt in (1, 2):
+            # 与 restore() 同因: WinINET 的自动配置缓存会在**刷新时把值写回注册表**,
+            # 所以必须先通知 (让它把缓存吐完) 再删, 且删完要回读。
+            _notify_change()
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _SETTINGS_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as k:
+                try:
+                    winreg.DeleteValue(k, "AutoConfigURL")
+                except FileNotFoundError:
+                    pass
+            now = _readback_with(winreg)
+            surviving = [] if "AutoConfigURL" not in now else [
+                f"AutoConfigURL 未删除 (仍为 {now['AutoConfigURL'][0]!r})"]
+            if not surviving:
+                return True, ("已清除本程序写入的系统「自动配置脚本」"
+                              + ("" if attempt == 1 else f" (第 {attempt} 次尝试才生效)"))
+        # 兜底: 独立进程 reg.exe (不共享本进程的注册表视图)
+        _notify_change()
+        try:
+            proc = subprocess.run(["reg", "delete", "HKCU\\" + _SETTINGS_KEY,
+                                   "/v", "AutoConfigURL", "/f"],
+                                  capture_output=True, timeout=5, shell=False,
+                                  **get_silent_startup_kwargs())
+        except Exception as e:
+            return False, f"清除自动配置脚本失败: {type(e).__name__}: {e}"
+        now = _readback_with(winreg)
+        if "AutoConfigURL" not in now:
+            return True, "已清除系统「自动配置脚本」(经 reg.exe 兜底)"
+        return False, (f"清除自动配置脚本**未真正生效** (reg 退出码 "
+                       f"{getattr(proc, 'returncode', None)}): "
+                       f"AutoConfigURL 仍为 {now['AutoConfigURL'][0]!r}")
+    except Exception as e:
+        return False, f"清除自动配置脚本失败: {type(e).__name__}: {e}"

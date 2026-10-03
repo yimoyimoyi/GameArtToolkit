@@ -30,6 +30,7 @@ from path_utils import NGINX_DIR
 from ip_pool import CANDIDATE_IPS, SERVICES_BY_ID, PROFILES_BY_ID
 import h3_upstream
 import cover_sni
+import http_verdict
 from config_store import load_config
 from win_utils import is_port_in_use, get_physical_adapter_ip, auto_detect_active_proxy
 from ech_tunnel import ech_tunnel
@@ -42,7 +43,7 @@ DEFAULT_PROXY = ("127.0.0.1", 7897)
 # L4 Relay 代理转发端口基址: 44311 + CANDIDATE_IPS 顺序索引, 避开 SNI 主端口 44301
 RELAY_PORT_BASE = 44311
 
-from service_profile import PROFILES
+from service_profile import PROFILES, SITE_FILE_FOR_GROUP
 
 # 各服务的 SNI 模式自动由 ServiceProfile 单源导出
 SNI_MODES = {p.id: p.ssl_sni_mode for p in PROFILES}
@@ -70,7 +71,11 @@ def effective_sni_mode(srv_id: str) -> str:
     return SNI_MODES.get(srv_id, "host")
 
 # nginx.conf include 的有效站点配置 (site-tools.conf 服务已全部删除)
-SITE_CONF_NAMES = ["site-gaming.conf", "site-acg.conf", "site-dev.conf"]
+# 站点配置文件清单: **从 service_profile.SITE_FILE_FOR_GROUP 派生**, 不再手写三个名字。
+# 为什么要派生 (2026-10-03): 这份清单被 `_scan_site_upstream_refs()` 用来校验
+# "每个 site-*.conf 里 proxy_pass 的 upstream 都有定义"; 漏一个文件 = 那个文件的引用
+# 游离在校验之外 = 上游漏定义要等 nginx 启动才炸 (整体拒载)。
+SITE_CONF_NAMES = list(SITE_FILE_FOR_GROUP.values())
 
 # 上游节点熔断策略 (写进 upstream-dynamic.conf 的 server 行)
 #
@@ -86,6 +91,13 @@ UPSTREAM_FAIL_TIMEOUT = "5s"
 # QUIC 直连服务的单节点测速预算 (秒)。QUIC 握手正常在 250ms 内完成, 6s 已足够覆盖
 # 跨洋高丢包; 该值同时作为 aioquic 的 idle_timeout 上限, 避免静默丢包时按默认 60s 空等。
 QUIC_PROBE_TIMEOUT = 6.0
+
+# 单个 upstream 块里允许的 backup 服务器**累计**上限 (2026-10-03 定因, 原缺陷 M5)。
+# 与 upstream-dynamic.conf 文件头的声明("3 主力 + 最多 5 备份冗余")保持一致。
+# 为什么必须有累计上限: 原实现每次增量合并都补 `missing[:5]` 而不数已有的,
+# 实测 `upstream_github_web` 累积到 **13 条 backup**, 与文件头声明自相矛盾;
+# 而 backup 是"主力全挂才轮到"的兜底, 逐个试错 (每节点一档超时) 会把 502 拖得很晚。
+_MAX_BACKUP_SERVERS = 5
 
 
 def _upstream_server_opts() -> str:
@@ -534,29 +546,110 @@ def _send_connect_and_read_200(sock: socket.socket, host: str, port: int, timeou
         raise ConnectionError(f"CONNECT 隧道建立失败: {line or '无响应'}")
 
 
-def _location_target(loc: str, domain: str) -> "tuple[str, str]":
-    """把 `Location` 解析成 (host, path) —— **相对 Location 必须按相对路径处理**
+def _cert_gate(sans: List[str], cert_vendor: str,
+               cert_families: Tuple[str, ...]) -> "tuple[bool, str]":
+    """证书硬门槛: 返回 (是否通过, 不通过的原因)
 
-    为什么单独抽成纯函数 (2026-10-02 定因):
-      原先在探测里内联解析, 对不带 `://` 的 Location 直接把 path 当成 "/" ——
-      于是"同 host + 同路径"的自我重定向判据**退化成"同 host"**, 任何相对重定向
-      都被误判成死循环, 候选被降为 rank3。
-      实测: `www.xbox.com/` 回 `307 Location: /zh-CN/` (正常的区域跳转),
-      6 个候选**全部**因此拿不到主力位。区域/语言跳转是 CDN 最常见的根路径行为,
-      误判面很宽, 所以按相对路径解析, 而不是打补丁排除某些路径。
-    返回值已剥掉 query/fragment —— 路径比较不该被它们影响。
+    为什么抽成**纯函数** (2026-10-03): 这道关是"伪 SNI / 空 SNI 方案下唯一的防线"
+    (运行期必须 proxy_ssl_verify off), 但此前只有 `cert_vendor` 一条判据, 而
+    `VENDOR_CERT_SUFFIXES` **只登记了 google** —— 于是"源站忽略 SNI"与"空 SNI"这两类
+    画像**根本没有门槛**, 别家 vhost / 链路侧劫持页的 2xx 会被当成可用收进池
+    (实测形态: 证书 `fallback.wgcz.net` / `flirtify.com`)。
+
+    两条判据分工 (可同时声明, 任一不过即淘汰):
+      · cert_vendor   : 共享 CDN **按 IP 选证书**的场景 —— 证书须属该厂商自有证书族;
+      · cert_families : 证书须落在这些**域族**内 —— 用于"证书必须仍是目标域自己的"。
+    取不到 SAN 时**判否**: "证不出来"不能当"证得出来"。
     """
-    loc = (loc or "").strip()
-    if "://" in loc:
-        rest = loc.split("://", 1)[1]
-        host = rest.split("/", 1)[0].lower()
-        path = ("/" + rest.split("/", 1)[1]) if "/" in rest else "/"
-    else:
-        host = (domain or "").lower()           # 相对 Location 沿用本 host
-        path = loc if loc.startswith("/") else "/" + loc
-    path = path.split("?", 1)[0].split("#", 1)[0]
-    return host, path
+    _families = tuple(cert_families or ())
+    _vendor_gate = bool(cert_vendor and cert_vendor in cover_sni.VENDOR_CERT_SUFFIXES)
+    if _vendor_gate:
+        ok = cover_sni.cert_belongs_to_vendor(sans, cert_vendor)
+        if not ok:
+            return False, (f"cert gate: 证书不属于 {cert_vendor} 证书族 "
+                           f"(SAN={sans[:3] or '空'})")
+    if _families:
+        fam_ok = cover_sni.cert_matches_family(sans, _families)
+        if not fam_ok:
+            return False, (f"cert gate: 证书域族不在 {list(_families)} 内 "
+                           f"(SAN={sans[:3] or '空'})")
+    return True, ""
 
+
+def _location_target(loc: str, domain: str) -> "tuple[str, str]":
+    """把 `Location` 解析成 (host, path)
+
+    ★ 2026-10-03: 实现已收敛到 `app/http_verdict.py`（探测脚本与两个验收工具共用同一份
+    判据 —— 此前三处各写一份，其中两份是错的/缺失的，实测把一个自跳循环判成了"可用"）。
+    这里保留同签名薄封装：既有单测直接打这个函数，且调用方不必改。
+    """
+    return http_verdict.location_target(loc, domain)
+
+
+def _loop_from_second_hop(second_location: str, domain: str, first_target_path: str) -> bool:
+    """第二跳是否证明这是死循环 (A → B → A 的 B → B)
+
+    抽成一行函数是为了**可测**: 探测里那一段是"拿证据 → 判定", 而判定必须能单测 ——
+    这正是本轮修补的靶子 (旧判据只比一次 Location, 抓不到 yande.re 的 `/post → /post`)。
+    """
+    if not second_location:
+        return False
+    return http_verdict.classify_redirect(
+        second_location, domain, first_target_path) == http_verdict.SELF
+
+
+def _probe_second_hop(ssock, domain: str, path: str, deadline: float) -> str:
+    """对第一跳的目标路径**再发一次请求**，返回新的 Location（拿不到就返回空串）
+
+    为什么需要第二跳（2026-10-03，yande.re 定案）:
+      只比较一次 Location 抓不到 `A → B → A` —— 经 CF 时 `/` 可能先 301 到 `/post`
+      （看着像正常规范化），而 `/post` 又 301 回 `/post`。只判一跳 ⇒ 把已坏的通道判成可用。
+
+    ⚠ 这一跳是**尽力而为**、不得影响主判定:
+      · 探测请求带 `Connection: close`，服务器可能已经关连接 ⇒ 读写失败一律返回空串；
+      · 时限受主探测的 deadline 约束（只允许用剩余预算，最多再等 0.6s）；
+      · 任何异常都吞掉 —— "没拿到证据"绝不等于"有死循环"。
+    """
+    try:
+        remain = deadline - time.monotonic()
+        if remain <= 0.15:
+            return ""
+        ssock.settimeout(max(0.2, min(0.6, remain)))
+        req = (f"GET {path or '/'} HTTP/1.1\r\n"
+               f"Host: {domain}\r\n"
+               f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) GameArtToolkit/2.0\r\n"
+               f"Connection: close\r\n\r\n")
+        ssock.sendall(req.encode("utf-8"))
+        hdr = b""
+        while b"\r\n\r\n" not in hdr and len(hdr) < 65536:
+            chunk = ssock.recv(4096)
+            if not chunk:
+                break
+            hdr += chunk
+        text = hdr.decode("latin-1", errors="replace")
+        for line in text.split("\r\n"):
+            if line.lower().startswith("location:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+
+def _is_managed_challenge(raw_headers: bytes) -> bool:
+    """响应头里是否带 Cloudflare **托管挑战**标记 (2026-10-03)
+
+    只看 `cf-mitigated` —— CF 在挑战/拦截时用它标明处置原因 (实测取值 `challenge`)。
+    为什么不用"页面里含 Just a moment"这类**内容**启发式:
+      · 那要读 body, 而我们在只读到响应头时就该做淘汰判定 (省一次往返);
+      · 内容判据会被真实页面里的文案误伤 —— 本项目已经吃过"判据看着合理但会误伤"的亏。
+    响应头是权威且零成本的。解码用 latin-1: 它**永不抛异常**, 且能覆盖任意字节。
+    """
+    try:
+        head = raw_headers.decode("latin-1", errors="replace").lower()
+    except Exception:
+        return False
+    return "cf-mitigated:" in head
 
 
 def _suspect_status(status: Optional[int]) -> bool:
@@ -610,7 +703,8 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          probe_domains: Optional[List[str]] = None,
                          ok_statuses: Optional[set] = None,
                          proxy_connect_domain: bool = False,
-                         cert_vendor: str = "") -> Dict:
+                         cert_vendor: str = "",
+                         cert_families: Tuple[str, ...] = ()) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
 
     单节点独立生命周期计时:
@@ -630,12 +724,17 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
       判据 = 对端证书的 SAN 里至少有一条属于该厂商自有证书族; 不通过则**硬淘汰**该节点
       (http_suspect=True 并提前返回), 因为伪 SNI 方案下运行期必须 proxy_ssl_verify off,
       "这个节点是不是真的该厂商边缘"只能在探测阶段把关 —— 这是唯一防线。
+    - cert_families: 画像声明的**证书域族硬门槛** (空 = 不检查)。用于 `cdn_vendor` 覆盖不到的那类:
+      "源站忽略 SNI、按 Host 路由"与"空 SNI"通道下, 证书必须**仍是目标域自己的** ——
+      否则别家 vhost / 链路侧劫持页的 2xx 会被当成可用收进池 (实测形态: 证书
+      `fallback.wgcz.net` / `flirtify.com`)。取不到 SAN (或 SAN 为空) 时**判否**:
+      "证不出来"不能当"证得出来", 硬门槛宁可淘汰。
     """
     def _do_probe_once() -> Dict:
         out = {"tcp_ok": False, "tcp_latency": None, "tls_ok": False,
                "tls_latency": None, "http_ok": False, "http_status": None, "error": "",
                "http_suspect": False, "http_subdomains_ok": True, "throughput": None,
-               "cert_ok": None, "cert_sans": []}
+               "cert_ok": None, "cert_family_ok": None, "cert_sans": []}
         # http_suspect: 主域状态码可疑 (硬淘汰, 防假阳性)
         # http_subdomains_ok: 副域多域验证是否全部通过 (软信号, 失败仅排序降权不淘汰,
         #   防 GFW 特判封锁子域/瞬时抖动误杀整服务)
@@ -700,21 +799,23 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                 out["tls_ok"] = True
                 out["tls_latency"] = round((time.perf_counter() - t0) * 1000.0, 1)
 
-                # §6.2 第 ③ 关: 证书硬门槛 (仅已登记证书族的厂商)
-                if cert_vendor and cert_vendor in cover_sni.VENDOR_CERT_SUFFIXES:
+                # §6.2 第 ③ 关: 证书硬门槛 (厂商证书族 + 画像声明的域族; 任一不过即硬淘汰)
+                _families = tuple(cert_families or ())
+                if (cert_vendor and cert_vendor in cover_sni.VENDOR_CERT_SUFFIXES) or _families:
                     try:
                         sans = cover_sni.cert_sans(ssock.getpeercert(binary_form=True))
                     except Exception:
                         sans = []
                     out["cert_sans"] = sans[:8]
-                    ok = cover_sni.cert_belongs_to_vendor(sans, cert_vendor)
-                    out["cert_ok"] = bool(ok)
-                    if not ok:
+                    _gate_ok, _gate_why = _cert_gate(sans, cert_vendor, _families)
+                    out["cert_ok"] = _gate_ok if (cert_vendor and
+                                                  cert_vendor in cover_sni.VENDOR_CERT_SUFFIXES) else None
+                    out["cert_family_ok"] = _gate_ok if _families else None
+                    if not _gate_ok:
                         # 硬门槛: 不可降权, 直接淘汰。命中场景 = 空 SNI 的占位证书
-                        # invalid2.invalid / 打错服务器的别人家证书 / Bandaid 类错误 vhost。
+                        # invalid2.invalid / 打错服务器的别人家证书 / 链路侧劫持页的 2xx。
                         out["http_suspect"] = True
-                        out["error"] = (f"cert gate: 证书不属于 {cert_vendor} 证书族 "
-                                        f"(SAN={sans[:3] or '空'})")
+                        out["error"] = _gate_why
                         return out
             except Exception as e:
                 out["error"] = f"tls error: {e}"
@@ -760,8 +861,20 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                             # 相对 Location (如 `/zh-CN/`) 必须按相对路径解析 —— 见
                             # _location_target 的注释 (这是 xbox 6 个候选被误降 rank3 的原因)
                             loc_host, loc_path = _location_target(loc, domain)
-                            if loc_host == domain.lower() and loc_path == "/":
+                            # ★ 2026-10-03: 判据改用 app/http_verdict 的单一真源, 并**多看一眼**:
+                            #   只比较一次 Location 抓不到 `A → B → A` 形态 —— 经 CF 时 `/` 可能先
+                            #   301 到 `/post` (看着像正常规范化), 而 `/post` 又 301 回 `/post`。
+                            #   实测 yande.re 正是这种, 而旧判据 (只认 path=="/") 与两个验收工具
+                            #   (干脆不看 Location) 都会把它判成可用 ⇒ 用户侧表现为无限跳转。
+                            _verdict = http_verdict.classify_redirect(loc, domain, "/")
+                            if _verdict == http_verdict.SELF:
                                 out["self_redirect"] = True
+                            elif _verdict == http_verdict.NORMALIZE:
+                                # 第二跳: 只有目标路径又跳回**同一路径**才算死循环。
+                                # 尽力而为, 失败一律不算 (见 _probe_second_hop 注释)。
+                                _second = _probe_second_hop(ssock, domain, loc_path, deadline)
+                                if _loop_from_second_hop(_second, domain, loc_path):
+                                    out["self_redirect"] = True
 
                             # 校园网 Portal / 深澜 srun 网关劫持防御:
                             # 若重定向指向 portal/srun/auth/login 关键字, 或目标属于非标内网 IP, 严厉硬淘汰
@@ -774,6 +887,18 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                     # 主域状态码干净判定 (ok_statuses 显式放行或非可疑)
                     if not ((out["http_status"] in ok_set) or not _suspect_status(out["http_status"])):
                         out["http_suspect"] = True
+
+                    # ★★ 托管挑战**硬否决**: 不论状态码是否在白名单里 (2026-10-03)
+                    #   为什么必须有: 我们**自己**给 discord_gateway 开了 403 白名单
+                    #   (probe_ok_statuses=(403, 404)), 而 Cloudflare 托管挑战的响应正是
+                    #   `403 + cf-mitigated: challenge` ⇒ **一个挑战页会被判成"可用"**。
+                    #   那是"假可用", 直接违反项目红线; 而且托管挑战任何纯反代方案都拿不到
+                    #   cf_clearance, 判它可用只会让用户看到"连得上却打不开"。
+                    #   放行白名单是**有意的**(root 路径本就该 4xx), 但它绝不能放行挑战页 ——
+                    #   两者的区别只有响应头能表达, 所以这条否决必须独立于 ok_statuses。
+                    if _is_managed_challenge(hdr):
+                        out["http_suspect"] = True
+                        out["challenge"] = True
 
                     # 吞吐测量: 仅对主域干净 2xx 响应进行; 继承 hdr 中已读到的首个 body 分片
                     if measure_throughput and 200 <= out["http_status"] < 300:
@@ -858,6 +983,12 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                                     # 副域状态码: ok_statuses 显式放行或非可疑 (与主域同一套判定)
                                     if not ((extra_code in ok_set) or not _suspect_status(extra_code)):
                                         out["http_subdomains_ok"] = False  # 副域可疑 -> 软降权不淘汰
+                                        break
+                                    # 托管挑战: 与主域同一判据, 但这里保持副域既有的**软降权**语义
+                                    # (副域挑战页同样不能算"干净", 但按设计不淘汰整条通道)
+                                    if _is_managed_challenge(extra_hdr):
+                                        out["http_subdomains_ok"] = False
+                                        out["challenge"] = True
                                         break
                                     # 干净副域继续验证下一个域
                                 else:
@@ -1042,17 +1173,21 @@ class CDNOptimizer:
         proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
         # §6.2 第 ③ 关: 证书硬门槛的厂商 (仅已登记证书族者生效, 见 probe_ip_endpoint_v2)
         cert_vendor = str(getattr(profile, "cdn_vendor", "") or "").strip().lower()
+        # 画像声明的证书**域族**门槛 (空 = 不检查): "证书必须仍是目标域自己的" ——
+        # 专治 cdn_vendor 覆盖不到的通道 (源站忽略 SNI / 空 SNI), 见 probe_ip_endpoint_v2
+        cert_families = tuple(getattr(profile, "cert_families", ()) or ())
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
                 direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
                                               measure_throughput=measure_thp,
                                               probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                              cert_vendor=cert_vendor)
+                                              cert_vendor=cert_vendor, cert_families=cert_families)
                 proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
                                                  measure_throughput=False,
                                                  probe_domains=probe_domains, ok_statuses=ok_statuses,
                                                  proxy_connect_domain=proxy_connect_domain,
-                                                 cert_vendor=cert_vendor) if proxy else None
+                                                 cert_vendor=cert_vendor,
+                                                 cert_families=cert_families) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -1170,26 +1305,30 @@ class CDNOptimizer:
             proxy_connect_domain = bool(getattr(profile, "proxy_connect_by_domain", False))
             # §6.2 第 ③ 关: 证书硬门槛的厂商 (仅已登记证书族者生效)
             cert_vendor = str(getattr(profile, "cdn_vendor", "") or "").strip().lower()
+            # 画像声明的证书域族门槛 (空 = 不检查), 见 probe_ip_endpoint_v2
+            cert_families = tuple(getattr(profile, "cert_families", ()) or ())
 
             # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
 
             for ip in final_ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout, measure_thp,
-                                   probe_domains, ok_statuses, proxy_connect_domain, cert_vendor))
+                                   probe_domains, ok_statuses, proxy_connect_domain, cert_vendor,
+                                   cert_families))
 
         def run_both(task):
             (srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains,
-             ok_statuses, proxy_connect_domain, cert_vendor) = task
+             ok_statuses, proxy_connect_domain, cert_vendor, cert_families) = task
             direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
                                           quick_retry=True, measure_throughput=measure_thp,
                                           probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                          cert_vendor=cert_vendor)
+                                          cert_vendor=cert_vendor, cert_families=cert_families)
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
                                              quick_retry=False, measure_throughput=False,
                                              probe_domains=probe_domains, ok_statuses=ok_statuses,
                                              proxy_connect_domain=proxy_connect_domain,
-                                             cert_vendor=cert_vendor) if proxy else None
+                                             cert_vendor=cert_vendor,
+                                             cert_families=cert_families) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -1790,12 +1929,98 @@ class CDNOptimizer:
         if idx < 0:
             return block
         flag = "" if balancing else "backup "
+
+        # ★ 累计上限 (2026-10-03 定因, 原缺陷 M5): 原实现每次都补 `missing[:5]`, 而**没有**
+        #   累计上限 —— 第一次补 5 条、下一次再补 5 条…… 实测 `upstream_github_web`
+        #   最终带着 **13 条 backup**(文件头却声明"3 主力 + 最多 5 备份冗余"),
+        #   而且有 8 条被插在 `keepalive` 指令**之后**(该函数的插入痕迹)。
+        #   后果: 文件自身的声明与内容矛盾; backup 逐个试错会把 502 拖到很晚才出现
+        #   (每节点一档 5s 超时), 而 nginx 的 `keepalive` 语义依赖指令顺序。
+        #   现在: 先数出块里**已有**多少条 backup, 只补到上限为止, 且插入点选在
+        #   `keepalive` **之前** (保持 "server 行都在 keepalive 之前" 的 nginx 惯例)。
+        if flag:
+            existing_backup = len(re.findall(r"^\s*server\s+[^\s;]+\s+backup\b", block, re.M))
+            room = max(0, _MAX_BACKUP_SERVERS - existing_backup)
+            if room <= 0:
+                return block
+            missing = missing[:room]
+
         add = "\n".join(self._fmt_server(ip, flag + _upstream_server_opts())
-                        for ip in missing[:5])
-        return block[:idx].rstrip("\n") + "\n" + add + "\n" + block[idx:]
+                        for ip in missing)
+        insert_at = idx
+        if flag:
+            # 插到 keepalive 之前 (若有); 否则仍在块尾
+            m = re.search(r"^\s*keepalive\b", block[:idx], re.M)
+            if m:
+                insert_at = m.start()
+        return (block[:insert_at].rstrip("\n") + "\n" + add + "\n"
+                + block[insert_at:])
+
+    @staticmethod
+    def normalize_upstream_file_text(text: str) -> str:
+        """一次性/幂等地**净化** upstream-dynamic.conf 的历史污染 (原缺陷 M5)
+
+        做三件事, 全部是"让文件回到它自己声明的样子":
+          ① 把 backup 服务器**收敛到至多 `_MAX_BACKUP_SERVERS` 条** (超出的删掉);
+          ② 把散落在 `keepalive` **之后**的 server 行**移回** `keepalive` 之前
+             (nginx 的惯例是 server 行集中在前面; 这也正是历史上"追加式插入"的痕迹);
+          ③ 含均衡法 (hash/least_conn/ip_hash/random) 的块里**移除** backup
+             (两者在 nginx 里互斥, 并存会让**整份配置被拒载**)。
+
+        为什么需要它: `_augment_block_with_pool` 的累计上限只约束**新追加**的量,
+        而旧块是"上一次的实测快照、被原样复用" —— 于是既有的 13 条 backup
+        不会自己消失。实测 `upstream_github_web` 就是这种状态。
+
+        ⚠ **格式守卫**: 本函数只处理"块以行首 `}` 结束"这种**生成器自己写出的格式**。
+        块里若出现 `hash $request_uri consistent;` 这类嵌套花括号不构成问题, 但
+        单行写的块 (`upstream x { ... }` 同行收尾) 会被此守卫识别出来并**原样返回** ——
+        宁可不动, 也不要按错误的边界切分。实测踩到过: 用宽松正则切分会把 `{` 之后
+        的换行吃掉, 生成 `{    server ...` 这种畸形输出。
+        """
+        pat = re.compile(r"upstream\s+(upstream_[a-z0-9_]+)\s*\{\n(.*?)\n\}", re.S)
+        if re.search(r"upstream\s+upstream_[a-z0-9_]+\s*\{[^\n]*\S", text):
+            return text          # 存在"同行收尾"的块 ⇒ 格式不认识, 不动
+        out_blocks = []
+        pos = 0
+        for m in pat.finditer(text):
+            out_blocks.append(text[pos:m.start()])
+            name, body = m.group(1), m.group(2)
+            lines = body.split("\n")
+            server_lines, other_lines = [], []
+            for ln in lines:
+                if re.match(r"^\s*server\s", ln):
+                    server_lines.append(ln)
+                else:
+                    other_lines.append(ln)
+
+            balancing = any(re.search(rf"^\s*{d}\b", body, re.M)
+                            for d in ("hash", "least_conn", "ip_hash", "random"))
+            main, backup = [], []
+            for ln in server_lines:
+                # ⚠ 必须用 `\b` 而不是 `\s+`: 行尾形式是 `... backup;` —— `backup` 后面
+                #   紧跟分号, 用 `\s+` 会匹配不到 (实测踩到: 含均衡法的块净化不生效)。
+                if re.search(r"\bserver\s+[^\s;]+\s+backup\b", ln):
+                    backup.append(ln)
+                else:
+                    main.append(ln)
+            if balancing:
+                # 净化: 去掉 backup 关键字 (保留这些节点, 否则会凭空少候选)
+                backup = [re.sub(r"^(\s*server\s+[^\s;]+\s+)backup\b", r"\1", ln)
+                          for ln in backup]
+                main = main + backup
+                backup = []
+            backup = backup[:_MAX_BACKUP_SERVERS]
+
+            # 统一收敛布局: 主力 → backup → 其余 (含 keepalive)。
+            # 这同时修掉"server 行散落在 keepalive 之后"的追加痕迹。
+            # ⚠ `{` 之后必须保留换行 (写成 `{{{body}` 会把第一条 server 挤到同一行)。
+            body_new = "\n".join(main + backup + other_lines)
+            out_blocks.append(f"upstream {name} {{\n{body_new}\n}}")
+            pos = m.end()
+        out_blocks.append(text[pos:])
+        return "".join(out_blocks)
 
     def _scan_site_upstream_refs(self) -> set:
-        """扫描 nginx.conf 实际 include 的 site 配置, 提取所有 proxy_pass 引用的 upstream 名"""
         refs = set()
         for name in SITE_CONF_NAMES:
             conf_file = self.conf_path.parent / name

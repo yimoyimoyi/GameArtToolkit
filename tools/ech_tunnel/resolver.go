@@ -55,11 +55,12 @@ func inCloudflare(ipStr string) bool {
 // 必须走 DoH 的原因: 本机系统 DNS 对 pixiv 等域名返回污染结果。但 DoH 本身
 // 也不完全可靠(见 cloudflareV4 注释), 所以还要叠加网段过滤与静态池兜底。
 type Resolver struct {
-	dohURLs       []string
-	pool          []string // 静态 IP 池兜底(来自服务配置, 视为可信)
-	ttl           time.Duration
-	requireCFNet  bool // 只接受 Cloudflare 网段内的解析结果
-	client        *http.Client
+	dohURLs      []string
+	pool         []string            // 全局静态池(其它画像的边缘, 仅作最后兜底)
+	perHost      map[string][]string // 每主机专属池(该画像自己验过的边缘), 键为小写域名
+	ttl          time.Duration
+	requireCFNet bool // 只接受 Cloudflare 网段内的解析结果
+	client       *http.Client
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -70,15 +71,81 @@ type cacheEntry struct {
 	expires time.Time
 }
 
-func NewResolver(dohURLs, pool []string, ttl time.Duration, requireCFNet bool) *Resolver {
+func NewResolver(dohURLs, pool []string, perHost map[string][]string,
+	ttl time.Duration, requireCFNet bool) *Resolver {
 	return &Resolver{
 		dohURLs:      dohURLs,
 		pool:         pool,
+		perHost:      perHost,
 		ttl:          ttl,
 		requireCFNet: requireCFNet,
 		client:       &http.Client{Timeout: 5 * time.Second},
 		cache:        make(map[string]cacheEntry),
 	}
+}
+
+// poolFor 返回该主机应使用的静态池: 优先**专属池**(该域自己验过的边缘), 再退回全局池。
+//
+// 为什么必须区分 (2026-10-03 实测, 这不是优化而是正确性):
+//   全局池里混着**别的 zone** 的边缘地址。对"权威解析本身不是 Cloudflare"的主机
+//   (实测 n2.pawchive.pw 的 DoH 答案落在 DDoS-Guard), 网段过滤会把 DoH 答案全部拒掉,
+//   于是回退到全局池 —— 而池里排在最前的是别的服务的边缘。同一路径 (1,828,047B 的原图)
+//   实测: 专属池(该 zone 自己的边缘) 6/6 **完整**; 全局池则出现 **响应截断**
+//   (实收 439,569B / 903,504B, 声明 1,828,047B) 与 **502**, 且 DialContext 只在
+//   **TCP 失败**时换 IP ⇒ 截断与 502 都不会自动换到下一个地址。
+//   注意: 该主机的 DoH 答案 185.178.208.148 是 DDoS-Guard 挡板(直连只得 3.2KB 挡板页),
+//   真正能拿到原图的是本 zone 的 CF 边缘 —— 这正是"池必须与目标匹配"的由来。
+//
+// 匹配规则: 精确命中优先, 其次按后缀命中注册域 (登记 pawchive.pw 即覆盖 img./n2.)。
+func (r *Resolver) poolFor(host string) []string {
+	if len(r.perHost) == 0 {
+		return r.pool
+	}
+	h := strings.ToLower(host)
+	if ips, ok := r.perHost[h]; ok && len(ips) > 0 {
+		return ips
+	}
+	var best string
+	var bestIPs []string
+	for reg, ips := range r.perHost {
+		if len(ips) == 0 {
+			continue
+		}
+		if strings.HasSuffix(h, "."+reg) && len(reg) > len(best) {
+			best, bestIPs = reg, ips
+		}
+	}
+	if len(bestIPs) > 0 {
+		return bestIPs
+	}
+	return r.pool
+}
+
+// poolForDial 在 poolFor 基础上再做**网段过滤**。
+//
+// 为什么池也要过滤: 池里可能混入非 Cloudflare 地址 (实测 pixiv_web 的候选池含源站
+// 210.140.139.x)。这类地址**能建 TCP 但必然 ECH 握手失败**, 而拨号逻辑只在 TCP 失败时
+// 换 IP ⇒ 结果是"第一个地址就打死整条链路"的 502。过滤掉它们, 后面真正是 CF 边缘的
+// 候选才有机会被拨到。
+func (r *Resolver) poolForDial(host string) []string {
+	pool := r.poolFor(host)
+	if !r.requireCFNet {
+		return pool
+	}
+	var out []string
+	var dropped []string
+	for _, ip := range pool {
+		if inCloudflare(ip) {
+			out = append(out, ip)
+		} else if !contains(dropped, ip) {
+			dropped = append(dropped, ip)
+		}
+	}
+	if len(dropped) > 0 {
+		log.Printf("[dns] %s 静态池剔除非 Cloudflare 地址(ECH 必失败): %s",
+			host, strings.Join(dropped, ", "))
+	}
+	return out
 }
 
 // poolCacheTTL 是回退到静态池时的缓存时长。
@@ -127,7 +194,7 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string) ([]string, error
 		// jsdelivr 的 DoH 结果是 104.17.207.5, 连接被 RST; 而静态池里各服务
 		// 验证过的地址正常。两张表合并后由拨号逻辑依次尝试, 单个失效不影响整体。
 		merged := append([]string{}, clean...)
-		for _, ip := range r.pool {
+		for _, ip := range r.poolForDial(host) {
 			if !contains(merged, ip) {
 				merged = append(merged, ip)
 			}
@@ -137,14 +204,15 @@ func (r *Resolver) ResolveAll(ctx context.Context, host string) ([]string, error
 	}
 
 	// DoH 不可用或全被过滤: 退回静态池。池内地址来自服务配置, 视为可信。
-	if len(r.pool) > 0 {
+	pool := r.poolForDial(host)
+	if len(pool) > 0 {
 		reason := "DoH 不可用"
 		if len(rejected) > 0 {
 			reason = "DoH 结果疑似投毒(" + strings.Join(rejected, ", ") + ")"
 		}
-		log.Printf("[dns] %s 回退静态池(%s): %s", host, reason, strings.Join(r.pool, ", "))
-		r.store(host, r.pool, poolCacheTTL)
-		return r.pool, nil
+		log.Printf("[dns] %s 回退静态池(%s): %s", host, reason, strings.Join(pool, ", "))
+		r.store(host, pool, poolCacheTTL)
+		return pool, nil
 	}
 	return nil, fmt.Errorf("无法解析 %s: DoH 不可用/被投毒且无静态池兜底", host)
 }

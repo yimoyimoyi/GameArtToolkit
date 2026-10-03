@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hosts_manager import build_domain_targets
+from service_profile import ServiceMode, get_profile_by_domain
 from nrpt_manager import NRPT_DNS_PORT, NRPT_NAME_SERVER, NrptManager
 from pac_redirect import PacRedirectManager
 import proxy_settings
@@ -46,14 +47,20 @@ MODE_PAC_AUTO = "pac_auto"
 _CFG_PROXY_BACKUP = "proxy_settings_backup"
 
 
-def _persist_proxy_backup(backup: dict) -> None:
+def _persist_proxy_backup(backup: dict) -> bool:
+    """把用户原有代理设置落盘; 返回**是否真的写进去了**
+
+    ★ 必须返回 bool (2026-10-03 定因): 原实现整体 `except: pass` 而调用方无条件
+    `state["proxy_backup_saved"] = True` 并对外宣称"已自动备份并还原原有代理设置" ——
+    备份没落盘也报成功, 等于把"可恢复"这个承诺建立在一次静默失败的写入上。
+    """
     try:
         from config_store import load_config, save_config
         cfg = load_config() or {}
         cfg[_CFG_PROXY_BACKUP] = backup
-        save_config(cfg)
+        return bool(save_config(cfg))
     except Exception:
-        pass
+        return False
 
 
 def _load_proxy_backup():
@@ -92,18 +99,54 @@ def restore_system_proxy_if_needed() -> Tuple[bool, str]:
     backup = _load_proxy_backup()
     if not auto and not backup:
         return True, "系统代理无需还原"
+
+    # ★ 有备份时也必须有"现值是否仍是我们写的"这道判据 (2026-10-03 定因)。
+    #   原实现: `if backup:` 就无条件 restore —— 而下面"没有备份"的分支反而有守卫
+    #   ("只清理指向本机 PAC 的那种, 绝不乱动用户自设的其它 PAC")。
+    #   同一个函数里两种标准, 后果是: 用户在我们运行期间**自己改过**代理设置(或换了网络、
+    #   被别的工具改过)之后, 我们一退出就照旧按旧备份**覆盖回去**, 把用户的新设置抹掉 ——
+    #   等于替用户改上网方式, 与"系统代理是用户自己的设置"这条自我约束直接冲突。
+    #   判据用 proxy_settings.is_pointing_at() (此前定义了却无人调用的死代码, 见 M11)。
+    still_ours = False
+    try:
+        if auto:
+            still_ours = ("127.0.0.1" in str(auto) and "proxy.pac" in str(auto))
+    except Exception:
+        still_ours = False
+
     if backup:
+        if not still_ours:
+            # 现值已不是我们的 PAC: 用户(或其他程序)改过。清掉过期备份, 不动注册表。
+            _clear_proxy_backup()
+            return True, f"系统代理已被改动 (现为 {auto or '空'}), 不是本项目的 PAC, 不动它"
         ok, msg = proxy_settings.restore(backup)
         if ok:
             _clear_proxy_backup()
         return ok, msg
-    # 没有备份, 但值仍在: 只清理指向本机 PAC 的那种, 绝不乱动用户自设的其它 PAC
-    if auto and "127.0.0.1" in str(auto) and "proxy.pac" in str(auto):
-        ok, msg = proxy_settings.restore({"values": {}})
-        return ok, f"检测到上次遗留的本地 PAC 设置, 已清除 ({auto})"
+    # ★★ 这条分支**只能清 AutoConfigURL 一个值** (2026-10-03 实机踩到, 属"补充修复")
+    #
+    # 原先这里调的是 `proxy_settings.restore({"values": {}})` —— 而 restore() 的语义是
+    # "把系统代理**整体**还原成 values 描述的状态", 传空集就等于把**四个值全删**
+    # (AutoConfigURL / ProxyEnable / ProxyServer / ProxyOverride)。
+    #
+    # 实机后果 (我本人复现): 用户原本设着 ProxyServer=127.0.0.1:7897 (他唯一的代理出口)
+    # 与 ProxyEnable, 只因为"我们没有他的备份", 就被连同 AutoConfigURL 一起删掉,
+    # 而函数**返回成功**、文案还写"系统代理设置已还原"。
+    # ProxyServer 跟我们的 PAC 毫无关系 ⇒ 这是**超出授权范围地改用户的联网方式**。
+    #
+    # 现在: 清理路径只删自己的那一个值; 要动另外三个, 唯一正当依据是**用户原值的备份**
+    # (那条走上方的 restore(backup))。
+    if still_ours:
+        ok, msg = proxy_settings.clear_autoconfig_url()
+        return ok, f"检测到上次遗留的本地 PAC 设置, 已清除 ({auto})" + ("" if ok else f" — {msg}")
     return True, "系统代理指向的不是本项目的 PAC, 不动它"
 
 DEFAULT_DNS_PORT = 5353
+
+# 不经本机代理的画像模式 (与 nginx_generator.NGINX_BYPASS_MODES 同源判据):
+# DIRECT 由 hosts/DNS 直接钉真实 CDN IP; QUIC_DIRECT 由 DNS 下发 HTTPS RR 让浏览器自走 QUIC。
+# 两者在 nginx 侧都没有 server 块 ⇒ 交给 PAC 只会落到默认 server 拿到不相干的内容。
+_PAC_BYPASS_MODES = (ServiceMode.DIRECT, ServiceMode.QUIC_DIRECT)
 
 _NRPT = NrptManager()
 _PAC = PacRedirectManager()
@@ -144,6 +187,49 @@ def _clear_bypass():
         pass
 
 
+def pac_redirectable_domains(services: List[str]) -> List[str]:
+    """由启用服务推导**该交给 PAC/代理处理**的域名 (原缺陷 H6)
+
+    ## 为什么不能直接用 `build_domain_targets(...).keys()`
+
+    `build_domain_targets` 对 `DIRECT` / `QUIC_DIRECT` 画像会算出"**钉真实 CDN IP**"
+    的决策 (见 hosts_manager 的推导), 而那两个模式在 nginx 侧被 `NGINX_BYPASS_MODES`
+    排除 —— **没有 server 块**。原实现把 `.keys()` 直接交给 PAC, 于是这些域名被
+    送进本地代理, 却又没有站点承载它们 ⇒ 落到默认 server (H5/H5′), 得到**不相干的内容**。
+
+    对照: DNS 后端 (`dns_server._resolve_local_entry`) 是**尊重** `profile.mode` 的
+    (`QUIC_DIRECT` 走向上游解析、`DIRECT` 返回真实 CDN IP), PAC 分支原先不尊重。
+    这里补齐这条对称性 —— 判据取自画像本身, 与 DNS 层同源。
+
+    `reddit_static` 就是活例子: `mode=ServiceMode.DIRECT`(注释写"只钉真实 IP, 不经本机
+    反代")且**默认启用**, 所以这条路径在日常使用里必然被走到。
+    """
+    out: List[str] = []
+    for d in sorted(build_domain_targets(services).keys()):
+        try:
+            profile = get_profile_by_domain(d)
+        except Exception:
+            profile = None
+        if profile is not None and getattr(profile, "mode", None) in _PAC_BYPASS_MODES:
+            continue
+        out.append(d)
+    return out
+
+
+def _pac_fallback_directive_safe() -> str:
+    """取用户既有代理设置的 PAC 兜底指令; 任何异常都退化为 DIRECT
+
+    为什么单独抽出来: `pac.start(..., fallback=...)` 有**两个**调用方
+    (apply_redirect 与 GUI 的"以 PAC 启动浏览器"), 原实现只有前者传了 fallback,
+    后者用默认值 DIRECT ⇒ 点那个按钮会把**系统级生效的 PAC** 悄悄换成 DIRECT 兜底版,
+    把用户自己的固定代理旁路掉 (实测事故 b1693ed: 用户代理收到的 CONNECT 数为 0)。
+    """
+    try:
+        return proxy_settings.pac_fallback_directive() or "DIRECT"
+    except Exception:
+        return "DIRECT"
+
+
 def apply_redirect(cfg: Dict[str, Any], services: List[str], hosts, nrpt=None,
                    dns=None, state: Optional[Dict[str, Any]] = None,
                    pac_mgr=None) -> Tuple[bool, str]:
@@ -163,18 +249,21 @@ def apply_redirect(cfg: Dict[str, Any], services: List[str], hosts, nrpt=None,
     state["mode"] = mode
     state["domain_count"] = len(domains)
 
-    if mode in (MODE_PAC, MODE_PAC_AUTO):
+    if is_pac_mode(mode):   # 族查询, 不写死成员 (见 is_pac_mode docstring)
         # PAC 分支: 域名表交给 PAC 后端 (它把通配表达在 PAC 的 JS 里)。
         # 与 NRPT 分支一样, **同时清掉 Hosts 规则** —— Hosts 优先级高于代理之前的解析,
         # 残留会让部分域名绕过本后端, 造成"有的能开有的不能"的错乱。
+        #
+        # ★ 域名表必须先按 `profile.mode` 过滤 (2026-10-03 定因, 原缺陷 H6):
+        #   DIRECT / QUIC_DIRECT 的画像在 nginx 侧**没有 server 块**, 交给 PAC 只会把它们
+        #   送进本地代理再落到默认 server —— 那正是"静默错内容"。见 pac_redirectable_domains。
+        pac_domains = pac_redirectable_domains(services)
+        state["pac_domain_count"] = len(pac_domains)
         pac = pac_mgr or _PAC
         # 兜底必须复现用户既有代理设置: PAC 优先于固定代理, 一律返回 DIRECT 会把
         # 用户自己的代理整个旁路掉 (实测其 CONNECT 数为 0)。
-        try:
-            _fb = proxy_settings.pac_fallback_directive()
-        except Exception:
-            _fb = "DIRECT"
-        ok, msg = pac.start(domains, fallback=_fb)
+        _fb = _pac_fallback_directive_safe()
+        ok, msg = pac.start(pac_domains, fallback=_fb)
         if not ok:
             # ★ 这里**刻意不回退 Hosts**: Hosts 表达不了通配, 回退后动态节点名依然不被劫持
             # —— 那正是本项目一直在消除的"假可用"(界面显示已加速, 实际视频永远转圈)。
@@ -195,14 +284,41 @@ def apply_redirect(cfg: Dict[str, Any], services: List[str], hosts, nrpt=None,
             # 且实测运行中的浏览器会当场采用 (写入后已通知系统)。
             # ⚠ 写入前**必须备份**用户原有代理设置, 并持久化 —— 否则进程被强杀后
             #    备份随内存丢失, 用户的系统代理就被我们永久改掉了。
-            backup = proxy_settings.read_current()
+            #
+            # ★★ "已备份过就不再备份" 这道守卫是必须的 (2026-10-03 定因) ——
+            #    `_apply_redirect` 在**每次**服务开关/后端切换时都会被调用, 而第一次
+            #    apply 之后 AutoConfigURL 已经指向**我们自己的** PAC。若第二次 apply
+            #    无条件 read_current(), 它读到的"用户原值"其实就是我们自己写的值 ——
+            #    于是落盘备份被污染成"用户的 PAC = 我们的 PAC"; 退出时把它写回注册表,
+            #    用户**原有的 AutoConfigURL 永久丢失** (随后 _clear_proxy_backup 还会
+            #    删掉唯一的证据)。更糟的是若回读恰好"成功", 这个坏状态会被固化, 下次
+            #    启动又用同一份污染备份再写一遍。
+            #    这正是 proxy_settings.py 注释写明要避免的事, 所以守卫必须在这里。
+            backup = _load_proxy_backup()
+            if backup is None:
+                cur = proxy_settings.read_current()
+                # 备份丢失但注册表已指着我们 (上次被强杀) 时, 不能把"我们自己的值"
+                # 当用户原值 —— 记成空集, 让还原走"删除"这条路 (用户原本没有 PAC 时
+                # 正确; 他原本有 PAC 时那份原值早在第一次 apply 时就被备份了, 且因
+                # 上面的守卫从未被覆盖过)。
+                try:
+                    if proxy_settings.is_pointing_at(pac.pac_url()):
+                        cur = {"exists": bool(cur.get("exists")), "values": {}}
+                except Exception:
+                    pass
+                backup = cur
             ok2, msg2 = proxy_settings.set_autoconfig_url(pac.pac_url())
             if not ok2:
                 pac.stop()
                 state.update({"backend": None, "fell_back": False, "note": msg2})
                 return False, f"无法写入系统自动配置脚本: {msg2}"
-            _persist_proxy_backup(backup)
-            state["proxy_backup_saved"] = True
+            saved = _persist_proxy_backup(backup)
+            state["proxy_backup_saved"] = saved
+            if not saved:
+                # 备份没落盘 ⇒ 不得宣称"已自动备份": 强杀后就无法还原用户的代理设置了。
+                return True, (f"{msg}; {msg2}; ⚠ **原有代理设置未能落盘备份**"
+                              f"(配置文件写入失败) —— 退出时仍会尝试还原, 但若进程被强杀"
+                              f"则无法恢复, 建议尽快正常退出。")
             return True, (f"{msg}; {msg2}; 已自动备份并还原原有代理设置。"
                           f"用浏览器直接打开即可 (若个别浏览器未生效, 重启该浏览器)。")
 
@@ -398,6 +514,38 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     except Exception:
         pass
 
+    # ⚠ `detail` 必须**先**初始化 (2026-10-02 单测抓到): 下面 try/except 的两条分支都写成
+    #   `f"{detail}; ..." if detail else ...`, 而 detail 只在**这两行**里被赋值 ——
+    #   于是 restore_system_proxy_if_needed() 一旦抛异常, 走 except 分支时 detail 尚未绑定
+    #   ⇒ UnboundLocalError。而这是**启动路径**(孤儿残留清理), 一炸就整段清理中断,
+    #   用户看到的是"上一会话残留没清掉"而不是真正的异常原因。
+    detail = ""
+    proxy_msg = ""
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ★★ 系统代理还原必须**在"无残留"提前 return 之前** (2026-10-03 定因)
+    #
+    # 原实现的顺序是:
+    #     if not (applied_hosts or applied_nrpt): return {"cleaned": False, "detail": "无残留"}
+    #     ...
+    #     restore_system_proxy_if_needed()          # ← 永远到不了
+    #
+    # 而 pac_auto 分支**故意会删掉 hosts 规则** (见本文件上方 "同时清掉 Hosts 规则"),
+    # 所以进程被强杀后的残留**恰好就是** hosts=False、nrpt=False、而系统代理仍指着我们的 PAC
+    # ⇒ 命中的正是那个提前 return。
+    # 而 pyside_app 启动时**唯一**的还原入口就是本函数 ⇒ "上次被强杀 → 按落盘备份还原"
+    # 这条设计在最典型的中止场景下**从未生效过**, 用户的浏览器会一直去取一个已死的本地 PAC。
+    #
+    # 口径: 系统代理是**用户自己的设置**, 它是否被我们污染与"有没有 hosts/nrpt 残留"无关,
+    # 因此这一步必须无条件先跑。
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _p_ok, _p_msg = restore_system_proxy_if_needed()
+        if _p_msg and "无需" not in _p_msg and "不动它" not in _p_msg:
+            proxy_msg = _p_msg
+    except Exception as e:
+        proxy_msg = f"系统代理还原异常: {e}"
+
     applied_hosts = False
     try:
         applied_hosts = bool(hosts.is_applied())
@@ -411,24 +559,10 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
         pass
 
     if not (applied_hosts or applied_nrpt):
-        return {"cleaned": False, "detail": "无残留"}
-
-    # ⚠ `detail` 必须**先**初始化 (2026-10-02 单测抓到): 下面 try/except 的两条分支都写成
-    #   `f"{detail}; ..." if detail else ...`, 而 detail 只在**这两行**里被赋值 ——
-    #   于是 restore_system_proxy_if_needed() 一旦抛异常, 走 except 分支时 detail 尚未绑定
-    #   ⇒ UnboundLocalError。而这是**启动路径**(孤儿残留清理), 一炸就整段清理中断,
-    #   用户看到的是"上一会话残留没清掉"而不是真正的异常原因。
-    detail = ""
-
-    # ★ 启动时也要还原**系统代理**: 上一次进程被强杀时无法执行清理, 而 pac_auto 改的是
-    #   用户的系统代理设置 —— 若不在启动时还原, 用户的浏览器会把所有流量送进一个
-    #   可能已不存在的本地代理, 等于全网上不了。落盘备份使这一步可恢复。
-    try:
-        _p_ok, _p_msg = restore_system_proxy_if_needed()
-        if _p_msg and "无需" not in _p_msg and "不动它" not in _p_msg:
-            detail = f"{detail}; {_p_msg}" if detail else _p_msg
-    except Exception as e:
-        detail = f"{detail}; 系统代理还原异常: {e}" if detail else f"系统代理还原异常: {e}"
+        # ⚠ 无残留时 `detail` 必须保持逐字 "无残留" (tests/test_nrpt_manager.py 断言依赖它),
+        #   所以系统代理的还原文案走**独立字段** proxy_detail, 不并进 detail。
+        return {"cleaned": False, "detail": "无残留", "proxy_detail": proxy_msg,
+                "proxy_ok": _p_ok}
 
     ok = fast_remove_redirect(cfg, hosts, nrpt, dns)
     parts = []
@@ -438,12 +572,18 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
         parts.append("NRPT")
     detail = (f"已清理上一会话遗留的 {'/'.join(parts)} 重定向残留"
               if ok else f"{'/'.join(parts)} 残留清理未完全成功 (删除 NRPT 规则需管理员权限)")
+    # ★ 系统代理还原的结果**不得**被上面的赋值吞掉 (2026-10-03 定因): 原实现里
+    #   `detail` 在这两行被**无条件覆盖**, 于是"系统代理还原失败"的文案被丢弃,
+    #   随后 `ok=True` 还会清掉 last_cleanup_warning —— 用户永远不会知道
+    #   他的系统代理没被还原回来。
+    if proxy_msg:
+        detail = f"{detail}; {proxy_msg}"
 
     # 结果落盘: 下次启动要在界面上明确告知用户, 而不是让他自己去猜为什么上不了网
     try:
         from config_store import load_config as _load, save_config as _save
         _cfg = _load()
-        if ok:
+        if ok and not proxy_msg:
             _cfg.pop("last_cleanup_warning", None)
         else:
             import time as _time
@@ -453,6 +593,7 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
         pass
 
     return {"cleaned": True, "ok": ok, "detail": detail,
+            "proxy_detail": proxy_msg, "proxy_ok": _p_ok,
             "had_hosts": applied_hosts, "had_nrpt": applied_nrpt}
 
 

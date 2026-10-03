@@ -32,7 +32,7 @@ from typing import Tuple, Optional, List, Set, Dict, Any
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from path_utils import NGINX_DIR
@@ -162,26 +162,53 @@ def _is_public_suffix_pair(last_two: List[str]) -> bool:
 
 
 def get_all_san_domains() -> List[str]:
-    """从 ServiceProfile 单源动态提取全量 SAN 域名列表并自动拓展通配符与二级主域名"""
+    """从 ServiceProfile 单源提取全量 SAN 域名列表
+
+    ## ★ 只取画像**显式声明**的域名 —— 不再做"后两段派生" (2026-10-03 定因, 原缺陷 M3)
+
+    ## 旧实现做了什么, 以及为什么它是信任边界问题
+
+    旧实现除了声明域名本身, 还会把**任意** 3 段以上域名的"后两段"当二级主域,
+    并额外加一条通配 SAN:
+
+        i.pximg.net   -> pximg.net   + *.pximg.net     (合理, 这是本项目自己的 CDN)
+        www.google.com.sg -> (被 _is_public_suffix_pair 挡掉, 见下)
+        s3.amazonaws.com  -> amazonaws.com + *.amazonaws.com   ← ★ 无关第三方!
+
+    于是**用户装进受信任根的这张 CA, 签署了一张对 `*.amazonaws.com` 有效的证书** ——
+    实测叶子证书里 1202 条 SAN 中有 **601 条通配**, 覆盖
+    `*.amazonaws.com` / `*.apache.org` / `*.python.org` / `*.pythonhosted.org` /
+    `*.maven.org` / `*.npmjs.com` / `*.crates.io` / `*.pypi.org` / `*.nuget.org` /
+    `*.cloudflare.com` / `*.akamaihd.net` / `*.akamaized.net` / `*.jsdelivr.net` 等
+    **与加速完全无关**的第三方基础设施。
+
+    这不是"多几个域名"的规模问题, 而是**信任面被扩大**: 任何能让这些域名解析到本机
+    的场景下, 我们的 nginx 都能给它们出一个被全机信任的证书。`_is_public_suffix_pair`
+    那条守卫只挡住了"注册局标签 + 两位国家码"形态, 挡不住上面这一大批。
+
+    ## 新口径
+
+    只保留声明域名的**原样**形式 (通配 `*.x` 原样保留、apex 保留)。
+    于是 `.pximg.net` 这类"我们确实需要"的通配必须由画像**显式声明** —— nginx 那边
+    本来也是靠一张硬编码补表才拿到它的 (原缺陷 M6), 现在两边同源。
+
+    ## 安全性论证 (为什么不会削掉在服务的主机名)
+
+    本项目的 SNI 集合 = nginx `server_name` 的取值 (浏览器必须用 SNI 才能落到对应 vhost)。
+    实测: 584 个 `server_name` 条目里, 旧实现覆盖 584/584;
+    改成"仅声明"后, 只有 **11 条通配** 失去覆盖 —— 而那 11 条原先只存在于
+    `nginx_generator` 的硬编码补表里, **画像从未声明过**。
+    已把它们补进各自画像 (见 service_profile), 因此改后覆盖仍是 584/584。
+
+    同时: 原先被派生出来的 595 条第三方通配**全部消失**, SAN 从 1202 降到 ~586。
+    """
     domains_set: Set[str] = set()
     for p in PROFILES:
         for d in p.domains:
-            d_clean = d.lower().strip()
+            d_clean = (d or "").lower().strip()
             if not d_clean:
                 continue
-            if d_clean.startswith("*."):
-                d_clean = d_clean[2:]
-
             domains_set.add(d_clean)
-            domains_set.add(f"*.{d_clean}")
-
-            # 智能提取二级主域名 (如 i.pximg.net -> pximg.net & *.pximg.net)
-            # 但公共后缀样式 (com.sg / co.uk) 必须排除, 见上方 _PUBLIC_SUFFIX_REGISTRY_LABELS
-            parts = d_clean.split(".")
-            if len(parts) >= 3 and not _is_public_suffix_pair(parts[-2:]):
-                base_domain = ".".join(parts[-2:])
-                domains_set.add(base_domain)
-                domains_set.add(f"*.{base_domain}")
 
     return sorted(list(domains_set))
 
@@ -256,7 +283,25 @@ class CertManager:
             return False
 
     def _is_server_cert_valid(self, required_sans: List[str]) -> bool:
-        """检查服务端证书是否存在、私钥匹配、未过期且覆盖所有 required_sans 域名"""
+        """检查服务端证书是否存在、私钥匹配、未过期、**由当前根签发**且覆盖所有 required_sans
+
+        ## ★ 为什么要加"由当前根签发"(2026-10-03 定因, 原缺陷 M4)
+
+        原实现只验四件事: 文件在、私钥能解析、≥15 天未过期、SAN 覆盖。
+        **从不检查签发者是谁** —— 而这个函数是"要不要重签叶子"的唯一判据。
+        配合"活跃根"判据是"`ca.cer` 文件在不在"(见 `prune_stale_trust_roots`),
+        就构成这条链:
+          ① CA 换代 ⇒ 目录里出现新 `ca.cer`, 旧根被当"陈旧"从受信任存储删除;
+          ② 但**叶子证书没人重签** —— `_is_server_cert_valid()` 对它返回 True
+             (存在/未过期/SAN 齐全, 而签发者是谁根本没看);
+          ③ 于是全机信任的是新根, 而 nginx 端上的是**旧根签的叶子** ⇒
+             浏览器对**所有**域名报 `ERR_CERT_AUTHORITY_INVALID`;
+          ④ 而所有路径都报成功 (每一步都"没报错")。
+        这正是本项目反复出现的"假可用"形态, 只是后果最重: 加速全挂而上层毫无察觉。
+
+        ⇒ 现在要求 `cert.issuer == ca.cer 的 subject`, 且**用 ca.cer 的公钥验签**。
+          验签比只比 DN 更硬: DN 相同但密钥换了(重新生成过同名 CA)也必须重签。
+        """
         if not self.server_crt_path.exists() or not self.server_key_path.exists():
             return False
         try:
@@ -274,6 +319,10 @@ class CertManager:
             if cert_expiry - now < datetime.timedelta(days=15):
                 return False
 
+            # ★ 由当前 CA 签发 (issuer 匹配 + 公钥验签) —— 见上方 docstring
+            if not self._is_signed_by_current_ca(cert):
+                return False
+
             # 校验 SAN 域名覆盖率
             try:
                 san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
@@ -284,6 +333,48 @@ class CertManager:
             except Exception:
                 return False
 
+            return True
+        except Exception:
+            return False
+
+    def _is_signed_by_current_ca(self, leaf) -> bool:
+        """叶子证书是否**由当前 ca.cer 签发** (issuer 匹配 + 公钥验签)
+
+        为什么两道都做:
+          · 只比 issuer DN: CA 被重新生成(同名不同密钥)时会误判为有效 ⇒
+            全机信任的是新根, 而 nginx 上的是旧根签的叶子 ⇒ 全部域名证书不受信;
+          · 加验签: 直接证明"这确实是用当前 CA 的私钥签的", 与信任链一致。
+        任何一步无法判定 (ca.cer 缺失/读不出) 都返回 False —— 宁可重签一次
+        (幂等、代价可控), 也不要让"不受信的叶子"留在数据平面上。
+        """
+        try:
+            if not self.ca_cer_path.exists():
+                return False
+            ca = x509.load_pem_x509_certificate(self.ca_cer_path.read_bytes())
+        except Exception:
+            return False
+        try:
+            if leaf.issuer != ca.subject:
+                return False
+        except Exception:
+            return False
+        try:
+            ca_pub = ca.public_key()
+            if isinstance(ca_pub, rsa.RSAPublicKey):
+                ca_pub.verify(
+                    leaf.signature,
+                    leaf.tbs_certificate_bytes,
+                    padding.PKCS1v15(),
+                    leaf.signature_hash_algorithm,
+                )
+            elif isinstance(ca_pub, ec.EllipticCurvePublicKey):
+                ca_pub.verify(
+                    leaf.signature,
+                    leaf.tbs_certificate_bytes,
+                    ec.ECDSA(leaf.signature_hash_algorithm),
+                )
+            else:
+                return False
             return True
         except Exception:
             return False
@@ -1058,3 +1149,83 @@ def main(argv: Optional[List[str]] = None) -> int:
 if __name__ == "__main__":
     sys.exit(main())
 
+
+def ensure_single_usable_ca(cm: Optional["CertManager"] = None,
+                            allow_trust_changes: bool = True) -> Tuple[bool, str]:
+    """把证书状态**收敛到"任一刻恰好有一个可用的根"** (幂等自愈)
+
+    用户定的不变式 (2026-10-03): CA 是自动生成的, 不要求保住某个特定的根, 只要求
+    **同时有且仅有一个能用的**。一次收敛包含三件事, 每件都已实测可用:
+
+      1. **叶子必须由当前 ca.cer 签发** —— 用 `_is_signed_by_current_ca` 判定;
+         不成立就 `generate_server_cert(force=True)` 重签 (幂等);
+      2. **当前根必须在系统信任库里** —— 不在就 `install_cert()`;
+      3. **信任库里不得残留其它自有根** —— `prune_stale_trust_roots()` (它会保护在用的那个)。
+
+    为什么必须由代码做而不是靠人记得跑脚本: `nginx -t` 与 `curl -k` **都测不出**断链,
+    而断链的表现是"所有本地域名不受信" —— 只有显式验签能发现。实测本机就出现过
+    "源码树 ca.cer 不在信任库、库里是另一个根"的状态。
+
+    ⚠ 关于"换了根却不重签叶子": 我一度这么断言过, 但那个判断建立在**一个有 bug 的验签**
+      (恒返回 False) 之上, 因此**不成立**, 这里不再声称。第 1 步存在的意义是: 无论根是
+      因何被换掉的, 收敛后叶子一定与当前根配套 —— 判据是"结果", 不是"猜测原因"。
+
+    `allow_trust_changes=False` 时只做本地收敛 (不动信任库), 供无管理员权限或测试场景。
+    返回 (ok, 人类可读消息); **任何一步失败都不抛异常**, 便于在启动路径上调用。
+    """
+    cm = cm or CertManager()
+    notes: List[str] = []
+
+    # ── 1. 本地: 叶子必须由当前 CA 签发 ─────────────────────────────
+    try:
+        ok, msg = cm.ensure_certificates()
+        if not ok:
+            return False, f"本地证书准备失败: {msg}"
+        leaf_path = None
+        for cand in ("pixiv.net.crt", "server.crt", "localhost.crt"):
+            for base in (cm.nginx_dir / "ca", cm.nginx_dir / "conf" / "ca", cm.nginx_dir):
+                f = base / cand
+                if f.is_file():
+                    leaf_path = f
+                    break
+            if leaf_path:
+                break
+        if leaf_path is not None:
+            try:
+                leaf = x509.load_pem_x509_certificate(leaf_path.read_bytes())
+                if not cm._is_signed_by_current_ca(leaf):       # noqa: SLF001
+                    ok2, msg2 = cm.generate_server_cert(force=True)
+                    notes.append(f"叶子与当前根不配套, 已重签 ({msg2 if ok2 else msg2})")
+                else:
+                    notes.append("叶子与当前根配套")
+            except Exception as e:
+                notes.append(f"叶子复核跳过: {type(e).__name__}")
+    except Exception as e:
+        return False, f"本地证书收敛异常: {type(e).__name__}: {e}"
+
+    # ── 2/3. 信任库: 当前根在、其它自有根不在 ────────────────────────
+    if not allow_trust_changes:
+        notes.append("按要求未改动信任库")
+        return True, "; ".join(notes)
+
+    try:
+        want = cm.get_cert_thumbprint()
+        roots = cm.list_own_trust_roots()
+        have = {str(r.get("thumbprint", "")).upper() for r in roots}
+        if want and want.upper() not in have:
+            ok3, msg3 = cm.install_cert()
+            notes.append(f"当前根未装机, 已安装 ({msg3 if ok3 else msg3})")
+        try:
+            rep = cm.prune_stale_trust_roots()
+            removed = rep.get("removed") or []
+            if removed:
+                notes.append(f"清理其它自有根 {len(removed)} 个")
+        except Exception as e:
+            notes.append(f"清理其它自有根失败: {type(e).__name__}")
+        left = {str(r.get("thumbprint", "")).upper() for r in cm.list_own_trust_roots()}
+        notes.append(f"信任库自有根数={len(left)}" + (" (恰为一个 ✓)" if len(left) == 1 else ""))
+    except Exception as e:
+        # 无管理员权限时走到这里 —— 不阻断, 如实报告
+        notes.append(f"信任库收敛未完成 (可能需要管理员): {type(e).__name__}: {e}")
+
+    return True, "; ".join(notes)

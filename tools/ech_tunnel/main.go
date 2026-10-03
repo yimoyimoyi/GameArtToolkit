@@ -265,12 +265,43 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// parseHostPools 解析 `-host-ip-pool` 的 `host=ip1,ip2;host2=ip3` 形式。
+//
+// 为什么需要"每主机"的池 (2026-10-03 实测): 全局池是各画像候选的并集, 里面混着**别的
+// zone** 的边缘。对权威解析不是 Cloudflare 的主机 (n2.pawchive.pw 的 DoH 答案落在
+// DDoS-Guard), 过滤后只能回退全局池 —— 实测会把 1.8MB 的原图打成**截断**(439KB/903KB)
+// 甚至 **502**, 而换成该 zone 自己的边缘 6/6 完整。故池必须与目标匹配。
+func parseHostPools(s string) map[string][]string {
+	out := map[string][]string{}
+	for _, part := range strings.Split(s, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			log.Printf("[warn] -host-ip-pool 条目格式应为 host=ip1,ip2, 已忽略: %q", part)
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(kv[0]))
+		ips := splitCSV(kv[1])
+		if host == "" || len(ips) == 0 {
+			continue
+		}
+		out[host] = ips
+	}
+	return out
+}
+
 func main() {
 	listen := flag.String("listen", "127.0.0.1:44311", "监听地址")
 	domains := flag.String("domains", "", "允许的域名后缀, 逗号分隔 (留空=不限制)")
 	doh := flag.String("doh", "https://223.5.5.5/resolve,https://dns.alidns.com/resolve",
 		"DoH 端点, 逗号分隔, 按序容灾")
-	pool := flag.String("ip-pool", "", "静态 IP 池兜底, 逗号分隔 (DoH 不可用或结果被投毒时使用)")
+	pool := flag.String("ip-pool", "", "全局静态 IP 池兜底, 逗号分隔 (DoH 不可用或结果被投毒时使用)")
+	hostPool := flag.String("host-ip-pool", "",
+		"每主机专属 IP 池: host=ip1,ip2;host2=ip3 (host 可为注册域, 自动覆盖其子域)。"+
+			"用于\"权威解析不是 Cloudflare\"的主机 —— 它们只能靠专属池拿到本 zone 的真实边缘")
 	echRefresh := flag.Duration("ech-refresh", 30*time.Minute, "ECHConfig 刷新周期")
 	dnsTTL := flag.Duration("dns-ttl", 10*time.Minute, "DoH 解析结果缓存时长")
 	allowNonCF := flag.Bool("allow-non-cf", false,
@@ -287,7 +318,8 @@ func main() {
 	ech := NewECHConfigManager(dohURLs, *echRefresh)
 	ech.Start(ctx)
 
-	resolver := NewResolver(dohURLs, splitCSV(*pool), *dnsTTL, !*allowNonCF)
+	resolver := NewResolver(dohURLs, splitCSV(*pool), parseHostPools(*hostPool),
+		*dnsTTL, !*allowNonCF)
 	tunnel := NewTunnel(ech, resolver, splitCSV(*domains))
 
 	srv := &http.Server{

@@ -121,10 +121,39 @@ class ServiceProfile:
     probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
     probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
     cdn_vendor: str = ""                      # 上游 CDN 厂商 (fastly/akamai/cloudflare/cloudfront), 决定伪 SNI 是否可行
+    # 探测阶段的**证书域族硬门槛** (空 = 不检查)。2026-10-03 新增。
+    #
+    # 为什么需要它 (这是 `cdn_vendor` 覆盖不到的一类): "源站忽略 SNI、按 Host 路由"
+    # 的站点 (如 play.dlsite.com / chan.sankakucomplex.com) 用无害 SNI 就能握手成功,
+    # 且**证书仍是目标域自己的** —— 这类站点没有 CDN 厂商证书族可查
+    # (VENDOR_CERT_SUFFIXES 只登记了 google), 于是 `cdn_vendor=""` 的画像**完全没有证书门槛**,
+    # 而候选池探测只能看到状态码 ⇒ 别家 vhost / 链路侧劫持页的 2xx 会被当成"可用"收进池
+    # (实测假可用形态: 证书 CN=fallback.wgcz.net / flirtify.com, 见
+    #  docs/service-expansion-feasibility-2026-10-03.md §7.1)。
+    #
+    # 语义: 对端证书的 SAN 必须落在这些**域族**内 (判据 = cover_sni.cert_matches_family,
+    # 域族 = SAN 末两段标签)。于是:
+    #   · "L7 + 空 SNI" 通道 (证书应仍是目标域的): cert_families=("ehgt.org",)
+    #   · "源站忽略 SNI" 通道 (证书 CN=play.dlsite.com): cert_families=("dlsite.com",)
+    # 与 `cdn_vendor` 的分工: 厂商证书族用于**共享 CDN 按 IP 选证书**的场景, 域族门槛用于
+    # **证书必须属于目标自己**的场景; 两者可同时声明, 任一不过即硬淘汰该候选。
+    cert_families: Tuple[str, ...] = ()
     skip_cdn_probe: bool = False              # 跳过 TCP/TLS 测速 (QUIC_DIRECT 服务 TCP 侧本就被 RST, 探测只会得到假阴性)
     requires_dns_backend: bool = False         # 必须由本机 DNS 下发解析结果才能生效 (QUIC 直连类)
                                                # —— 默认的 Hosts 模式无法传递 HTTPS RR, 这类服务在
                                                # Hosts 模式下"启用了也不可用", 因此不纳入默认启用
+    # ★ 2026-10-03 (原缺陷 M13): 原先只有一个 `requires_dns_backend` 字段, 而它身上压着
+    #   **两种完全不同的语义**, 于是每个消费方各自推导, 得出不同结论:
+    #     · QUIC 直连类: 需要 DNS 下发 **HTTPS RR (alpn=h3)** —— Hosts 传不了这种记录类型;
+    #     · googlevideo: 节点名是 `rr1---sn-xxxx.googlevideo.com` 这种**海量动态子域**,
+    #       必须靠**后缀通配**覆盖 —— 与 HTTPS RR 毫无关系。
+    #   旧代码把后者写成 `requires_dns_backend=True`, 而 `needs_wildcard_resolution()`
+    #   又用 `requires_dns_backend and any(d.startswith("*."))` 二次推导 ——
+    #   那个合取式正好把 S1 的缺陷藏住了 (通配被 NRPT 丢空时, 这个推导仍然说"需要通配")。
+    #   现在拆成两个明确字段, 每个消费方读它真正需要的那个。
+    needs_wildcard_resolution: bool = False     # 该画像依赖**后缀通配**覆盖动态子域 (与 HTTPS RR 无关)
+    experimental_default_off: bool = False      # 标记为实验/通道性服务 ⇒ 不纳入默认启用
+                                                # (原先借 `requires_dns_backend` 兼职这件事)
     proxy_connect_by_domain: bool = False     # 代理通道探测时 CONNECT 域名而非候选 IP (适配 Clash 按 IP 段 DIRECT 规则直连、CDN geo 限制中国 IP 的场景)
     ech_enabled: bool = False                 # 经本地 ECH 隧道直连 (要求目标托管在 Cloudflare; 见 docs/ech-tunnel-proposal.md)
     h3_upstream: bool = False                 # 上游腿改走本地 HTTP/3 代理 (app/h3_upstream.py):
@@ -141,6 +170,14 @@ class ServiceProfile:
     # nginx 的 max_fails 熔断只对连接失败/超时生效, 对"成功返回 404"完全无感。
     # 故仅对已确认存在此类节点的服务开启 (minecraft / xbox, 详见各自 candidate_ips 注释)。
     retry_on_404: bool = False
+    # 掩护 SNI 运行时通道 (app/cover_sni.py 的 CHANNELS 键)。
+    # 为什么要**显式**声明, 而不是让 cover_sni 凭 cdn_vendor 猜: 同一个 cdn_vendor 下既有
+    # "必须走掩护 SNI"的画像 (reddit/imgur), 也有"只钉真实 IP、浏览器用自身 SNI"的画像
+    # (reddit_static) 与"掩护域是别人家"的画像 (github_raw 的 objects.githubusercontent.com)。
+    # 凭 vendor 猜会把它们卷进同一条通道 —— 它们的探测 SNI 会被改写成掩护域, 且一旦该 vendor
+    # 登记了证书族, cdn_optimizer 的证书硬门槛会淘汰它们整池 ("测速总失败"同类事故)。
+    # 留空 = 完全不参与运行时回归, 行为与改造前一致。
+    cover_sni_channel: str = ""
 
     def get_effective_sni(self, domain: str = "") -> Optional[str]:
         """获取实际用于 TLS 握手的 SNI 域名"""
@@ -173,7 +210,46 @@ SERVICE_GROUPS = {
         "name": "开发者与 AI",
         "icon": "terminal",
         "desc": "GitHub (Web/Raw/Releases/S3)、HuggingFace、GitLab、PyPI、npm、crates.io"
+    },
+    # --------------------------------------------------------------------------
+    # 受控分组 (gated): **默认不显示、也不可启用**, 由设置页开关显式放开
+    #   (2026-10-03 按用户决策新增; 开关键 = config.json 的 "gated_groups_enabled")
+    #
+    # 为什么把"成人内容"单列一组而不是塞进 acg (产品决策, 见复核报告 §六.1):
+    #   · 与 Pixiv/Fanbox 混进同一张卡片会让该组 11 → 29 个服务, 且两类内容的
+    #     使用场景与默认启用意愿完全不同;
+    #   · 需要一道**默认关闭**的总闸: 关闭时该分组在控制台不出现, 且其中任何服务
+    #     都无法启用 (三层拦截: 界面 → 配置加载清洗 → 默认启用清单, 见 ip_pool.config_store)。
+    #
+    # 本组目前**没有任何画像**(18 个候选画像仍待按批次落地), 因此界面会给出一句
+    # "暂未接入任何服务"的如实说明, 而不是静默显示一张空卡片。
+    # --------------------------------------------------------------------------
+    "adult": {
+        "id": "adult",
+        "name": "成人内容",
+        "icon": "lock",
+        "desc": "E-Hentai / nhentai / DLsite / JavDB 等成人平台（默认隐藏；需在设置中显式开启后才显示并允许启用）",
+        "gated": True,
+        "gate_note": "该分组默认隐藏且不可启用：其中的服务面向成人内容，且部分站点存在身份/合规与账号风险。"
+                     "开启后才在控制台显示并允许启用。",
     }
+}
+
+# 分组 -> 站点配置文件 (单一真源)
+#
+# 为什么把这张表放在这里而不是散在生成器与 cdn_optimizer 各写一份 (2026-10-03 实测事故):
+#   两边原先各自写死 `site-gaming/acg/dev` 三个文件, 于是新增分组 (adult) 时画像是
+#   **静默进不了任何配置**的 —— render_all 只按三个 group 过滤, 结果 adult 画像在
+#   所有 site-*.conf 里都找不到, 浏览器打到 default_server(444), 表现为"加了等于没加",
+#   而且没有任何报错。新增这张表后: 生成器遍历它产出文件、cdn_optimizer 用它做
+#   "upstream 引用是否都有定义"的校验清单, 两处不会再漂移。
+# ⚠ 新增分组必须同时: ① 在这里加一行; ② 在 nginx/conf/nginx.conf 里加 include。
+#   生成器会在 render 时**当场报错**提醒漏了 ①(见 NginxConfGenerator.render_all 的兜底)。
+SITE_FILE_FOR_GROUP = {
+    "gaming": "site-gaming.conf",
+    "acg": "site-acg.conf",
+    "dev": "site-dev.conf",
+    "adult": "site-adult.conf",
 }
 
 
@@ -189,7 +265,8 @@ PROFILES: List[ServiceProfile] = [
         group="gaming",
         name="Steam 商店与结账",
         desc="解决 Steam 商店首页白屏、愿望单与购物车结账卡死",
-        domains=["store.steampowered.com", "checkout.steampowered.com", "help.steampowered.com", "login.steampowered.com"],
+        domains=["store.steampowered.com", "checkout.steampowered.com", "help.steampowered.com", "login.steampowered.com",
+                    "*.steampowered.com"],   # ★ 显式通配 (原缺陷 M3, 同上)
         icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_store",
@@ -202,7 +279,8 @@ PROFILES: List[ServiceProfile] = [
         group="gaming",
         name="Steam 社区与个人资料",
         desc="解决 118 错误代码、玩家动态、讨论区与徽章展示",
-        domains=["steamcommunity.com", "api.steampowered.com"],
+        domains=["steamcommunity.com", "api.steampowered.com",
+                    "*.steamcommunity.com"],   # ★ 显式通配 (原缺陷 M3, 同上)
         icon="gamepad",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_community",
@@ -221,7 +299,8 @@ PROFILES: List[ServiceProfile] = [
         desc="解决好友头像加载失败、创意工坊 Mod 预览图破图",
         domains=["community.akamai.steamstatic.com", "avatars.akamai.steamstatic.com", "clan.akamai.steamstatic.com",
                  "steamcommunity-a.akamaihd.net", "steamuserimages-a.akamaihd.net",  # 创意工坊封面/用户上传图
-                 "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com"],  # 静态资源 CDN
+                 "cdn.akamai.steamstatic.com", "community.cloudflare.steamstatic.com",
+                    "*.steamstatic.com"],  # 静态资源 CDN + ★显式通配 (原缺陷 M3)
         icon="zap",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_steam_akamai",
@@ -255,7 +334,12 @@ PROFILES: List[ServiceProfile] = [
         domains=["battle.net", "www.battle.net", "us.battle.net", "eu.battle.net",
                  "kr.battle.net", "account.battle.net", "shop.battle.net",
                  "blizzard.com", "www.blizzard.com", "us.cdn.blizzard.com",
-                 "level3.blizzard.com", "blznav.akamaized.net"],
+                 "level3.blizzard.com", "blznav.akamaized.net",
+                    # ★ 显式通配 (2026-10-03, 原缺陷 M3): 这两条以前只存在于
+                    #   nginx_generator 的硬编码补表里, 而证书 SAN 靠"后两段派生"
+                    #   恰好也补上了。现在 SAN 只取声明域名 ⇒ 必须在此声明,
+                    #   否则 nginx 会服务 *.battle.net 而证书不覆盖它。
+                    "*.battle.net", "*.blizzard.com"],
         icon="rocket",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_battle_net",
@@ -391,7 +475,10 @@ PROFILES: List[ServiceProfile] = [
         #   接管, 留在本组只会与 pixiv_web 重复声明 server_name。
         # - 移除 imgaz.pixiv.net: 池段实测 RST, 其真实后端 74.86.17.48 亦 TCP 超时。
         # - 新增 booth.pximg.net: BOOTH 商品图, 实测与 pximg 同后端 (210.140.139.x 返回 301)。
-        domains=["i.pximg.net", "s.pximg.net", "booth.pximg.net"],
+        domains=["i.pximg.net", "s.pximg.net", "booth.pximg.net",
+                    # ★ 显式通配 (原缺陷 M3): nginx 一直在显式服务 *.pximg.net,
+                    #   而这条通配原先只由 SAN 的"后两段派生"提供 —— 两边不同源。
+                    "*.pximg.net"],
         icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_img",
@@ -410,7 +497,8 @@ PROFILES: List[ServiceProfile] = [
         group="acg",
         name="Pixiv Fanbox 创作者赞助",
         desc="解决创作者赞助平台、图文帖子与赞助列表加载",
-        domains=["fanbox.cc", "www.fanbox.cc", "api.fanbox.cc", "downloads.fanbox.cc"],
+        domains=["fanbox.cc", "www.fanbox.cc", "api.fanbox.cc", "downloads.fanbox.cc",
+                    "*.fanbox.cc"],   # ★ 显式通配 (原缺陷 M3, 同上)
         icon="star",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_fanbox",
@@ -422,7 +510,8 @@ PROFILES: List[ServiceProfile] = [
         group="acg",
         name="BOOTH 同人商城",
         desc="Pixiv 旗下同人志、3D 模型与独立周边商城",
-        domains=["booth.pm", "www.booth.pm", "api.booth.pm", "assets.booth.pm"],
+        domains=["booth.pm", "www.booth.pm", "api.booth.pm", "assets.booth.pm",
+                    "*.booth.pm"],   # ★ 显式通配 (原缺陷 M3: 原先是 nginx 补表 + SAN 派生各一份)
         icon="shopping_bag",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_booth_pm",
@@ -589,7 +678,10 @@ PROFILES: List[ServiceProfile] = [
         name="GitHub 前端 JS/CSS 静态 CDN",
         desc="解决 GitHub 前端 CSS/JS 静态资源、文档页与 Pages 站点加载",
         domains=["githubassets.com", "github.githubassets.com", "assets-cdn.github.com", "assets.github.dev",
-                 "github.io"],  # GitHub Pages 站点 (user.github.io, DNS 模式按后缀通配路由)
+                 "github.io",
+                    # ★ 显式通配 (原缺陷 M3): GitHub Pages 是**任意用户子域**
+                    #   (*.github.io), 必须显式声明; 原先只靠 nginx 补表 + SAN 派生。
+                    "*.github.io"],  # GitHub Pages 站点 (user.github.io, DNS 模式按后缀通配路由)
         icon="file_text",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_github_assets",
@@ -639,7 +731,8 @@ PROFILES: List[ServiceProfile] = [
         group="dev",
         name="GitLab 国际版",
         desc="解决 GitLab 国际版网页与 Raw 源码直连",
-        domains=["gitlab.com", "assets.gitlab-static.net"],
+        domains=["gitlab.com", "assets.gitlab-static.net",
+                    "*.gitlab.com", "*.gitlab-static.net"],   # ★ 显式通配 (原缺陷 M3, 同 battle_net)
         icon="terminal",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_gitlab",
@@ -1270,9 +1363,14 @@ PROFILES: List[ServiceProfile] = [
         skip_cdn_probe=True,
         # 视频流绝不落盘缓存
         enable_cache=False,
-        # 动态节点名只能靠 NRPT 后缀匹配 (hosts 不支持通配) —— 该标记同时使它
-        # 不进入 DEFAULT_ENABLED_SERVICES (见 ip_pool 的默认启用过滤)
-        requires_dns_backend=True,
+        # ★ M13 拆字段 (2026-10-03): 这里**既不需要 HTTPS RR**, 也与 DNS 后端能力无关 ——
+        #   它真正依赖的是"**后缀通配**能把 rr1---sn-xxxx.googlevideo.com 这类海量动态
+        #   子域导向本机"(hosts 不支持通配)。原先写成 requires_dns_backend=True 属于一词多义,
+        #   还让 needs_wildcard_resolution() 去做二次推导, 正好把 S1 的缺陷藏住了。
+        needs_wildcard_resolution=True,
+        # 通道性/实验性服务: 可用性分钟级时变, 启用前必须先过 gvs_h3_probe 闸门。
+        # 原先借 requires_dns_backend 兼职"不默认启用", 现在用独立字段表达真实理由。
+        experimental_default_off=True,
     ),
     # --------------------------------------------------------------------------
     ServiceProfile(
@@ -1391,10 +1489,15 @@ PROFILES: List[ServiceProfile] = [
         #   packaged-media.redd.it 返回 403 (根路径无权限, 属正常) —— 都是 Fastly **已服务**该域;
         #   而**自身 SNI 一律 502** (被阻断) —— 所以 DIRECT(钉真实 IP + 自身 SNI) 会把图片/视频全部弄坏。
         #   反例: i.redditmedia.com 掩护下返回 421 (Fastly 拒绝跨租户) -> 不得登记。
+        #
+        # ⚠ 2026-10-03 三拆: **图片/样式域**已迁到 `reddit_media` (见下一个画像), 本画像只留
+        #   "网页态 + 视频流"。为什么拆: 图片/样式是**可缓存**的静态资源, 而网页态是账号态
+        #   (观看记录/登录, 一律不缓存)、v.redd.it / packaged-media.redd.it 是**分段视频流**
+        #   (Range 请求, 进磁盘缓存无意义且会把大文件写满盘)。合在一起就只能整块不缓存 ——
+        #   于是"Fastly 边缘抖动时图片必然全破"。拆开后媒体域可用 `proxy_cache_use_stale`
+        #   在边缘失败时继续吐已缓存图片 (与 imgur/pixiv 同款处置)。
         domains=["reddit.com", "www.reddit.com", "old.reddit.com",
-                 "i.redd.it", "v.redd.it", "preview.redd.it", "external-preview.redd.it",
-                 "packaged-media.redd.it", "styles.redditmedia.com",
-                 "b.thumbs.redditmedia.com", "emoji.redditmedia.com"],
+                 "v.redd.it", "packaged-media.redd.it"],
         icon="message",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_reddit",
@@ -1404,7 +1507,54 @@ PROFILES: List[ServiceProfile] = [
         # 因此无需 QUIC/ECH —— 浏览器经本机 nginx (本地 CA 证书) 即可正常加载,
         # 不再依赖"浏览器自行采用 HTTP/3"(该前提已被 netlog 证伪, 见 docs 第十四节)。
         ssl_sni_mode="www.fastly.com",
+        # 运行时掩护 SNI 通道 (app/cover_sni.py 的 CHANNELS["reddit"]):
+        # 实测这条通道是**分钟级时变**的 —— 同一组合 (www.fastly.com @199.232.161.140 +
+        # Host www.reddit.com) 在 40 分钟内实测到 200 / 404 / 502 / 504 / TLS 超时 / RST
+        # 全套状态; 而候选池里的 199.232.113.140 在首个窗口起 40 分钟内始终 RST/502
+        # (末次回归才 2/2 通过) —— 所以候选池不能按"整池全绿"判通过。
+        # 因此这里声明通道, 由启动回归按"候选池顺序 + 四关实测"选出当时可用的那一个,
+        # 全部失效时显式报 UNAVAILABLE (而不是继续写死这个常量假装正常)。
+        cover_sni_channel="reddit",
+        # 探测域必须与掩护通道的判据一致 (通道用 www.reddit.com 做四关):
+        # 原先是空 -> 退化成 domains[0]="reddit.com" (apex), 与通道/图片域都不是同一个 vhost,
+        # 会出现"测速说这个节点好、掩护通道却说它不可用"的口径分裂。
+        probe_domains=("www.reddit.com", "i.redd.it"),
+        probe_ok_statuses=(403, 404),
         candidate_ips=["199.232.161.140", "199.232.113.140"]
+    ),
+    ServiceProfile(
+        id="reddit_media",
+        group="dev",
+        name="Reddit 媒体与样式",
+        desc="Reddit 图片/缩略图/样式域 (Fastly 掩护 SNI + 本地磁盘缓存, 边缘抖动时继续吐已缓存内容)",
+        # 为什么单独成画像 (2026-10-03): 拿掉"唯一零外部依赖"的一环 —— 这条通道是**分钟级
+        # 时变**的 (实测同一组合 40 分钟内 200/404/502/504 全出现过), 而图片/样式是**可缓存**
+        # 的静态资源。合在 reddit 画像里时 enable_cache 只能为 False (那里面还有账号态网页与
+        # 分段视频流), 于是边缘一抖图片就全破。拆开后这里开缓存 + 生成器的
+        # `proxy_cache_use_stale error timeout http_5xx` 会在上游失败时**继续吐旧缓存** ——
+        # 把"外部依赖抖动"降级成"已看过的图照常显示"。
+        # 域集合与 reddit 画像**互不重叠** (v.redd.it / packaged-media.redd.it 是视频流, 留在那边)。
+        domains=["i.redd.it", "preview.redd.it", "external-preview.redd.it",
+                 "styles.redditmedia.com", "b.thumbs.redditmedia.com", "emoji.redditmedia.com"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_reddit_media",
+        cdn_vendor="fastly",
+        ssl_sni_mode="www.fastly.com",
+        # 与 reddit 画像**同一条掩护通道** (同一个掩护域、同一组节点、同一套四关):
+        # 不新开通道 —— 通道的证书族判据 (reddit.com/redd.it/redditmedia.com/redditstatic.com)
+        # 已经覆盖这些域, 而独立通道会让"同一个掩护域是否有效"被重复探测两次。
+        cover_sni_channel="reddit",
+        enable_cache=True,
+        # 媒体域根路径本就 403/404 (无索引页/无权限), 必须放行, 否则全部候选被判"可疑"淘汰
+        probe_ok_statuses=(403, 404),
+        probe_domains=("i.redd.it", "b.thumbs.redditmedia.com"),
+        # ⚠ 与 reddit 画像的节点池**不同**, 依据是三窗口实测 (见 docs/reddit-cover-sni-channel.md §2.5):
+        #   · 加 **146.75.92.193** (imgur 的边缘): 三窗口下 6 个媒体域**全部可用** (404/403) ——
+        #     给媒体多一个独立边缘。它在 reddit 主域画像上会 421 (跨租户), 但 421 只出现在
+        #     `old.reddit.com`, 媒体域 33 次采样里 0 次 421, 所以**只**加到这个画像。
+        #   · 不加 199.232.192.193: 对媒体域逐窗口退化 (styles/thumbs/emoji/packaged 从 404 变 502)。
+        candidate_ips=["199.232.161.140", "199.232.113.140", "146.75.92.193"]
     ),
     ServiceProfile(
         id="reddit_static",
@@ -1492,7 +1642,75 @@ PROFILES: List[ServiceProfile] = [
         # (实测 403×2 + 404×5 全部 suspect=True)。与 reddit_static 的 404 同类。
         probe_ok_statuses=(403, 404),
         probe_domains=("gateway.discord.gg",),
-    )
+    ),
+
+    # ==========================================================================
+    # 成人内容生态 (受控分组 adult: 默认隐藏、默认不可启用, 需在设置页显式放开)
+    #
+    # 2026-10-03 实测 (docs/pawchive-onboarding-2026-10-03.md) —— 本地通道判定:
+    #   · 系统解析**干净** (104.21.95.170 / 172.67.146.57 + CF v6), 但真 SNI 一律 RST;
+    #   · 掩护 SNI 与空 SNI 都被 Cloudflare 拒 (4 候选 × 3 形态 = 12/12 全停 TLS 层)
+    #   ⇒ 既不是"DNS 污染钉 IP"型, 也不是"能直连"型, 本地只剩 **ECH 隧道**一条路。
+    # 为什么拆三个画像: 三台主机的后端行为完全不同 (HTML/API / 静态缩略图 / 大二进制),
+    #   缓存策略与超时诉求相反, 合池必然错配 (与 nhentai/nhentai_img 同一判据)。
+    # ⚠ 隧道白名单由 domains 自动聚合; 受控分组未放开时该分组域名**不进白名单**
+    #   (见 app/pyside_app.py 的 _start_ech_tunnel)。
+    # ==========================================================================
+    ServiceProfile(
+        id="pawchive",
+        group="adult",
+        name="Pawchive 创作档案",
+        desc="Pawchive 创作者投稿档案站 (Kemono 同族; Cloudflare 托管, 经本地 ECH 隧道)",
+        domains=["pawchive.pw", "www.pawchive.pw"],
+        icon="book",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_pawchive",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",       # 仅"隧道不健康"的退化分支取值 (与 pixiv_web/discord 同款)
+        # 实测: / 200 · 15,608B 标题 Pawchive (3/3); /posts 200 · 75,340B 标题 "Posts | Pawchive";
+        #       www 301 → 裸域; /api/v1/* 为 JSON (creators 单请求实测 15.4MB / 3.77s)。
+        # 候选池只放**通用 CF 边缘**: 本域解析值可用, 但同类站点(见下)的解析值不可用,
+        # 统一用 CF 边缘可避免"照抄 DoH 值"这类错配 (隧道内部也只接受 CF 网段答案)。
+        candidate_ips=["104.21.95.170", "172.67.146.57", "104.18.42.239", "172.64.145.17"],
+    ),
+    ServiceProfile(
+        id="pawchive_img",
+        group="adult",
+        name="Pawchive 缩略图 CDN",
+        desc="Pawchive 预览/缩略图主机 (同 zone Cloudflare, 经本地 ECH 隧道, 静态图可缓存)",
+        domains=["img.pawchive.pw"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_pawchive_img",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # 实测 /thumbnail/data/<path> → 200 · 36,712B / 50,690B, Server: cloudflare;
+        # ⚠ 该站的 content-type **不可信** (…png 的头配 RIFF/WEBP 字节), 故不按 MIME 做任何判据。
+        candidate_ips=["104.21.95.170", "172.67.146.57", "104.18.42.239"],
+        enable_cache=True,          # 纯静态图片, 值得本地落盘 (cache 与 buffering off 互斥, 见生成器)
+    ),
+    ServiceProfile(
+        id="pawchive_dl",
+        group="adult",
+        name="Pawchive 原图与附件",
+        desc="Pawchive 原图/压缩包/视频下载主机 (同 zone Cloudflare, 经本地 ECH 隧道)",
+        # 为什么单独成画像: 原图/附件只在 n2 节点上 (同一 path 打 img/主站的 /data 是 404),
+        # 且是 1.8MB 级图片与 zip/mp4 (50 条投稿里 zip 7 / mp4 3 / pdf 2)。
+        # ⚠ 该主机的 DoH 答案是 **DDoS-Guard 挡板** (185.178.208.148, 直连只得 3.2KB 挡板页),
+        #   而经 ECH 隧道打同一主机拿到 1,828,047B 真图 ⇒ 它其实同属该 CF zone。
+        #   故 candidate_ips 仍只放通用 CF 边缘, **绝不可**抄那条 DoH 值。
+        domains=["n2.pawchive.pw"],
+        icon="folder",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_pawchive_dl",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        candidate_ips=["104.21.95.170", "172.67.146.57", "104.18.42.239"],
+        enable_cache=False,         # 大二进制先不落盘: 避免 zip/mp4 挤掉共享缓存区里的图缓存
+    ),
 ]
 
 # 索引字典与导出辅助

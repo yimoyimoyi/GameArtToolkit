@@ -8,8 +8,10 @@ GameArt Toolkit - Nginx 站点配置声明式模板生成器 (Nginx Configuratio
 - 精准映射 WebSocket、Range 206、图片磁盘缓存、Steam 302 重定向与伪装 SNI
 """
 
+import os
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -22,17 +24,67 @@ from service_profile import (
     PROFILES_BY_ID,
     ServiceProfile,
     ServiceMode,
-    SERVICE_GROUPS
+    SERVICE_GROUPS,
+    SITE_FILE_FOR_GROUP,
 )
 
 CONF_DIR = NGINX_DIR / "conf"
 
-# 上游故障切换策略 (与 cdn_optimizer 的 upstream 熔断参数配套)
+# 站点配置文件的标题文案 (只影响注释头; 分组与文件的对应关系在 service_profile 里)
+SITE_GROUP_TITLES = {
+    "gaming": "游戏生态全平台加速规则",
+    "acg": "二次元与创作者生态加速规则",
+    "dev": "开发者与 AI 平台加速规则",
+    "adult": "成人内容加速规则",
+}
+
+# ==============================================================================
+# 上游**快速失败**策略 (2026-10-03) —— 与 cdn_optimizer 的 upstream 熔断参数配套
+# ==============================================================================
 #
-# 为什么是"最多尝试 4 个节点": 上游池按可用性分层后可达 8 个节点, 若不限制尝试次数,
-# 一次请求会在坏节点之间串行等待 (3s 连接超时 × 8 = 24s), 用户感知就是"卡死"。
-# 限 4 次后最坏约 12s; 而坏节点会被 max_fails 迅速熔断, 后续请求直接命中健康节点。
+# 三个参数必须**一起**看, 少任何一个都会让"单请求最坏等待时间"失去上界:
+#   · connect_timeout      单次建连 (+ https 上游的 TLS 握手) 的预算;
+#   · next_upstream_tries  单请求最多换几个节点;
+#   · next_upstream_timeout 换节点的**总预算** —— 这才是真正的上界, 因为前两者相乘
+#                          才是最坏值, 而池子大小是会变的 (4~8 个)。
+#
+# ★ 为什么把 connect 从 3s 压到 1s (换网后实测, 2026-10-03):
+#   健康边缘的建连实测落在 29~350ms (Google 中国系 29~95ms / pixiv CDN 135~187ms /
+#   Cloudflare 150~250ms / Fastly 104~150ms); 而"活着但病态"的是另一档:
+#   1.1s / 1.3s / 2.3s / 3.3s (CloudFront 与个别 Fastly 地址)。
+#   1s 干净地把两档分开: 全部健康节点照收, 病态节点判死并**立刻交棒**给同池里
+#   100ms 级的兄弟节点。这不是"更激进", 而是"别再为一条注定更慢的路径付费"。
+#   实测代价(旧值 3s): pypi 池 4 个里 2 个 TCP 超时 ⇒ 3s × 最多 4 次 = 单请求最坏 12s,
+#   实测 TTFB 1.8~4.8s 且 8s 预算内没下完; 而**直连同一个 URL 只要 0.47s**。
+#
+# ★ 为什么总预算是 4s: `proxy_next_upstream_timeout` 只在"要不要再换一个节点"这个
+#   **决策点**被检查, 不是硬中断。所以 4s 预算 + 1s 单次 ≈ 允许先试掉 2 个死节点,
+#   仍有余额去连第 3 个健康节点 (健康节点建连 <350ms; 一旦连上就转由
+#   proxy_read_timeout 管辖, 不受本预算约束 ⇒ **不会**误伤大文件下载)。
+#   全池皆死时最坏 ≈4s 收尾并如实返回 502, 而不是拖 12s 或(缺 tries 时)无限期。
+#
+# ⚠ 为什么不顺手把 upstream 的 `fail_timeout` 从 5s 调大: 那是**另一笔权衡**
+#   (记忆时长 vs 重新学习的时效), 且 cdn_optimizer 里的 5s 有实测依据
+#   (见 UPSTREAM_FAIL_TIMEOUT 注释: GFW 逐段分钟级轮换)。本函数不碰它。
+UPSTREAM_CONNECT_TIMEOUT = "1s"
 UPSTREAM_NEXT_TRIES = 4
+UPSTREAM_NEXT_TIMEOUT = "4s"
+
+
+def upstream_failover_lines(indent: str = "        ") -> List[str]:
+    """渲染"上游快速失败"三件套 —— **所有 location 模板都必须用它**
+
+    为什么抽成函数而不是散在各模板里: 本文件原有 6 处 location 模板各自手写这些参数,
+    实测生成的 `site-acg.conf` 里因此出现三种口径 —— 5 个 location **完全没有**
+    tries 限制 (继承默认 = 不限次数)、1 个写着 `proxy_next_upstream_timeout 60`
+    (无单位, 60 秒, 形同虚设)、其余没有 connect 超时 (只继承全局 5s)。
+    同一份配置里三种口径, 正是"最坏等待时间无界"的直接来源。
+    """
+    return [
+        f"{indent}proxy_connect_timeout {UPSTREAM_CONNECT_TIMEOUT};",
+        f"{indent}proxy_next_upstream_tries {UPSTREAM_NEXT_TRIES};",
+        f"{indent}proxy_next_upstream_timeout {UPSTREAM_NEXT_TIMEOUT};",
+    ]
 
 # 不经 Nginx 的模式: Direct (Hosts/DNS 直指真实 CDN IP) 与 QUIC 直连 (浏览器自行走
 # HTTP/3) 都由解析层直接引导, 本地 Nginx 既不该也无法承载它们 —— 若仍渲染 server 块,
@@ -178,39 +230,27 @@ class NginxConfGenerator:
     def render_server_block(cls, profile: ServiceProfile,
                            ech_services: Optional[Set[str]] = None,
                            h3_services: Optional[Set[str]] = None) -> str:
-        """为单个 ServiceProfile 渲染标准 Nginx Server 块"""
+        """为单个 ServiceProfile 渲染标准 Nginx Server 块
+
+        ## ★ 通配来源 (2026-10-03 定案, 原缺陷 M6)
+
+        以前这里有一张**按 `profile.id` 硬编码**的通配补表
+        (steam_* / booth_pm / pixiv_fanbox / github_assets / gitlab / dlsite /
+         battle_net / patreon)。它与其它三个后端各算一套:
+
+          · nginx   —— 这张硬编码表
+          · PAC     —— `pac_redirect.split_domains()`, 只认画像里显式写的 `*.`
+          · NRPT    —— `nrpt_manager.build_namespace_entries()`, 按正则判
+          · Hosts   —— 完全不支持通配
+
+        于是**同一个画像在四个后端覆盖面不同, 且没有任何提示** —— 根因二。
+        M3 已把证书 SAN 统一到"只取声明域名", 并且把那 9 条只存在于本表的通配
+        **显式声明进了各自画像**。因此本表现在是纯冗余: 直接消费 `profile.domains`
+        即可, 四个后端从此同源。
+        """
         domains_list = list(profile.domains)
 
-        # 自动补全常见的通配子域并保序去重
-        if profile.id == "steam_store" and "*.steampowered.com" not in domains_list:
-            domains_list.append("*.steampowered.com")
-        elif profile.id == "steam_community" and "*.steamcommunity.com" not in domains_list:
-            domains_list.append("*.steamcommunity.com")
-        elif profile.id == "steam_akamai" and "*.steamstatic.com" not in domains_list:
-            domains_list.append("*.steamstatic.com")
-        elif profile.id == "booth_pm" and "*.booth.pm" not in domains_list:
-            domains_list.append("*.booth.pm")
-        elif profile.id == "pixiv_fanbox" and "*.fanbox.cc" not in domains_list:
-            domains_list.append("*.fanbox.cc")
-        elif profile.id == "github_assets" and "*.github.io" not in domains_list:
-            domains_list.append("*.github.io")  # GitHub Pages 任意用户站点 (本地 DNS 后缀通配路由)
-        elif profile.id == "gitlab" and "*.gitlab.com" not in domains_list:
-            domains_list.extend(["*.gitlab.com", "*.gitlab-static.net"])
-        elif profile.id == "dlsite" and "*.dlsite.com" not in domains_list:
-            domains_list.append("*.dlsite.com")
-        elif profile.id == "battle_net":
-            for _wd in ("*.battle.net", "*.blizzard.com"):
-                if _wd not in domains_list:
-                    domains_list.append(_wd)
-        elif profile.id == "patreon":
-            for _wd in ("*.patreon.com", "*.patreonusercontent.com"):
-                if _wd not in domains_list:
-                    domains_list.append(_wd)
-        # 注: googlevideo 曾在此补 `*.googlevideo.com` (动态节点名)。该服务已于 2026-10-01
-        # 按"不通不加入"原则撤下登记 (签名 URL 绑定出口 IP, 本设计无法播放), 见
-        # service_profile 里的长注释与 docs/googlevideo-quic-channel.md。
-
-        # 保序去重
+        # 保序去重 (通配已在画像里显式声明 —— 见本函数 docstring 的 M6 说明)
         domains_list = list(dict.fromkeys(domains_list))
         domains_str = " ".join(domains_list)
 
@@ -381,14 +421,10 @@ class NginxConfGenerator:
                 "        proxy_set_header If-Range $http_if_range;",
                 "        proxy_read_timeout 3600s;",
                 "        proxy_send_timeout 3600s;",
-                # 连接超时 3s (nginx.conf 全局为 5s, 开发组更激进)。
-                # 原为 15s: 开发组 upstream 里混有失活节点, 配合 proxy_next_upstream
-                # 逐个试错, 单个请求最坏要等 15s × 节点数 —— 这是"经代理反而更卡"的
-                # 直接来源。实测 GitHub 存在整段间歇性中断(日志中三个主力同时
-                # "while connecting" 超时, 而间隔数秒的独立探测又全部可达), 3s 既能
-                # 覆盖最慢的正常建连(实测峰值 1.1s), 又能在整段不可用时尽快交棒给
-                # 下一个节点; 持续失败的节点由 max_fails=3/fail_timeout=30s 熔断。
-                "        proxy_connect_timeout 3s;",
+                # 连接超时不再在这里写死 —— 见文件头的"上游快速失败策略"。
+                # 原注释曾写"持续失败的节点由 max_fails=3/fail_timeout=30s 熔断",
+                # 那句话**与代码不符** (cdn_optimizer 早已改成 max_fails=1/fail_timeout=5s),
+                # 属于典型的"注释描述了一个不存在的实现", 已随本次收口删除。
             ])
         else:
             lines.extend([
@@ -405,17 +441,18 @@ class NginxConfGenerator:
         # (即已确认 upstream 内混有"错误 vhost"节点) 时才附带 —— nginx 的 max_fails
         # 熔断只对连接失败/超时生效, 对"成功返回 404"完全无感, 不重试就等于把错误
         # vhost 的 404 原样透传给用户 (minecraft "频繁 Page not found" 的直接成因)。
-        retry_codes = (
+        retry_codes = _strip_retry_403(
             "http_403 http_429 http_404 http_500 http_502 http_503 http_504"
             if getattr(profile, "retry_on_404", False)
             else "http_403 http_429 http_500 http_502 http_503 http_504"
         )
         lines.extend([
             f"        proxy_next_upstream error timeout {retry_codes} non_idempotent;",
-            # 限制单请求的上游尝试次数: 上游池可达 8 节点, 配合 3s 连接超时若不加限制,
-            # 一次请求最坏会在坏节点间串行等待 8×3=24s (用户感知即"卡死")。限 4 次后
-            # 最坏约 12s, 且持续失败的节点会被 max_fails 迅速熔断, 后续请求直达健康节点。
-            f"        proxy_next_upstream_tries {UPSTREAM_NEXT_TRIES};",
+        ])
+        # 三件套 (connect / tries / 总预算) 统一由 upstream_failover_lines 产出 ——
+        # 不再在这里手写, 否则又会和别的模板漂移 (原先就是那样)。
+        lines.extend(upstream_failover_lines("        "))
+        lines.extend([
             "    }",
             "}\n"
         ])
@@ -432,6 +469,10 @@ class NginxConfGenerator:
         """
         main_domains = [d for d in profile.domains if d != "lc-event.pixiv.net"]
         domains_str = " ".join(main_domains)
+        # ★ 摘掉 http_403 (见 _strip_retry_403): 403 是重试改变不了的结果,
+        #   而 nginx 侧带 non_idempotent ⇒ 留在列表里会让同一个 POST 被重放。
+        retry_codes = _strip_retry_403(
+            "http_403 http_429 http_404 http_500 http_502 http_503 http_504")
 
         ech = cls._use_ech(profile, ech_services)
         scheme = "http" if ech else "https"
@@ -445,6 +486,10 @@ class NginxConfGenerator:
         proxy_ssl_verify off;
         proxy_ssl_session_reuse on;
 """
+        # 快速失败三件套 (connect / tries / 总预算) —— 本模板的 4 个 location 原先
+        # **一个都没写**, 于是全部继承 nginx.conf 的全局值: connect 5s 且 **tries 不限**,
+        # 池里 5 个候选全死时要串行等 5×5=25s。见文件头"上游快速失败策略"。
+        failover = "\n".join(upstream_failover_lines("        "))
 
         return f"""{banner}
 server {{
@@ -464,7 +509,8 @@ server {{
         proxy_set_header User-Agent $http_user_agent;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-{ssl_opts}        proxy_next_upstream error timeout http_403 http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{ssl_opts}        proxy_next_upstream error timeout {retry_codes} non_idempotent;
+{failover}
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}
@@ -479,9 +525,9 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-{ssl_opts}        proxy_hide_header Access-Control-Allow-Origin;
-        add_header Access-Control-Allow-Origin $http_origin always;
-        proxy_next_upstream error timeout http_403 http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{ssl_opts}{_CORS_ADD_HEADERS}
+        proxy_next_upstream error timeout {retry_codes} non_idempotent;
+{failover}
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}
@@ -496,8 +542,8 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-{ssl_opts}        proxy_hide_header Access-Control-Allow-Origin;
-        add_header Access-Control-Allow-Origin $http_origin always;
+{ssl_opts}{_CORS_ADD_HEADERS}
+{failover}
         proxy_read_timeout 7200s;
         proxy_send_timeout 7200s;
     }}
@@ -519,13 +565,13 @@ server {{
         proxy_set_header User-Agent $http_user_agent;
         proxy_max_temp_file_size 0;
         proxy_buffering off;
-{ssl_opts}        proxy_next_upstream error timeout http_403 http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{ssl_opts}        proxy_next_upstream error timeout {retry_codes} non_idempotent;
+{failover}
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}
 }}
 """
-
     @classmethod
     def _render_pixiv_img_server(cls, profile: ServiceProfile) -> str:
         """渲染 Pixiv pximg 插画 CDN 专用规则 (带磁盘缓存与 Range 续传)
@@ -536,6 +582,23 @@ server {{
         """
         names = list(dict.fromkeys(["*.pximg.net"] + list(profile.domains)))
         domains_str = " ".join(names)
+        # ★ M17: 必须**尊重声明式字段 enable_cache**, 不能无条件写 proxy_cache
+        #   (通用渲染器是会查的: 见 render_server_block 里的 `if profile.enable_cache:`)。
+        #   原实现对这个特例渲染器硬写缓存指令 —— 于是"画像说不要缓存, 生成物却缓存"。
+        #   当前 `pixiv_img` 恰好 enable_cache=True, 所以行为没变; 但这是**声明被忽略**的
+        #   潜伏缺陷: 一旦按需关掉缓存, 生成物会与声明不符而不报错。
+        cache_block = ""
+        if getattr(profile, "enable_cache", False):
+            cache_block = (
+                "        proxy_cache pixiv_img_cache;\n"
+                "        proxy_cache_valid 200 304 30d;\n"
+                "        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;\n"
+                "        add_header X-Cache-Status $upstream_cache_status;\n"
+            )
+        # 快速失败三件套。★ 这里原来是 `proxy_next_upstream_timeout 60;` —— **没有单位**,
+        # nginx 按秒解释 = 60 秒, 等于没设上界; 而且它是本块唯一的超时相关指令
+        # (connect 继承全局 5s、tries 完全不限)。这是"同一份配置三种口径"的又一例。
+        failover = "\n".join(upstream_failover_lines("        "))
         return f"""# {profile.name} (带本地图片磁盘缓存与 Range 断点续传)
 server {{
     listen 80;
@@ -556,14 +619,9 @@ server {{
         proxy_ssl_server_name on;
         proxy_ssl_verify off;
         proxy_ssl_session_reuse on;
-
-        proxy_cache pixiv_img_cache;
-        proxy_cache_valid 200 304 30d;
-        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
-        proxy_force_ranges on;
-        add_header X-Cache-Status $upstream_cache_status;
-        proxy_next_upstream_timeout 60;
-        proxy_next_upstream error timeout http_403 http_429 http_404 http_500 http_502 http_503 http_504 non_idempotent;
+{cache_block}        proxy_force_ranges on;
+        proxy_next_upstream error timeout {_strip_retry_403("http_403 http_429 http_404 http_500 http_502 http_503 http_504")} non_idempotent;
+{failover}
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
     }}
@@ -574,12 +632,37 @@ server {{
     def generate_all(cls, target_dir: Path = CONF_DIR,
                      ech_services: Optional[Set[str]] = None,
                      h3_services: Optional[Set[str]] = None) -> Dict[str, str]:
-        """全量渲染并原子写入三大站点配置文件
+        """全量渲染并**原子写入**三大站点配置文件
+
+        ★ 与旧实现的差别 (2026-10-03, 原缺陷 M1): 这里现在**真的**是原子写。
+          旧实现在本函数里对三个文件各做一次裸 `write_text`, 而 docstring 却写着
+          "原子写入" —— 注释与代码相反。裸写在 nginx reload/崩溃窗口里会被读到半截内容,
+          而 site-*.conf 与 upstream-dynamic.conf 是**一对**(引用与定义),
+          混合状态会让 nginx **整体拒载**(见 tests/test_config_pair.py)。
+          现在: 渲染与落盘分离, 落盘走 `_atomic_write_text` (tmp + os.replace)。
+
+        ⚠ 本函数**只保证单文件原子**。跨三个文件的事务由 `NginxManager.test_config()`
+          的"预检通过才提交"负责 (那一步也保证预检本身不改动被跟踪文件)。
 
         ech_services 为走 ECH 隧道的服务 id 集合 (决定 proxy_pass 用 http 还是
         https)。缺省时从 target_dir 下已生成的 upstream-dynamic.conf 反推 —— 即
         以实际写进上游的后端为准, 保证两者不会脱钩; 该文件尚不存在时回退到隧道
         实时健康检查。
+        """
+        results = cls.render_all(target_dir, ech_services, h3_services)
+        for name, content in results.items():
+            _atomic_write_text(target_dir / name, content)
+        return results
+
+    @classmethod
+    def render_all(cls, target_dir: Path = CONF_DIR,
+                   ech_services: Optional[Set[str]] = None,
+                   h3_services: Optional[Set[str]] = None) -> Dict[str, str]:
+        """渲染三大站点配置并返回 {文件名: 内容}, **不落盘**
+
+        拆出来的理由: `NginxManager.test_config()` 需要"先在临时目录里渲染 + 预检,
+        通过了才提交", 而那个流程绝不能顺手改动正式文件 (那正是 M1 的另一半:
+        `test_config()` 自称只读却每次重写被跟踪的 `site-*.conf`)。
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         results = {}
@@ -627,60 +710,182 @@ server {{
                     + "; ".join(broken))
             return blocks
 
-        # 1. 渲染 site-gaming.conf
-        gaming_profiles = [p for p in PROFILES
-                           if p.group == "gaming" and p.mode not in NGINX_BYPASS_MODES]
-        gaming_blocks = [
-            "# ==============================================================================",
-            "# GameArt Toolkit - 游戏生态全平台加速规则 (由 ServiceProfile 模板自动生成)",
-            "# ==============================================================================\n"
-        ]
-        # Steam 社区 Host 分流 map: api.steampowered.com 保持原 Host 路由 API 网关,
-        # 其余域名 (steamcommunity.com 及子域) 归一化到主域防 118 (由 steam_community 渲染引用)
-        if any(p.id == "steam_community" for p in gaming_profiles):
-            gaming_blocks.append(
-                "map $host $steam_upstream_host {\n"
-                "    hostnames;\n"
-                "    api.steampowered.com api.steampowered.com;\n"
-                "    default steamcommunity.com;\n"
-                "}\n"
-            )
-        gaming_blocks.extend(_fallback_for(gaming_profiles))
-        for p in gaming_profiles:
-            gaming_blocks.append(cls.render_server_block(p, ech_services, h3_services))
-        gaming_content = "\n".join(gaming_blocks)
-        (target_dir / "site-gaming.conf").write_text(gaming_content, encoding="utf-8")
-        results["site-gaming.conf"] = gaming_content
+        # ★ 按分组表遍历 (2026-10-03) —— 原先只渲染 gaming/acg/dev 三个硬编码分组,
+        #   于是新增分组 (adult) 的画像会**静默进不了任何站点配置**: 实测把 adult 画像挂进
+        #   PROFILES 后 render_all 的任何输出里都找不到它, 浏览器只能打到 default_server(444)
+        #   ⇒ "服务等于没加"且无报错。现在遍历 SITE_FILE_FOR_GROUP, 并保证四点:
+        #     ① 每个分组一个文件 (新增分组只需在 service_profile 里加一行映射);
+        #     ② 每组的注释头/CORS map/Steam 分流 map 与改造前**逐字一致** (既有测试在守);
+        #     ③ 缺映射的分组**当场报错**, 而不是静默丢弃 (见下面的兜底检查);
+        #     ④ 产物顺序与文件名保持稳定 (gaming → acg → dev → adult)。
+        for group, filename in SITE_FILE_FOR_GROUP.items():
+            group_profiles = [p for p in PROFILES
+                              if p.group == group and p.mode not in NGINX_BYPASS_MODES]
+            title = SITE_GROUP_TITLES.get(group, f"{group} 加速规则")
+            if group == "acg":
+                blocks = [
+                    "# ==============================================================================",
+                    f"# GameArt Toolkit - {title} (由 ServiceProfile 模板自动生成)",
+                    "# ==============================================================================",
+                    # CORS 来源白名单必须在 http 层声明 (nginx 的 map 只能出现在 http 上下文)
+                    _CORS_MAP.rstrip("\n"),
+                    "",
+                ]
+            else:
+                blocks = [
+                    "# ==============================================================================",
+                    f"# GameArt Toolkit - {title} (由 ServiceProfile 模板自动生成)",
+                    "# ==============================================================================\n",
+                ]
+            # Steam 社区 Host 分流 map: api.steampowered.com 保持原 Host 路由 API 网关,
+            # 其余域名 (steamcommunity.com 及子域) 归一化到主域防 118 (由 steam_community 渲染引用)
+            if group == "gaming" and any(p.id == "steam_community" for p in group_profiles):
+                blocks.append(
+                    "map $host $steam_upstream_host {\n"
+                    "    hostnames;\n"
+                    "    api.steampowered.com api.steampowered.com;\n"
+                    "    default steamcommunity.com;\n"
+                    "}\n"
+                )
+            blocks.extend(_fallback_for(group_profiles))
+            for p in group_profiles:
+                blocks.append(cls.render_server_block(p, ech_services, h3_services))
+            results[filename] = "\n".join(blocks)
 
-        # 2. 渲染 site-acg.conf
-        acg_profiles = [p for p in PROFILES
-                        if p.group == "acg" and p.mode not in NGINX_BYPASS_MODES]
-        acg_blocks = [
-            "# ==============================================================================",
-            "# GameArt Toolkit - 二次元与创作者生态加速规则 (由 ServiceProfile 模板自动生成)",
-            "# ==============================================================================\n"
-        ]
-        acg_blocks.extend(_fallback_for(acg_profiles))
-        for p in acg_profiles:
-            acg_blocks.append(cls.render_server_block(p, ech_services, h3_services))
-        acg_content = "\n".join(acg_blocks)
-        (target_dir / "site-acg.conf").write_text(acg_content, encoding="utf-8")
-        results["site-acg.conf"] = acg_content
-
-        # 3. 渲染 site-dev.conf
-        dev_profiles = [p for p in PROFILES
-                        if p.group == "dev" and p.mode not in NGINX_BYPASS_MODES]
-        dev_blocks = [
-            "# ==============================================================================",
-            "# GameArt Toolkit - 开发者与 AI 平台加速规则 (由 ServiceProfile 模板自动生成)",
-            "# ==============================================================================\n"
-        ]
-        dev_blocks.extend(_fallback_for(dev_profiles))
-        for p in dev_profiles:
-            dev_blocks.append(cls.render_server_block(p, ech_services, h3_services))
-        dev_content = "\n".join(dev_blocks)
-        (target_dir / "site-dev.conf").write_text(dev_content, encoding="utf-8")
-        results["site-dev.conf"] = dev_content
+        # 兜底: 画像的 group 若没有对应站点文件, 就是"静默丢弃" —— 必须响亮地失败
+        _unmapped = sorted({p.group for p in PROFILES if p.mode not in NGINX_BYPASS_MODES}
+                           - set(SITE_FILE_FOR_GROUP))
+        if _unmapped:
+            raise ValueError(
+                "这些分组没有对应的站点配置文件, 其中的画像会被静默丢弃 (既不生效也不报错): "
+                f"{_unmapped} —— 请在 service_profile.SITE_FILE_FOR_GROUP 里登记, "
+                "并在 nginx/conf/nginx.conf 里 include 对应文件")
 
         return results
+
+
+# ==============================================================================
+# 模块级辅助 (必须在 class 之后定义: 见下方 _CORS_* 与 _strip_retry_403 的说明)
+# ==============================================================================
+
+# 临时文件序号 (进程内自增): 与 pid/线程 id 一起保证**并发写同一目标时 tmp 不重名**。
+# 见 _atomic_write_text 的说明 —— 写死 `.tmp` 会被并发调用互相移走, 报 FileNotFoundError。
+_TMP_SEQ = 0
+_TMP_SEQ_LOCK = threading.Lock()
+
+
+def _next_tmp_seq() -> int:
+    global _TMP_SEQ
+    with _TMP_SEQ_LOCK:
+        _TMP_SEQ += 1
+        return _TMP_SEQ
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """把 text **原子地**写到 path (临时文件 + os.replace) —— 原缺陷 M1
+
+    ## 为什么必须有
+
+    原实现在 `generate_all()` 里对三个站点配置各写一次裸 `write_text`
+    (`:652/:667/:682`), 而函数 docstring 却写着"**全量渲染并原子写入**三大站点配置文件"。
+    注释与代码相反 ⇒
+      · nginx 可能在**写了一半**的时候读到配置 (reload / 崩溃窗口);
+      · 任一次写失败会留下"部分新 + 部分旧"的**混合状态**, 而 upstream 与 site 是**一对**
+        (见 tests/test_config_pair.py 的说明: 引用不到定义的 upstream 会让 nginx **整体拒载**);
+      · 没有临时文件就没有回滚点。
+
+    本函数只保证"单个文件要么全是新内容、要么全是旧内容"(os.replace 在同一卷上是原子的),
+    跨文件的事务由 `test_config()` 的"预检通过才提交"负责。
+
+    ★ 临时文件名必须**唯一** (2026-10-03 实测事故): 原先写死 `path + ".tmp"`, 于是两个
+    并发调用 (UI 生成 + 健康巡检重生成 / pytest-xdist 两个 worker 同时收集
+    `tests/test_regression.py` 的模块级 generate_all) 会互相踩:
+      A 建 tmp → B 覆盖同一 tmp → A `os.replace` **把 tmp 移走** → B `os.replace` 报
+      `FileNotFoundError: site-gaming.conf.tmp -> site-gaming.conf`。
+    这不只是测试问题 —— 生产里两个线程同时生成配置就会抛异常, 而下面的重试只覆盖
+    `PermissionError` (共享冲突), 覆盖不到"tmp 已被别人移走"。故按 pid+线程+序号命名。
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}."
+                         f"{_next_tmp_seq()}.tmp")
+    try:
+        import time as _time
+        # ⚠ 不传 newline="": 与原先的 `Path.write_text(text, encoding="utf-8")` 保持
+        #   **逐字一致**的行尾行为 (文本模式下 \n 会按平台转成 os.linesep)。
+        #   传了 newline="" 会让同样内容写出不同的行尾 ⇒ 每次预检都判定"内容变了"
+        #   而重写三个文件, 制造无意义的 diff 与 mtime 抖动 (实测踩到)。
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # ★ Windows 上 `os.replace` 会因**瞬时共享冲突**失败 (实测 WinError 5 拒绝访问,
+        #   当时是另一个进程/线程正读同一个 site-*.conf)。这不是逻辑错误而是竞态窗口,
+        #   重试几次即可越过; 但**绝不能静默放弃** —— 最后仍失败就抛出, 让调用方看到
+        #   "这次写入没成功", 而不是留下一个陈旧的配置当成功。
+        last = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as e:      # WinError 5 / 32 都属于这一类
+                last = e
+                _time.sleep(0.05 * (attempt + 1))
+        raise last if last else PermissionError(f"无法替换 {path}")
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def _render_all(target_dir: Path,
+                ech_services: Optional[Set[str]] = None,
+                h3_services: Optional[Set[str]] = None) -> Dict[str, str]:
+    """兼容别名: 渲染三大站点配置, 只返回文本、不落盘
+
+    与 `NginxConfGenerator.render_all` 等价; 保留模块级别名是为了让
+    `NginxManager.test_config()` 能用一个**明显的只读名字**调用它 ——
+    那个函数曾经因为顺手调用 `generate_all()` 而每次启动都重写被跟踪的
+    `site-*.conf` (原缺陷 M1)。
+    """
+    return NginxConfGenerator.render_all(target_dir, ech_services, h3_services)
+
+
+
+#
+# 原实现是 `proxy_hide_header Access-Control-Allow-Origin;` +
+# `add_header Access-Control-Allow-Origin $http_origin always;` —— 把**任意**
+# Origin 原样反射回去, 等于**拆掉上游自己的来源限制**:
+# 任意站点页面做 `fetch("https://www.pixiv.net/ajax/...", {credentials:'include'})`
+# 都会拿到 `ACAO: https://evil.com`; 若上游带 `ACAC: true`, 浏览器即放行跨源读取
+# 已登录数据。而且原实现**没有一并隐藏** `Access-Control-Allow-Credentials`,
+# 也不发 `Vary: Origin` (后者会让共享缓存把一个来源的响应发给另一个来源)。
+#
+# 现在: 只有名单内的来源才回填 ACAO (名单外得到空值 = 相当于不发该头);
+# 同时隐藏上游的 ACAC 并显式补 `Vary: Origin`。
+# ⚠ 为什么放在类定义**之后**: 这些名字必须与 NginxConfGenerator 处于同一模块作用域,
+#    而类方法体内的引用是运行时解析的 —— 因此位置只需在**调用时**已定义即可。
+_CORS_MAP = """    # CORS 来源白名单 (不反射任意 Origin) —— 见 app/nginx_generator.py 的注释
+    map $http_origin $cors_pixiv_origin {
+        default "";
+        "~^https://(www\\.)?pixiv\\.net$" $http_origin;
+    }
+"""
+
+_CORS_ADD_HEADERS = """        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Credentials;
+        add_header Access-Control-Allow-Origin $cors_pixiv_origin always;
+        add_header Vary Origin always;"""
+
+
+def _strip_retry_403(codes: str) -> str:
+    """从 proxy_next_upstream 的状态码列表里摘掉 `http_403` (2026-10-03, 原缺陷 H7)
+
+    为什么必须摘: 本腿会把 gvs 的**正常** 403 原样透传 (非 Google 段/签名无效时的标准应答)。
+    把 403 放进重试列表 ⇒ 每次 403 都要再投一遍上游, 而 nginx 侧本来就带
+    `non_idempotent`, 于是同一个 POST 会被**重放**。对按 token 计费的生成端点,
+    重放等于让用户多付一次钱; 而 403 是重试**改变不了**的结果 (它不是瞬时故障)。
+    """
+    return " ".join(c for c in str(codes).split() if c != "http_403")
 

@@ -19,7 +19,49 @@ from service_profile import ServiceMode, get_profile_by_id
 from win_utils import flush_dns_native
 from path_utils import BASE_DIR, HOSTS_BACKUP_DIR
 
-HOSTS_PATH = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
+def _resolve_hosts_path() -> Path:
+    r"""从**操作系统**取 hosts 路径, 而不是信任 `%WINDIR%` 环境变量 (原缺陷 M16)
+
+    ## 为什么必须校验
+
+    原实现是 `Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / ...`,
+    而程序**支持 UAC 自提权** (win_utils 里的 ShellExecuteW runas)。
+    于是: 若 `%WINDIR%` 被继承的值/其它进程改成了别的目录, 我们就会
+    **把规则写到一个非系统路径**, 而 `is_applied()` 读的是**同一个** `self.hosts_file`
+    ⇒ 它照样回 True。界面显示"已接管", 系统 hosts 其实一个字节没动。
+    这正是本项目最忌讳的形态: 写错地方 + 读同一处 ⇒ **静默假可用**。
+
+    ## 取值顺序
+
+      1. `GetSystemDirectoryW` (kernel32) —— 由内核给出, 与环境变量无关;
+      2. 退回 `%SystemRoot%` (比 `%WINDIR%` 更少被覆盖), 且要求它**存在**;
+      3. 最后才用 `C:\\Windows`, 并且仍然要求存在。
+
+    任何一步都要求"目录真的存在" —— 宁可回落到默认值, 也不要把 hosts 写到不存在的地方。
+    """
+    candidates: List[Path] = []
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260):
+            candidates.append(Path(buf.value))
+    except Exception:
+        pass
+    for var in ("SystemRoot", "WINDIR"):
+        v = (os.environ.get(var) or "").strip()
+        if v and Path(v).is_dir():
+            candidates.append(Path(v) / "System32")
+    candidates.append(Path(r"C:\Windows\System32"))
+    for sysdir in candidates:
+        try:
+            if sysdir.is_dir():
+                return sysdir / "drivers" / "etc" / "hosts"
+        except Exception:
+            continue
+    return Path(r"C:\Windows\System32\drivers\etc\hosts")
+
+
+HOSTS_PATH = _resolve_hosts_path()
 HOSTS_BAK_PATH = HOSTS_PATH.with_suffix(".ptk.bak")
 
 BLOCK_START = "# >>>>> GameArt Toolkit Rules Start >>>>>"
