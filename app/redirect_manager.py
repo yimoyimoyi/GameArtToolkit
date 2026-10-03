@@ -496,8 +496,36 @@ def fast_remove_redirect(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     return ok
 
 
+def _our_redirect_backend_running(cfg: Dict[str, Any], nrpt=None,
+                                  pac_mgr=None) -> bool:
+    """我们自己的重定向后端是否正在运行 (= 它正持有系统代理设置)
+
+    用途 (缺陷 W1, 2026-10-04): `cleanup_orphans` 的语义是"清理**上一会话**的残留"。
+    但 `restore_system_proxy_if_needed()` 原先被放在最前面、且**不看 data_plane_alive**,
+    于是**第二份副本启动时会替第一份把系统代理还原掉并清空落盘备份** ——
+    而那个设置正是第一份正在使用的。第一份的 `REDIRECT_STATE` 仍报"已生效",
+    且备份已删 ⇒ 它之后再也无法正确还原。这就是"两个实例互相拆台"里最直接的一条。
+
+    与 `is_redirect_applied` 用同一组判据, 避免两处各算一套:
+      · PAC 家族: 后端实例的 `running` (它不写系统状态, 只能看进程内状态)
+      · NRPT:     规则仍装着
+    """
+    try:
+        if is_pac_mode(normalize_mode(cfg)) and (pac_mgr or _PAC).running:
+            return True
+    except Exception:
+        pass
+    try:
+        if normalize_mode(cfg) == MODE_NRPT:
+            _n = nrpt or _NRPT
+            return bool(_n.is_supported() and _n.is_applied())
+    except Exception:
+        pass
+    return False
+
+
 def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
-                    data_plane_alive: bool = False) -> Dict[str, Any]:
+                    data_plane_alive: bool = False, pac_mgr=None) -> Dict[str, Any]:
     """启动时清理**上一会话遗留**的重定向 (异常退出/被强杀时会残留)
 
     为什么必须在启动时清 (实测事故): 上一会话在 NRPT 模式下被强杀, 规则残留下来, 而
@@ -508,11 +536,6 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     返回 {"cleaned": bool, "detail": str}
     """
     nrpt = nrpt or _NRPT
-    try:
-        if data_plane_alive:
-            return {"cleaned": False, "detail": "数据平面存活, 视为本会话状态, 不做清理"}
-    except Exception:
-        pass
 
     # ⚠ `detail` 必须**先**初始化 (2026-10-02 单测抓到): 下面 try/except 的两条分支都写成
     #   `f"{detail}; ..." if detail else ...`, 而 detail 只在**这两行**里被赋值 ——
@@ -521,30 +544,7 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     #   用户看到的是"上一会话残留没清掉"而不是真正的异常原因。
     detail = ""
     proxy_msg = ""
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # ★★ 系统代理还原必须**在"无残留"提前 return 之前** (2026-10-03 定因)
-    #
-    # 原实现的顺序是:
-    #     if not (applied_hosts or applied_nrpt): return {"cleaned": False, "detail": "无残留"}
-    #     ...
-    #     restore_system_proxy_if_needed()          # ← 永远到不了
-    #
-    # 而 pac_auto 分支**故意会删掉 hosts 规则** (见本文件上方 "同时清掉 Hosts 规则"),
-    # 所以进程被强杀后的残留**恰好就是** hosts=False、nrpt=False、而系统代理仍指着我们的 PAC
-    # ⇒ 命中的正是那个提前 return。
-    # 而 pyside_app 启动时**唯一**的还原入口就是本函数 ⇒ "上次被强杀 → 按落盘备份还原"
-    # 这条设计在最典型的中止场景下**从未生效过**, 用户的浏览器会一直去取一个已死的本地 PAC。
-    #
-    # 口径: 系统代理是**用户自己的设置**, 它是否被我们污染与"有没有 hosts/nrpt 残留"无关,
-    # 因此这一步必须无条件先跑。
-    # ══════════════════════════════════════════════════════════════════════════
-    try:
-        _p_ok, _p_msg = restore_system_proxy_if_needed()
-        if _p_msg and "无需" not in _p_msg and "不动它" not in _p_msg:
-            proxy_msg = _p_msg
-    except Exception as e:
-        proxy_msg = f"系统代理还原异常: {e}"
+    _p_ok = True
 
     applied_hosts = False
     try:
@@ -558,11 +558,49 @@ def cleanup_orphans(cfg: Dict[str, Any], hosts, nrpt=None, dns=None,
     except Exception:
         pass
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ★★ 系统代理的还原: 两个条件都必须满足 (2026-10-03 定因 + 2026-10-04 收敛)
+    #
+    # 条件一 (2026-10-03, 原缺陷 S3): **不能**被"无残留就提前 return"挡住。
+    #   原顺序是 `if not (applied_hosts or applied_nrpt): return "无残留"` 之后才还原,
+    #   而 pac_auto 分支**故意会删掉 hosts 规则** ⇒ 进程被强杀后的残留恰好是
+    #   hosts=False、nrpt=False、而系统代理仍指着我们的 PAC, 命中的正是那个提前 return
+    #   ⇒ "上次被强杀 → 按落盘备份还原"这条设计在最典型的中止场景下**从未生效过**。
+    #   所以它必须在"无残留"这条 return 之前跑。
+    #
+    # 条件二 (2026-10-04, 缺陷 W1): **不能**在"另一个实例正持有它"时跑。
+    #   原实现只看 `data_plane_alive`, 而 `restore_system_proxy_if_needed()` 在它之前
+    #   ⇒ 第二份副本启动时会替第一份还原掉系统代理**并清空落盘备份**(还原成功即
+    #   `_clear_proxy_backup()`), 而第一份仍以为自己在生效、且再也无法正确还原。
+    #   判据用"我们自己的重定向后端是否在跑"而不是 nginx: PAC 后端不写任何系统状态,
+    #   它是否活着只能看进程内状态 —— 而系统代理恰恰是它写的。
+    #   (注意: 数据平面存活 ≠ 我们的 PAC 活着。窗口未关而本程序被关掉时, nginx 会按
+    #    设计存活, 此时 PAC 已死、系统代理正指着死端口 ⇒ 那正是要还原的场景, 所以
+    #    这里**不能**用 data_plane_alive 当判据。)
+    # ══════════════════════════════════════════════════════════════════════════
+    if _our_redirect_backend_running(cfg, nrpt=nrpt, pac_mgr=pac_mgr):
+        proxy_msg = ""
+    else:
+        try:
+            _p_ok, _p_msg = restore_system_proxy_if_needed()
+            if _p_msg and "无需" not in _p_msg and "不动它" not in _p_msg:
+                proxy_msg = _p_msg
+        except Exception as e:
+            _p_ok = False
+            proxy_msg = f"系统代理还原异常: {e}"
+
     if not (applied_hosts or applied_nrpt):
         # ⚠ 无残留时 `detail` 必须保持逐字 "无残留" (tests/test_nrpt_manager.py 断言依赖它),
         #   所以系统代理的还原文案走**独立字段** proxy_detail, 不并进 detail。
         return {"cleaned": False, "detail": "无残留", "proxy_detail": proxy_msg,
                 "proxy_ok": _p_ok}
+
+    # 走到这里说明**确实看到残留**, 才轮到"数据平面存活 ⇒ 视为本会话状态不动它"这条守卫。
+    # 它守的是残留删除 (hosts/NRPT 规则), 而不是系统代理还原 —— 后者已经在上一步按
+    # "我们的后端是否正持有它"独立判过了 (缺陷 W1)。两者判据不同、归属不同, 不能混用。
+    if data_plane_alive:
+        return {"cleaned": False, "detail": "数据平面存活, 视为本会话状态, 不做清理",
+                "proxy_detail": proxy_msg, "proxy_ok": _p_ok}
 
     ok = fast_remove_redirect(cfg, hosts, nrpt, dns)
     parts = []

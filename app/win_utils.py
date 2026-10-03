@@ -437,6 +437,69 @@ def fast_terminate_pid(pid: int) -> bool:
     return False
 
 
+# ==================== 单实例闸门 (2026-10-04) ====================
+# 为什么需要 (缺陷 W1 的另一半): 本项目**没有**任何单实例互斥。第二份副本不但不会被
+# 拒绝, 还会:
+#   · 与第一份互相覆盖 hosts / NRPT 规则与 nginx 配置;
+#   · 按镜像路径杀掉**双方**的 nginx (两份是同一个可执行文件);
+#   · 退出时停掉共享单例 (本机 DNS 解析器 / relay / 隧道 / h3 腿) —— 而如果第一份
+#     正用 NRPT 模式, 它的域名会被指向一个被停掉的解析器 ⇒ **整机解析失败**;
+#   · 占用 44500/44501 时只会说"端口被占用", 用户于是去杀进程, 而不是意识到"已经开着了"。
+#
+# 上一轮已把"第二份不得替第一份还原系统代理"单独修掉 (见 redirect_manager 的
+# _our_redirect_backend_running); 这里补的是**根因**: 让第二份根本不去碰数据平面。
+#
+# 语义 (刻意保守): 名字互斥体已存在 ⇒ 判定"已有实例"。不枚举进程、不按镜像名匹配 ——
+# 那正是本项目拒绝过的做法(会误伤同名程序)。互斥体随进程退出由内核自动释放,
+# 因此"被强杀后残留互斥体"不是问题 (这与注册表/文件锁不同)。
+_SINGLE_INSTANCE_MUTEX = "Global\\GameArtToolkit_SingleInstance_Mutex"
+_single_instance_handle = None  # 必须保持在模块级: 句柄一关, 闸门就失效
+
+
+def acquire_single_instance(mutex_name: str = _SINGLE_INSTANCE_MUTEX) -> bool:
+    """尝试成为唯一实例; True = 本进程是唯一实例 (或闸门不可用, 见下)
+
+    返回值语义是"**可以继续启动**", 所以在 API 不可用时选择放行而不是拒绝:
+    闸门是**保护**手段, 不能因为拿不到它就把用户挡在程序外面 (那会把一个防护变成故障)。
+    拿不到 API 时打印一行说明以便排查。
+
+    ⚠ 必须显式声明 argtypes/restype (2026-10-04 实测教训): ctypes 对未声明的函数
+    默认按 **32 位 int** 取返回值, 而 `HANDLE` 在 64 位 Windows 上是 64 位指针 ⇒
+    高位被截断, 句柄可能变成 0/极小值。实测后果是**闸门静默失效**(每次都报
+    "CreateMutexW 失败" 并放行), 也就是看起来装好了、其实两个实例照样都能起来。
+    """
+    global _single_instance_handle
+    if os.name != "nt":
+        return True
+    try:
+        k32 = ctypes.windll.kernel32
+        # ── 原型声明 (见 docstring 的教训) ──────────────────────────────────
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.GetLastError.restype = wintypes.DWORD
+
+        handle = k32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            print("[SingleInstance] CreateMutexW 失败, 跳过闸门 (放行)")
+            return True
+        ERROR_ALREADY_EXISTS = 183
+        if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+            # 已在别处运行: 立刻关掉这个句柄, 不持有它
+            try:
+                k32.CloseHandle(handle)
+            except Exception:
+                pass
+            return False
+        # 成为持有者: 句柄必须活到进程结束
+        _single_instance_handle = handle
+        return True
+    except Exception as e:
+        print(f"[SingleInstance] 闸门异常, 跳过 (放行): {e}")
+        return True
+
+
 # ==================== 进程镜像路径识别 (2026-10-04) ====================
 # 为什么需要: 退出清理原先按**进程名**枚举并终止全部 `nginx.exe`, 会连带杀掉用户
 # 自己另装的 nginx (开发/测试用)。改为按**完整镜像路径**判定, 两头都要:

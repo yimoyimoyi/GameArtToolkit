@@ -6126,6 +6126,28 @@ class MainWindow(QMainWindow):
             show_toast(self, "Git 配置执行完成", toast_type="info", duration=2500)
 
 
+def show_already_running_message() -> None:
+    """告知用户"已有实例在运行", 然后退出
+
+    为什么必须告诉用户, 而不是静默退出: 用户双击图标多半是**以为它没开**
+    (例如它最小化到了托盘)。静默退出会让他以为程序坏了、或是去任务管理器杀进程 ——
+    而杀掉的可能是正在工作的那一份。用原生 MessageBox 而不是 Qt: 此刻 QApplication
+    还没建, 而且这条路径要尽量不依赖任何重量级初始化。
+    """
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "GameArt Toolkit 已经在运行。\n\n"
+            "请在任务栏右下角的托盘区找到它的图标（可能需要点开隐藏图标）。\n"
+            "重复启动会与正在运行的实例互相干扰，因此本次已退出。",
+            "GameArt Toolkit",
+            0x00000040 | 0x00001000,  # MB_ICONINFORMATION | MB_SYSTEMMODAL
+        )
+    except Exception:
+        pass
+
+
 def main():
     # 0. 命令行极速静默响应 (安装包/卸载器/脚本调用，无界面 0.1s 极速还原)
     if "--clean-hosts-silent" in sys.argv or "--clean-hosts" in sys.argv:
@@ -6136,6 +6158,25 @@ def main():
         except Exception as e:
             print(f"[CleanHosts Error] {e}")
         sys.exit(0)
+
+    # 0.4 ★ 单实例闸门 (缺陷 W1, 2026-10-04)
+    #
+    # 必须放在**注册退出清理与孤儿清理之前**, 而不是"建窗口之前":
+    # 那两步都会动共享状态 (cleanup_orphans 会还原系统代理; _register_exit_cleanup
+    # 会让本进程退出时去停 DNS 解析器/relay/隧道/h3 腿并杀 nginx)。
+    # 也就是说, 第二份副本即使"什么都不做", 光是启动再退出就足以拆掉第一份 ——
+    # 若第一份正用 NRPT, 它的域名会被指向一个被停掉的解析器 ⇒ 整机解析失败。
+    # 因此闸门必须早于那两步: 判定失败就**在碰任何共享状态之前**退出。
+    try:
+        from win_utils import acquire_single_instance
+        if not acquire_single_instance():
+            print("[SingleInstance] 已有实例在运行, 本进程退出 (不碰数据平面)")
+            show_already_running_message()
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[SingleInstance] 闸门跳过 (放行): {e}")
 
     # 注册退出清理。必须放在上面那条纯命令行分支之后 (卸载器只期望清 hosts),
     # 且必须是主程序入口而非模块级 —— 见 _register_exit_cleanup 的说明。
