@@ -398,13 +398,22 @@ class L4RelayServer:
                 await srv.wait_closed()
         for p in sorted(desired - current):
             try:
+                # ⚠ reuse_address 必须为 False (2026-10-04 统一, 缺陷 D1):
+                #   本项目在 pac_redirect.py 里已为这个语义定过案 —— Windows 上
+                #   SO_REUSEADDR 允许绑定**已被监听**的端口, 于是"冲突"不报错,
+                #   两方抢同一批流量, 归属不确定。端口被占就该如实失败。
                 srv = await asyncio.start_server(
                     functools.partial(self._handle_connection, listen_port=p),
-                    self.host, p, reuse_address=True)
+                    self.host, p, reuse_address=False)
                 self._servers[p] = srv
-            except OSError:
-                # 端口被第三方占用: 跳过该端口 (nginx 将 502, 由 backup 兜底)
+            except OSError as e:
+                # 端口被第三方占用: 跳过该端口 (nginx 将 502, 由 backup 兜底)。
+                # 但必须**留下可见痕迹** (缺陷 D3): 原先这句是静默 pop, 于是
+                # "配置里写着这个端口、实际没在听"永远不会被任何人发现, 表现为
+                # 某个站点间歇性 502, 且下次启动还会从配置里把死映射重建出来。
                 self.proxy_routes.pop(p, None)
+                print(f"[Relay] 端口 {p} 无法监听 ({e}), 已从代理映射中移除 —— "
+                      f"该端口对应的站点将回落到 backup 或失败")
 
     def _run_event_loop(self):
         """后台独立线程运行 asyncio 事件循环"""
@@ -416,12 +425,16 @@ class L4RelayServer:
             # SNI 主端口 + 全部代理转发端口
             self._servers.clear()
             try:
+                # 同 _sync_tunnel_servers: reuse_address=False, 冲突如实失败 (缺陷 D1)
                 srv = await asyncio.start_server(
                     functools.partial(self._handle_connection, listen_port=self.port),
-                    self.host, self.port, reuse_address=True)
+                    self.host, self.port, reuse_address=False)
                 self._servers[self.port] = srv
-            except OSError:
-                pass  # 主端口被占: 仅代理转发端口可用
+            except OSError as e:
+                # 主端口被占: 仅代理转发端口可用。
+                # 同样留痕 (缺陷 D3) —— 这是"relay 整体不可用"的原因, 不能静默。
+                print(f"[Relay] SNI 主端口 {self.port} 无法监听 ({e}); "
+                      f"relay 通道不可用, 相关站点将走其它路径")
             await self._sync_tunnel_servers()
             self._is_running = True
             try:

@@ -88,8 +88,14 @@ def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         if rc != errno.ETIMEDOUT:  # 立即拒绝 = 端口空闲
             return False
     # 回环 SYN 被静默丢弃: bind 探测确认端口真实占用状态
+    #
+    # ⚠ 这里**绝不能**开 SO_REUSEADDR (2026-10-04 修正, 缺陷 D1): 在 Windows 上
+    #   可复用语义允许绑定一个**已被监听**的端口 —— 于是 bind "成功", 本函数会
+    #   把"端口已被占用"判成"空闲"。而本函数正是启动前的占用闸门与 UI 诊断的判据,
+    #   判错的后果是"报空闲 → 启动时才发现被占", 或者反过来把冲突源指错。
+    #   项目在 pac_redirect.py 里已经为同一个语义定过案 (注释写着"不能开"),
+    #   但本处与另外三处没跟上; 现在统一为"独占语义, 让冲突如实失败"。
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((host, port))
             return False  # bind 成功 = 端口空闲

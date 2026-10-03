@@ -1989,7 +1989,13 @@ class _LegHTTPServer(ThreadingHTTPServer):
     """
 
     request_queue_size = 128
-    allow_reuse_address = True
+    # ⚠ 必须 False (2026-10-04 统一, 缺陷 D1): Windows 上 SO_REUSEADDR 允许绑定
+    #   一个**已被监听**的端口 —— 于是"端口被占"不会报错, 两个进程同时绑 44411,
+    #   流量落到谁那里不确定。本项目在 pac_redirect.py 里已为这个语义定过案
+    #   (注释写着"不能开"), 但这里与 l4_relay / dns_server / is_port_in_use 没跟上;
+    #   现在四处统一为"独占语义, 冲突如实失败"。后果是 TIME_WAIT 期间短时无法重绑
+    #   —— 与 pac_redirect 已接受的同一代价, 且 is_listening() 会如实报告未就绪。
+    allow_reuse_address = False
     daemon_threads = True
 
 

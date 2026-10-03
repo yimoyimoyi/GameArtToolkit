@@ -387,7 +387,17 @@ class LocalDnsServer:
             # 按监听地址选择地址族: NRPT 在 IPv4 53 被代理占用时可改指向 ::1 共存
             family = socket.AF_INET6 if ":" in (self.host or "") else socket.AF_INET
             self._sock = socket.socket(family, socket.SOCK_DGRAM)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # ⚠ 刻意**不**开 SO_REUSEADDR (2026-10-04 统一, 缺陷 D1)。
+            #
+            # Windows 上可复用语义允许绑定一个**已被监听**的端口 ⇒ 冲突静默成功,
+            # 两个监听者抢同一批数据报。而本项目其余监听器 (pac_redirect / l4_relay /
+            # h3_upstream / is_port_in_use) 都已统一为"独占语义, 让冲突如实失败",
+            # 且 pac_redirect.py 里为这个语义写下了实测理由。这里原先单独开着,
+            # 是同一仓库对同一语义的两套标准 —— 正是"两套标准"这类缺陷的温床。
+            #
+            # 代价: 端口处于 TIME_WAIT 时可能短时无法重绑。本 socket 是 UDP,
+            # 且地址族已在上面按 host 选好 (UDP 无 TIME_WAIT 之扰); 真绑不上时
+            # ensure_bind 会按已有逻辑回退 ::1 或如实报告, 不静默降级。
             if family == socket.AF_INET6:
                 try:
                     # 仅监听指定回环地址, 不做 v4 映射 (避免与占用者抢 IPv4 流量)

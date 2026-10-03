@@ -227,10 +227,16 @@ class _PacHttpHandler(socketserver.BaseRequestHandler):
 
 
 class _Server(socketserver.ThreadingTCPServer):
-    # ⚠ **不能**开 SO_REUSEADDR (2026-10-02 实测): 在 Windows 上它允许绑定到**已被监听**的
-    # 端口 —— 于是端口冲突不会报错, 本后端会与既有监听者争抢流量 (实测: 先占住端口再 start,
-    # 竟然返回成功)。本项目其余服务也都选择"端口被占就如实失败"。
+    # ⚠ **不能**开 SO_REUSEADDR (2026-10-02 实测, 2026-10-04 定案为全局政策 = 缺陷 D1):
+    # 在 Windows 上它允许绑定到**已被监听**的端口 —— 于是端口冲突不会报错,
+    # 本后端会与既有监听者争抢流量 (实测: 先占住端口再 start, 竟然返回成功)。
     # 代价是 TIME_WAIT 期间可能短暂无法重绑, 但这远比静默抢端口可接受。
+    #
+    # 本条注释原先还写着"本项目其余服务也都选择'端口被占就如实失败'" —— 那句话在
+    # 写下的那一刻**就是假的**: h3_upstream / l4_relay / dns_server / is_port_in_use
+    # 四处都开着 (其中 is_port_in_use 最隐蔽: 它自己开 SO_REUSEADDR, 于是"端口已被
+    # 监听"时 bind 仍成功 ⇒ 把**被占用判成空闲**, 而那正是启动前的占用闸门)。
+    # 现已四处统一为独占语义, 并由 tests/test_bind_semantics.py 做全仓库源码扫描锁定。
     allow_reuse_address = False
     daemon_threads = True
 
