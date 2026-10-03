@@ -478,8 +478,52 @@ class NginxManager:
         except Exception as e:
             return False, f"热重载异常: {e}"
 
+    # 自写日志文件的大小上限 (缺陷 D5, 2026-10-04)。单项超过即截断到尾部这段长度。
+    LOG_TRUNCATE_BYTES = 2 * 1024 * 1024   # 2 MB
+
+    def _trim_logs(self) -> Tuple[int, int]:
+        """按大小截断自写日志, 返回 (处理文件数, 释放字节数)
+
+        为什么需要: 这些日志由 nginx / 隧道**追加写、不轮转**, 而没有任何东西会缩小
+        它们 —— 实测旧实例的 `access.log` 曾长到 **183.9 MB**。`access_log off` 已经
+        止住了新增 (见 nginx.conf), 但**既有文件与隧道日志仍在增长**, 且原先的
+        `clear_cache()` 只清 `cache/img`, 完全覆盖不到 logs 目录。
+
+        做法是"截断保留尾部"而不是删除: 排障时最近的行才有用, 而直接删文件会让
+        nginx 继续往一个已 unlink 的句柄写 (Windows 上多半直接失败),
+        也会让用户/支持人员丢掉刚发生的那次故障现场。
+        """
+        handled = freed = 0
+        logs_dir = self.nginx_dir / "logs"
+        if not logs_dir.exists():
+            return 0, 0
+        for f in logs_dir.glob("*"):
+            try:
+                if not f.is_file():
+                    continue
+                size = f.stat().st_size
+                if size <= self.LOG_TRUNCATE_BYTES:
+                    continue
+                with open(f, "rb") as fh:
+                    fh.seek(size - self.LOG_TRUNCATE_BYTES)
+                    tail = fh.read()
+                # 从行边界开始, 避免留下半行 (半行会让解析日志的代码读到残缺记录)
+                nl = tail.find(b"\n")
+                if nl >= 0:
+                    tail = tail[nl + 1:]
+                with open(f, "wb") as fh:
+                    fh.write(tail)
+                try:
+                    freed += max(0, size - f.stat().st_size)
+                except Exception:
+                    pass
+                handled += 1
+            except Exception:
+                continue
+        return handled, freed
+
     def clear_cache(self) -> Tuple[bool, str]:
-        """安全清理 Pixiv 图片本地磁盘缓存"""
+        """安全清理本地磁盘缓存**与自写日志** (缺陷 D5: 日志原先不在清理范围内)"""
         deleted = 0
         try:
             if self.cache_dir.exists():
@@ -492,6 +536,12 @@ class NginxManager:
                         deleted += 1
                     except Exception:
                         continue
-            return True, f"本地图片缓存已清理完成！(清理了 {deleted} 个缓存分片)"
+            # 日志一并按大小收敛 —— 用户点"清理"时的预期是"把占地方的东西收掉",
+            # 而 183.9 MB 的 access.log 显然属于"占地方的东西"。
+            logs_handled, logs_freed = self._trim_logs()
+            tail = ""
+            if logs_handled:
+                tail = f", 另有 {logs_handled} 个日志文件超限已截断 (释放 {logs_freed / 1048576:.1f} MB)"
+            return True, f"本地图片缓存已清理完成！(清理了 {deleted} 个缓存分片{tail})"
         except Exception as e:
             return False, f"清空缓存异常: {e}"

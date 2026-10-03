@@ -97,7 +97,12 @@ DEFAULT_CONFIG = {
     #              "不可用", 也不静默降到一条没有任何证书保障的通路上。
     "cover_sni_allow_empty": True,
 
-    "cache_max_size_mb": 1024,
+    # ⚠ `cache_max_size_mb` 已删除 (缺陷 D4, 2026-10-04): 它**没有任何读取方**
+    #   (全仓库零引用), 于是"配置写 1GB、实际 nginx 长到 5GB" —— 而用户能看到的那份
+    #   是错的那份。磁盘上限的唯一真源现在是 nginx/conf/nginx.conf 的
+    #   `proxy_cache_path ... max_size`, 理由与改法都写在那里。
+    #   教训: 一个没人读的配置项不是"预留", 它会变成一份**互相矛盾的文档** ——
+    #   而这正是本项目根因一(注释/文档描述了一个不成立的前提)的又一种形态。
     "auto_clear_cache_on_exit": False,
 
     # 测速探测专用本地代理 (Clash/v2ray/Sing-box mixed 端口, 仅作真实节点筛选, 不参与 nginx 转发)
@@ -105,6 +110,12 @@ DEFAULT_CONFIG = {
     "cached_latencies": {},
     "cached_cdn_full_results": {}
 }
+
+# 已退役的配置键: 加载时剔除, 避免它们永久留在用户配置里冒充有效设置。
+# 只列**确认没有任何读取方**的键; 删除原因写在各键原先的位置 (见上方 cache_max_size_mb)。
+RETIRED_CONFIG_KEYS = (
+    "cache_max_size_mb",
+)
 
 # 旧版粗粒度服务 ID 到细粒度 ID 的映射转换字典 (自动兼容历史配置)
 # 注: ea_app / danbooru 已从服务列表移除 (明确封锁), 不再出现在映射中
@@ -223,6 +234,21 @@ def _sanitize_config(data: dict) -> dict:
 
     return data
 
+def _drop_retired_keys(data: dict) -> dict:
+    """剔除已退役的配置键 (缺陷 D4, 2026-10-04)
+
+    为什么需要: `load_config` 只做"补默认值", 从不删键 ⇒ 用户配置里会**永久留着**
+    一个已经没人读的键, 下次 save 还会把它写回去。它无害, 但会一直躺在用户文件里
+    冒充一个有效设置 —— 而这正是 D4 的成因 (那份"1GB"的假文档就是这么来的)。
+
+    只做**剔除**, 不做改名映射: 退役键的语义已被别处取代 (如 cache_max_size_mb 的
+    真源移到 nginx.conf 的 max_size), 猜一个映射反而会造出新的错值。
+    """
+    for k in RETIRED_CONFIG_KEYS:
+        data.pop(k, None)
+    return data
+
+
 def load_config() -> dict:
     with _CONFIG_LOCK:
         for target_path in [CONFIG_FILE, CONFIG_BAK]:
@@ -240,6 +266,7 @@ def load_config() -> dict:
                                         if sub_k not in data[k]:
                                             data[k][sub_k] = sub_v
                             data = _sanitize_config(data)
+                            data = _drop_retired_keys(data)
                             return data
                 except Exception as e:
                     print(f"[Config] 加载 {target_path.name} 异常: {e}")
