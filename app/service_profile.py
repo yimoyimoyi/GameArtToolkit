@@ -1242,8 +1242,15 @@ PROFILES: List[ServiceProfile] = [
         # 注: googlevideo.com (视频流本体) 由**独立画像**承载 —— 它走不了本通道:
         #   经中转 IP 请求 /videoplayback 时上游回 "Bandaid Misdirected Traffic Server"
         #   (Google 明确回"打错服务器"), 而真实 IPv6 节点的 TCP 侧被压制 (同一时刻
-        #   QUIC 5/5 成功 vs TCP 0/5)。视频通路需另走 QUIC 上游腿, 未在本次范围内。
-        #   登记它只会造出"页面能开但视频永远转圈"的假可用。
+        #   QUIC 5/5 成功 vs TCP 0/5)。
+        #   ★ 2026-10-04 更正: 原文写"视频通路需另走 QUIC 上游腿, **未在本次范围内**" ——
+        #     那是当时的范围声明, 早已落地 (见下方 googlevideo 画像 + app/h3_upstream.py)。
+        #     留在这里会让读代码的人以为视频还没做。
+        #   替代通路已逐条实测关闭 (docs/googlevideo-node-availability.md §7.6.5):
+        #     QUIC 只在 UDP **443** 听 (8443/80/8853/8080 全部 Timeout)、
+        #     TCP+ALPN=h3 与 h2 均被 RST、IPv4 侧整体不可达。
+        #   ⇒ 本画像**刻意不登记** googlevideo 域: 登记它只会造出"页面能开但视频永远转圈"
+        #     的假可用 (视频域必须由那个画像自己的 server 块与上游腿承载)。
         domains=[
             "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
             "youtube-nocookie.com", "www.youtube-nocookie.com",

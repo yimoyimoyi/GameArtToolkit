@@ -2179,20 +2179,6 @@ class MainWindow(QMainWindow):
                     f"({'/'.join(_gaps[service_id])}) —— 页面可开, 而这些子域仍会走真实解析"
                     f"(可能超时, 如 Gemini 的会话端点)。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                     toast_type="warning", duration=9000)
-            # 软告警 2 (2026-10-03): 走 HTTP/3 上游腿的服务 (googlevideo) —— 它的可用性是
-            # **节点级、分钟级时变**的, 且实测"每个节点只有一个可用地址"(别名域答案逐字相同、
-            # 只有一个干净 DoH 来源), 所以既拦不住也修不好, 只能**如实告知且不阻断**。
-            # 数据源 = 节点成绩单 (浏览器真实播放的跨会话统计), **离线读取**, 不做实时探测:
-            # 实时探测要数十秒会冻结界面, 且合成请求读不出"能不能播"(见文档 §5)。
-            try:
-                from h3_upstream import gvs_health_hint
-                _hint = gvs_health_hint([service_id])
-            except Exception:
-                _hint = ""
-            if _hint:
-                _name2 = (_profile or {}).get("name", service_id)
-                show_toast(self, f"[{_name2}] 已开启, 但当前并不稳定 —— {_hint}",
-                           toast_type="warning", duration=10000)
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -2204,6 +2190,27 @@ class MainWindow(QMainWindow):
         new_list = sorted(list(services))
         cfg["enabled_services"] = new_list
         save_config(cfg)
+
+        # 软告警 2 (2026-10-03, L3 修正 2026-10-04): 走 HTTP/3 上游腿的服务 (googlevideo) ——
+        # 它的可用性是**节点级、分钟级时变**的, 且实测"每个节点只有一个可用地址", 所以既拦不住
+        # 也修不好, 只能**如实告知且不阻断**。数据源 = 节点成绩单 (浏览器真实播放的跨会话统计),
+        # **离线读取**, 不做实时探测 (实时探测要数十秒会冻结界面, 且合成请求读不出"能不能播")。
+        #
+        # ★ 为什么放在 save_config **之后**、且传 new_list:
+        #   ① 判据是"这条告警与本次操作是否相关", 依据只能是**启用清单**;
+        #   ② 必须用切换**后**的清单 —— 打开 googlevideo 时它已在 new_list 里, 告警才出得来;
+        #   ③ 原先传 [service_id] 而函数不读该参数 ⇒ 开关任何服务都弹 googlevideo 的告警,
+        #      文案还会张冠李戴 (如 "[Gemini] 已开启 … 最近 N 次**视频**请求…")。
+        if checked:
+            try:
+                from h3_upstream import gvs_health_hint
+                _hint = gvs_health_hint(new_list)
+            except Exception:
+                _hint = ""
+            if _hint:
+                _name2 = (_profile or {}).get("name", service_id)
+                show_toast(self, f"[{_name2}] 已开启, 但当前并不稳定 —— {_hint}",
+                           toast_type="warning", duration=10000)
 
         srv_info = SERVICES_BY_ID.get(service_id)
 
@@ -5850,9 +5857,13 @@ class MainWindow(QMainWindow):
         ok, msg = h3_proxy.start()
         # 节点成绩单的健康提示 (离线读取, 不阻塞): 与启用边界的软告警同一口径,
         # 在启动收尾处再提示一次 —— 用户往往是在"已经开始加速"之后才发现视频卡。
+        # L3 (2026-10-04): 必须传**已算出的 `_enabled`** —— 原先不带参数, 而"不带"按
+        # gvs_health_hint 的口径是"调用方未声明", 保守提示, 于是 googlevideo **没启用**
+        # 也会在启动时弹一次它的告警。这里改用真实启用清单, 同时不影响
+        # `check_preconditions` 那一道"不阻断但如实告知"的告警。
         try:
             from h3_upstream import gvs_health_hint
-            self._gvs_health_note = gvs_health_hint()
+            self._gvs_health_note = gvs_health_hint(_enabled)
         except Exception:
             self._gvs_health_note = ""
         # 前置条件校验: 不阻断启动 (代理本身可用), 但必须**如实告知** —— 否则用户会在

@@ -162,6 +162,16 @@ nginx/conf/*.bak_*
 tests/
 # 本地探测 / 审计 / 验证脚本 (历次实测的复现工具)
 scripts/probe_*.py
+# ★ 例外 (2026-10-04): 下面两个探测脚本**入库**。
+#   理由: 它们不是"一次性排障", 而是多条已归档结论的**判据载体** —— 文档写在被忽略的
+#   docs/ 里、测试写在被忽略的 tests/ 里, 若复现工具也不入库, 那么
+#   docs/googlevideo-node-availability.md §7 的每条结论对新克隆都**无法复现**。
+#   具体承载:
+#     · probe_gvs_nodes.py     — 同刻交错 A/B 的通用轴 (--ab-var addr_health|retries)
+#                                与腿参数注入 (--leg-first-byte/--leg-retries) ⇒ §7.7
+#     · probe_gvs_alt_paths.py — 替代通路 (端口 / 传输) 的判据 ⇒ §7.6.5
+!scripts/probe_gvs_nodes.py
+!scripts/probe_gvs_alt_paths.py
 scripts/audit_*.py
 scripts/test_*.py
 scripts/benchmark_*.py
@@ -176,6 +186,8 @@ scripts/clean_extra_root.py
 # tools 下的开发脚本 (运行时必需的 tools/ech_tunnel/ 不受影响: 只匹配 tools/*.py)
 tools/*.py
 scripts/*.json
+# PAC 探测的运行时产物 (probe_pac_playback.py 的 WORK 目录: 生成的 proxy.pac)
+scripts/_pac_work/
 # Go 黑盒测试台 (仅测试用, 与 tests/ 同口径: 本地留存, 不上传)
 tools/h3_legtest/
 # 候选池探测三件套 (无运行时引用: 工具 + 生成的候选池描述 + 重生成/校验脚本)

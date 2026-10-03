@@ -282,9 +282,17 @@ BLOCKED_IP_NETWORKS = [
     ipaddress.ip_network("fc00::/7"),        # IPv6 ULA
 ]
 
-# 已知 GFW DNS 污染注入段 (Facebook/Twitter/Dropbox 等大厂 IP 前缀):
-POLLUTED_IP_PREFIXES = ("31.13.", "69.171.", "157.240.", "69.63.",
-                        "199.59.", "104.244.", "108.160.", "162.125.", "199.96.")
+# 已知 GFW DNS 污染注入段 (Facebook/Twitter/Dropbox 等大厂 IP 前缀)。
+#
+# ★ 2026-10-04 单一真源 (原缺陷: 同一语义在两张表里各写一份, 且**各自缺对方的取值**):
+#   本常量改为**引用** `h3_upstream.POISON_IP_PREFIXES`, 不再重抄字面量。
+#   合并前的不对称 (实测): 本表漏 128.242. / 185.45. / 174.132. / 192.133.77. / 2001::1
+#   等 11 条, 而其中 **4 个实测投毒值连 `is_valid_public_cdn_ip` 也放行** ⇒ 会真的混入
+#   候选池。这正是本文件 :454 注释里记载过的症状 ("实测曾混入 162.125.x / 199.59.x 并
+#   返回假 200")。反向安全性 (合并后不得误拦真实可达地址) 由
+#   `scripts/gvs_gate_benefit_check.py` 的 B3/B4 用冻结语料 (87 条本机实测地址) 守住。
+#   保留本别名是为了不动两处调用点 (:397 / :456) —— 名字的既有含义没有变。
+POLLUTED_IP_PREFIXES = h3_upstream.POISON_IP_PREFIXES
 
 
 def is_valid_public_cdn_ip(ip_str: str) -> bool:
