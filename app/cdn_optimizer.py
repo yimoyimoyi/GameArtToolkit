@@ -2208,6 +2208,38 @@ class CDNHealthMonitor:
             print(f"[Health] QUIC 服务 {srv_id} 巡检异常: {e}")
             return False
 
+    def _check_and_heal_ech(self, srv_id: str) -> bool:
+        """ECH 隧道服务的健康巡检 (缺陷 W4, 2026-10-04)
+
+        这类服务的上游是**本地隧道端口**(127.0.0.1:44401), 与候选池里的 CF 边缘地址
+        无关。而候选池里那几个地址在**普通握手**下必然失败 —— CF 对不带 ECH 的
+        受限域名握手会回 403 或直接拒绝(`ech-tunnel-proposal.md` 的实测: 明文 SNI
+        0/10 全 RST; booth 明文 SNI 稳定 403)。于是原路径每 30 秒对注定失败的地址
+        做一次探测, 连续两次失败就触发"自愈"重测并可能重写 upstream + reload nginx
+        —— **纯粹空转 + 周期性全局扰动**。
+
+        正确的探针对象是**隧道自己**:
+          · 隧道进程 + 端口在听 ⇒ 视为健康, 重置失败计数, 不自愈;
+          · 隧道不健康     ⇒ 这才是真故障, 交给上层 (看门狗) 去重启隧道,
+                             而**不是**去重选候选节点 (重选救不了隧道)。
+
+        返回值语义与其它分支一致: True = 发生了自愈(需要上层 reload), False = 无需处理。
+        这里**永不**返回 True: 本函数不重写 upstream —— ECH 服务的上游由
+        `generate_upstream_conf` 按隧道健康状态决定, 与候选池选举无关。
+        """
+        try:
+            if ech_tunnel.is_functionally_healthy():
+                with self._lock:
+                    self.failure_counts[srv_id] = 0
+                return False
+        except Exception:
+            pass
+        # 隧道不健康: 记一次失败但**不触发候选池重测** —— 池里的 IP 与这条链路无关。
+        # 真正的处置在 pyside_app 的看门狗 (重启隧道), 那里已有分流。
+        with self._lock:
+            self.failure_counts[srv_id] = self.failure_counts.get(srv_id, 0) + 1
+        return False
+
     def check_and_heal_service(self, srv_id: str) -> bool:
         """检查单个服务的当前主力节点，并在故障时自动选举自愈"""
         srv = SERVICES_BY_ID.get(srv_id)
@@ -2223,6 +2255,18 @@ class CDNHealthMonitor:
             _is_quic = False
         if _is_quic:
             return self._check_and_heal_quic(srv_id)
+
+        # ECH 隧道服务同样必须**先**分流 (缺陷 W4): 它的上游是本地隧道, 候选池里的
+        # CF 边缘地址在普通握手下一律失败 ⇒ 走常规探针只会每 30 秒空转一次并反复
+        # 触发"自愈"重测 + reload nginx。判据用 `optimizer.last_ech_services`
+        # (生成 upstream 时**实际**写入隧道端口的那些服务), 而不是静态的
+        # `ech_enabled` 标记 —— 与 nginx_generator._ech_services_from_upstream
+        # 同一条"以实际产物为准"的口径 (静态标记会与实际写入脱钩, 见其注释)。
+        try:
+            if srv_id in getattr(self.optimizer, "last_ech_services", set()):
+                return self._check_and_heal_ech(srv_id)
+        except Exception:
+            pass
 
         with self._lock:
             items = self.cached_results.get(srv_id)

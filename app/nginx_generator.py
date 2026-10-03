@@ -57,11 +57,32 @@ SITE_GROUP_TITLES = {
 #   实测代价(旧值 3s): pypi 池 4 个里 2 个 TCP 超时 ⇒ 3s × 最多 4 次 = 单请求最坏 12s,
 #   实测 TTFB 1.8~4.8s 且 8s 预算内没下完; 而**直连同一个 URL 只要 0.47s**。
 #
-# ★ 为什么总预算是 4s: `proxy_next_upstream_timeout` 只在"要不要再换一个节点"这个
-#   **决策点**被检查, 不是硬中断。所以 4s 预算 + 1s 单次 ≈ 允许先试掉 2 个死节点,
-#   仍有余额去连第 3 个健康节点 (健康节点建连 <350ms; 一旦连上就转由
-#   proxy_read_timeout 管辖, 不受本预算约束 ⇒ **不会**误伤大文件下载)。
-#   全池皆死时最坏 ≈4s 收尾并如实返回 502, 而不是拖 12s 或(缺 tries 时)无限期。
+# ★ 为什么总预算是 4s —— 以及它**实际**覆盖了几个死节点 (2026-10-04 实测校正):
+#
+# `proxy_next_upstream_timeout` 只在"要不要再换一个节点"这个**决策点**被检查,
+# **不能中断进行中的那条腿**。所以真实上界是:
+#       实际耗时 ≈ (被试掉的腿数) × (单腿最坏耗时)
+# 而不是预算本身。原注释写的"4s 预算 + 1s 单次 ≈ 允许先试掉 2 个死节点"只在
+# "每条腿都 ≤ 1.5s"时成立, 属于把**下限当成了上界**。
+#
+# 本机实测 (nginx 1.31.4, 见 docs/design-principles-...md 的 W6):
+#   · 对**已关闭的回环端口**建连要约 **2.0s** 才返回 WSAECONNREFUSED
+#     (.NET TcpClient 裸测 5 次: 2014.8–2062.7 ms) —— 即单腿 2s 量级;
+#   · 两节点池 {不可用节点, 健康节点} 给 1s 预算 ⇒ 3 次里 **2 次返回 502,
+#     健康节点根本没被试到**; 给 4s ⇒ 3/3 成功;
+#   · 反向边界同样实测到: 预算 300ms 时实际 515–521ms (超 72%);
+#     单腿 3.0s + 预算 1s 时实际 3012–3016ms (**超 3 倍**)。
+#
+# ⇒ 按实测的 2s 单腿成本, **4s 预算只够试掉 1 个死节点再连健康节点**, 不是 2 个。
+#   这是"预算 ≥ 2 × 单腿最坏耗时"这条不变量在 2s 单腿下的**必然结果**:
+#   4s < 2 × 2s = 4s 的边界上, 第二个死节点就会吃掉全部余额。
+#   `_assert_budget_reaches_health_after_one_dead_leg()` (测试) 锁住这个关系,
+#   所以将来改预算或改单腿成本时会被立刻发现, 而不是继续留一句错的口径。
+#
+# 为什么**不**在这一批里直接调大预算: 调大是行为变更, 需要先实测"2 个死节点 +
+# 健康节点"下目标服务是否真的变好 (本项目已多次因未实测的配置改动翻车);
+# 而且探测层 (cdn_optimizer._suspect_status) 本来就负责把高失败节点提前剔除,
+# nginx 很少真的看到死节点 —— 先把这个口径改对, 再据实测定是否调值。
 #
 # ⚠ 为什么不顺手把 upstream 的 `fail_timeout` 从 5s 调大: 那是**另一笔权衡**
 #   (记忆时长 vs 重新学习的时效), 且 cdn_optimizer 里的 5s 有实测依据
@@ -69,6 +90,69 @@ SITE_GROUP_TITLES = {
 UPSTREAM_CONNECT_TIMEOUT = "1s"
 UPSTREAM_NEXT_TRIES = 4
 UPSTREAM_NEXT_TIMEOUT = "4s"
+
+# 单腿最坏耗时 (秒) —— 实测值, 不是猜的。
+# 本机对已关闭的回环端口建连约 2.0s 才返回失败; 真实公网死节点多为 SYN 超时,
+# 量级相近或更大。它是"预算能覆盖几个节点"这条推理的输入, 因此必须是个具名常量,
+# 而不是散在注释里的一个数字。
+UPSTREAM_SINGLE_LEG_WORST_SECONDS = 2.0
+
+# 预算至少要是单腿最坏耗时的这个倍数, 否则"重试"在数学上救不了任何东西
+# (第一条腿就把余额吃光, 健康兄弟节点根本没机会被访问)。
+UPSTREAM_BUDGET_MIN_LEG_MULTIPLE = 2
+
+
+def _parse_nginx_duration_seconds(s: str) -> float:
+    """把 nginx 时长字面量 (如 '1s' / '300ms' / '4s') 解析成秒
+
+    只支持本文件实际会写出的单位; 遇到不认识的写法返回 -1, 由调用方决定怎么处理
+    (不抛异常: 这个函数服务于"把配置口径核对正确", 不该在核对失败时把生成流程带崩)。
+    """
+    t = (s or "").strip().lower()
+    try:
+        if t.endswith("ms"):
+            return float(t[:-2]) / 1000.0
+        if t.endswith("s"):
+            return float(t[:-1])
+        if t.endswith("m"):
+            return float(t[:-1]) * 60.0
+    except ValueError:
+        return -1.0
+    return -1.0
+
+
+def upstream_budget_reaches_health_after(dead_legs: int) -> bool:
+    """在"先试掉 `dead_legs` 条死腿再连健康节点"的场景下, 预算是否还够用
+
+    这是把注释里的那套推理变成**可执行**的判据: 预算 >= (dead_legs + 1) × 单腿最坏耗时,
+    其中最后一项是健康节点的建连 (健康边缘实测 29~350ms, 但这里按单腿最坏算, 保守)。
+    """
+    budget = _parse_nginx_duration_seconds(UPSTREAM_NEXT_TIMEOUT)
+    if budget < 0:
+        return False
+    return budget >= (dead_legs + 1) * UPSTREAM_SINGLE_LEG_WORST_SECONDS
+
+
+def _assert_budget_reaches_health_after_one_dead_leg() -> None:
+    """把"4s 预算到底覆盖几个死节点"这个事实钉住 (2026-10-04)
+
+    实测口径见 UPSTREAM_NEXT_TIMEOUT 上方注释。这里**断言当前设计意图**:
+    至少要在"1 个死节点 + 健康节点"下仍然够用 —— 低于这一条, 重试机制等于没有。
+    若将来把预算调小或把单腿成本实测改大, 这里会明确失败并指向原因, 而不是
+    让配置悄悄退化成"第一条腿吃光预算 ⇒ 502"。
+
+    用显式 `raise` 而不是 `assert`: `python -O` 会**剥掉** assert 语句,
+    而这条校验的意义正是"不允许被静默跳过"。
+    """
+    if not upstream_budget_reaches_health_after(1):
+        raise ValueError(
+            f"预算 {UPSTREAM_NEXT_TIMEOUT} 连'1 个死节点 + 1 个健康节点'都覆盖不了 "
+            f"(单腿最坏按 {UPSTREAM_SINGLE_LEG_WORST_SECONDS}s 计): 重试在数学上救不了任何东西, "
+            f"失败会以 502 形式出现, 用户看到的是'服务坏了'而不是'这个节点不行'")
+
+
+# 导入期即校验: 配置口径错了就不该继续生成配置
+_assert_budget_reaches_health_after_one_dead_leg()
 
 
 def upstream_failover_lines(indent: str = "        ") -> List[str]:
