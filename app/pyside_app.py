@@ -5874,6 +5874,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return False, msg
         # 从现有 upstream-dynamic.conf 恢复 relay 端口映射 (上次会话的代理转发路由)
+        mapping: Dict[int, str] = {}
         try:
             from cdn_optimizer import CDNOptimizer
             opt = CDNOptimizer()
@@ -5885,6 +5886,30 @@ class MainWindow(QMainWindow):
                     relay_server.set_proxy_tunnels(mapping)
         except Exception:
             pass
+
+        # ★ 对账: 配置里写着用了某个 relay 端口, 而该端口实际没在听 (缺陷 D2, 2026-10-04)。
+        #
+        # 为什么必须在这里说: `_sync_tunnel_servers` 在端口被第三方占用时会**静默**
+        # 把该映射从 proxy_routes 里 pop 掉, 而 nginx 侧配置仍写着那个端口 ⇒ 表现为
+        # "某个站点神秘间歇 502", 且**下次启动还会从配置里把这条死映射重建出来**。
+        # 用户/支持人员拿不到任何线索。这里把差异如实打出来 —— 我们不擅自改 nginx 配置
+        # (那是生成器的职责), 但绝不让这个状态继续无人知晓。
+        if mapping:
+            deadline = time.time() + 2.0
+            # _sync_tunnel_servers 由 set_proxy_tunnels 投递到事件循环, 是异步的;
+            # 给它一点时间把端口绑完再对账 (端口绑定本身是毫秒级)。
+            while time.time() < deadline:
+                if set(relay_server.proxy_routes.keys()) >= set(mapping.keys()):
+                    break
+                time.sleep(0.05)
+            missing = sorted(set(mapping.keys()) - set(relay_server.proxy_routes.keys()))
+            if missing:
+                detail = ", ".join(f"{relay_server.proxy_routes.get(p) or mapping.get(p)}:{p}"
+                                   for p in missing)
+                print(f"[Relay] ⚠ 配置要求的 {len(missing)} 个代理转发端口没能监听 "
+                      f"(多被其它程序占用): {detail} —— 这些站点会 502; "
+                      f"nginx 配置里的 relay 端口映射已与实际不一致, 重新测速/应用可重建")
+                msg = f"{msg}; ⚠ {len(missing)} 个 relay 端口未能监听 ({detail}), 相关站点将 502"
         return True, msg
 
     def stop_acceleration(self, blocking: bool = False):
