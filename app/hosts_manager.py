@@ -246,7 +246,23 @@ class HostsManager:
             return False
 
     def remove_rules_from_content(self, text: str) -> str:
-        """从 hosts 文本中安全剥离 GameArt Toolkit / PixivToolkit 规则块，保持原有排版"""
+        """从 hosts 文本中安全剥离**本程序**的规则块，保持原有排版
+
+        ⚠ 只剥离我们能证明是自己的 (缺陷 D10, 2026-10-04):
+          · `BLOCK_START/END`   —— 当前格式;
+          · `LEGACY_BLOCK_START/END` —— 本程序改名前的格式 (`PixivToolkit Rules`, 可追溯到
+            初始提交 `85c8310`);
+          · `# Pixiv Start/End` —— 本程序**最早**的格式 (同样出自初始提交)。
+        这三者都是本程序自己的历史格式 (见 421/460 行的检测口径), 删它们是对的。
+
+        **原先还额外删除了别的东西**, 已移除:
+          · `# HuggingFace Start ... End` 块;
+          · 散落的 `127.0.0.1 ...huggingface.co` 行。
+        它们**不是本程序写的** —— 那是别的工具 (Steam++ / Watt Toolkit 一类的加速器)
+        留在用户 hosts 里的条目。趁自己退出顺手删掉别人的规则, 属于"干扰用户其它网络
+        服务": 用户可能还在用那个工具, 而且他无从知道是谁删的。
+        现在只**报告**不删除, 由用户自己决定 (见 `find_foreign_hosts_entries`)。
+        """
         pattern = re.compile(rf"{re.escape(BLOCK_START)}.*?{re.escape(BLOCK_END)}\r?\n?", re.DOTALL)
         text = pattern.sub("", text)
 
@@ -256,13 +272,43 @@ class HostsManager:
         legacy_pattern = re.compile(r"# Pixiv Start.*?# Pixiv End\r?\n?", re.DOTALL)
         text = legacy_pattern.sub("", text)
 
-        # 清理旧版 (参考项目/Steam++) 遗留的 HuggingFace 劫持块与散落条目
-        legacy_hf_pattern = re.compile(r"# HuggingFace Start.*?# HuggingFace End\r?\n?", re.DOTALL)
-        text = legacy_hf_pattern.sub("", text)
-        scatter_pattern = re.compile(r"(?m)^127\.0\.0\.1\s+(?:[\w-]+\.)*huggingface\.co\s*\r?\n?$")
-        text = scatter_pattern.sub("", text)
-
         return text.rstrip() + "\n"
+
+    def find_foreign_hosts_entries(self, text: Optional[str] = None) -> List[str]:
+        """找出 hosts 里**别的工具**留下的重定向条目 (只读, 供如实告知用户)
+
+        为什么需要 (缺陷 D10, 2026-10-04): 这些条目会把对应域名指向 127.0.0.1, 若
+        那个工具没在运行, 域名就解析失败 —— 用户会以为是我们弄坏的。但我们**无权**
+        替他删除别人的规则 (他可能还在用那个工具)。正确处置是**告诉他有这么回事**,
+        并说明是谁留下的 (按已知工具的块标记判断)。
+
+        返回可读的描述行 (空列表 = 没有发现)。
+        """
+        if text is None:
+            try:
+                text = self.hosts_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return []
+        found: List[str] = []
+        # 已知的第三方块标记 → 工具名 (保守: 只列能确认归属的)
+        known = {
+            "HuggingFace": "Steam++ / Watt Toolkit 一类加速工具",
+            "Steam++": "Steam++ / Watt Toolkit",
+            "Watt Toolkit": "Watt Toolkit",
+        }
+        for mark, tool in known.items():
+            if re.search(rf"#\s*{re.escape(mark)}\s+Start", text, re.IGNORECASE):
+                found.append(f"检测到 {tool} 留下的 hosts 规则块 (# {mark} Start/End)")
+        # 散落的 127.0.0.1 劫持行 (排除我们自己会写的形式: 我们写在块内, 已在上面剥离)
+        stripped = self.remove_rules_from_content(text)
+        scatter = re.findall(r"(?m)^127\.0\.0\.1\s+(\S+)\s*$", stripped)
+        # 只报告"知名加速器会劫持"的那类散落条目, 避免把用户自己的 hosts 条目也报上来
+        HUGE = ("huggingface.co",)
+        hits = sorted({h for h in scatter if any(h.endswith(d) or f".{d}" in h for d in HUGE)})
+        if hits:
+            found.append("检测到散落的 127.0.0.1 重定向条目 (非本程序写入): "
+                         + ", ".join(hits[:8]) + (" ..." if len(hits) > 8 else ""))
+        return found
 
     def _safe_write_hosts(self, content: str):
         """写入 hosts 文件，支持 Windows 原生属性修复与多重备份写入机制"""
@@ -548,6 +594,16 @@ class HostsManager:
                     if f"127.0.0.1 {kw}" in content and not has_ptk:
                         has_conflicts = True
                         issues.append(f"发现外部/旧版残留规则: {kw}")
+
+                # ★ 别的工具留下的条目: **只报告, 不删除** (缺陷 D10, 2026-10-04)。
+                #   原先 remove_rules_from_content 会顺手删掉 `# HuggingFace Start/End`
+                #   块与散落的 huggingface.co 行 —— 那不是我们写的, 用户可能还在用那个
+                #   工具, 而且他无从知道是谁删的。但我们有权提醒他: 那些条目会把域名
+                #   指向 127.0.0.1, 若那个工具没在运行就会解析失败, 而用户很可能以为是
+                #   我们弄坏的。所以在这里如实列出, 交给他自己决定。
+                for _desc in self.find_foreign_hosts_entries(content):
+                    if _desc not in issues:
+                        issues.append(_desc + "（本程序不会替你删除，请自行确认是否还需要）")
         except Exception as e:
             issues.append(f"分析文件内容异常: {e}")
 
