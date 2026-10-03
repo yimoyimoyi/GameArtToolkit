@@ -109,8 +109,25 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def elevate_relaunch(*args, **kwargs) -> bool:
-    """唤起 Windows UAC 提示框并以管理员权限重新启动自身 (兼容 PyInstaller 打包与 Python 脚本环境)"""
+def elevate_relaunch(*args, cleanup=None, **kwargs) -> bool:
+    """唤起 Windows UAC 提示框并以管理员权限重新启动自身 (兼容 PyInstaller 打包与 Python 脚本环境)
+
+    ⚠ 本函数结束时会 `os._exit(0)` —— 它**跳过所有 atexit / Qt 退出清理**
+    (缺陷 D9, 2026-10-04)。若此刻我们已经写过 hosts / NRPT / 系统代理或起过 nginx,
+    那些状态会原样留给正在爬起来的提权实例去猜 —— 而它只能靠 `cleanup_orphans`
+    的"残留 = 上次没干净退出"启发式来收拾。
+
+    因此调用方**应当**传 `cleanup=<清理函数>`: 本函数会在提权进程**已经成功拉起之后**、
+    在 `os._exit(0)` **之前**同步执行它。顺序是刻意的 —— 太早会在 UAC 被拒时把用户
+    正在用的加速拆掉, 而用户其实还留在原进程里继续用。
+
+    清理里必须包含"先停 nginx"这一类动作, 否则本进程退出后 nginx 会按
+    CREATE_BREAKAWAY_FROM_JOB 的设计存活, 而 hosts 已被清掉 ⇒ 域名指向无人监听的
+    本机端口。这正是 `emergency_fast_cleanup` 的顺序 (先撤重定向再停数据平面)。
+
+    `cleanup` 默认 None 是为了不改变既有调用点 (它们经 Qt 信号调用, 无法传参);
+    测试与非 GUI 调用方可以直接传。
+    """
     import os
     import sys
     from pathlib import Path
@@ -139,6 +156,13 @@ def elevate_relaunch(*args, **kwargs) -> bool:
         None, "runas", exe_path, param_str, work_dir, 1
     )
     if ret > 32:
+        # ★ 提权进程已成功拉起 ⇒ 现在轮到我们把本进程留下的系统状态收干净 (缺陷 D9)。
+        #   放在 os._exit 之前, 且**只在此处**(拉不起来时不能清, 见 docstring)。
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception as e:
+                print(f"[Elevate] 提权前清理失败 (继续退出): {type(e).__name__}: {e}")
         try:
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()

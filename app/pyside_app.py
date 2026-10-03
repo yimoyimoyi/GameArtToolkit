@@ -1546,7 +1546,10 @@ class MainWindow(QMainWindow):
         self.btn_sidebar_admin.setIconSize(QSize(14, 14))
         self.btn_sidebar_admin.setProperty("class", "MDBtnTonal")
         self.btn_sidebar_admin.setStyleSheet("font-size: 11px; padding: 6px 10px; border-radius: 8px;")
-        self.btn_sidebar_admin.clicked.connect(elevate_relaunch)
+        # 提权按钮: 传 cleanup 让它在 os._exit(0) 之前把系统状态收干净 (缺陷 D9)。
+        # 不传的话, 本进程留下的 hosts / NRPT / 系统代理会原样留给提权实例去猜。
+        self.btn_sidebar_admin.clicked.connect(
+            lambda: elevate_relaunch(cleanup=emergency_fast_cleanup))
         sidebar_layout.addWidget(self.btn_sidebar_admin)
 
         body_layout.addWidget(sidebar)
@@ -5713,13 +5716,15 @@ class MainWindow(QMainWindow):
             if not result.get("prompted"):
                 if show_toast_on_fail:
                     show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
-                               duration=6000, action_text="提权", on_action=elevate_relaunch)
+                               duration=6000, action_text="提权",
+                               on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup))
                 else:
                     self.notify_tray("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。",
                                      QSystemTrayIcon.Warning, 3000)
             elif show_toast_on_fail:
                 show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
-                           duration=6000, action_text="提权", on_action=elevate_relaunch)
+                           duration=6000, action_text="提权",
+                               on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup))
             return
         if stage == "nginx_fail":
             if show_toast_on_fail:
