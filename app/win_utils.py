@@ -6,6 +6,12 @@ GameArt Toolkit - Windows 原生 API 工具集 (进程与端口探测)
 import os
 import socket
 import ctypes
+# `time` 在 kill_process_by_pid_safe 里用于"终止后等待 150ms 再复查"。
+# ⚠ 它此前**没有被导入**, 而该处又被 try/except 包着 ⇒ 那两个 `time.sleep` 一执行就
+#   抛 NameError 并被吞掉, 于是"结束进程"这条路径**从未真正跑过第二步**, 表现为
+#   按钮点了没反应/报"操作异常"(2026-10-04 由 tests/test_process_kill_guard.py 抓到)。
+#   教训: 宽 except 会把"我写漏了一个 import"变成一条用户可见的失败。
+import time
 from ctypes import wintypes
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -886,22 +892,105 @@ def get_critical_ports_status(ports: Optional[List[int]] = None) -> List[Dict[st
     return statuses
 
 
+# ==================== 系统关键进程闸门 (2026-10-04, 缺陷 W8) ====================
+# 为什么需要: UI 的"结束进程"按钮直接调 kill_process_by_pid_safe, 而它原先的守卫
+# **只有两条** —— PID ≤ 0、以及"不是我自己"。用户点一下就能终止:
+#   · PID 4 (System) —— 内核态驱动的宿主, 其中包含 http.sys (80/443 的常客);
+#   · System32 / SysWow64 下的任何系统组件;
+#   · 用户自己的 IIS / Docker / mihomo / 企业 VPN/EDR。
+# 触发概率不高, 但性质是"程序擅自终止系统组件", 且**不可逆**。
+#
+# 判据口径 (与其照抄一份"危险名单", 不如定一条保守规则):
+#   · PID 0 / 4 直接判关键;
+#   · 镜像路径落在 \windows\system32\ 或 \windows\syswow64\ 下, 且**不是我们自己**
+#     —— 判关键。这条覆盖了绝大多数系统组件, 且不需要维护名单;
+#   · **读不到镜像路径时判关键**。这是刻意的取舍, 与 emergency_fast_cleanup 的
+#     "路径读不到就照杀"**方向相反**, 因为两者代价不同:
+#       清理孤儿 worker 漏杀的代价 = 端口被占 + 永远无法 reload;
+#       误杀系统进程的代价   = 不可逆的系统级破坏。
+#     两害相权, 用户可见的操作路径上必须选"宁可漏杀"。
+_OWN_IMAGE_PATHS_CACHE: List[str] = []
+
+
+def _own_image_paths() -> List[str]:
+    """本项目自己的可执行文件路径 (nginx / 隧道等), 用于把"自家镜像"排除在关键进程之外"""
+    if _OWN_IMAGE_PATHS_CACHE:
+        return _OWN_IMAGE_PATHS_CACHE
+    import sys as _sys
+    from pathlib import Path as _Path
+    cands = []
+    try:
+        if getattr(_sys, "frozen", False):
+            cands.append(_sys.executable)
+        else:
+            cands.append(_sys.executable)
+        # 自带二进制: 与 path_utils 的口径一致, 相对项目根
+        root = _Path(__file__).resolve().parent.parent
+        cands += [str(root / "nginx" / "nginx.exe"),
+                  str(root / "tools" / "ech_tunnel" / "ech-tunnel.exe")]
+    except Exception:
+        pass
+    for c in cands:
+        try:
+            if c:
+                _OWN_IMAGE_PATHS_CACHE.append(_normalize_image_path(str(c)))
+        except Exception:
+            continue
+    return _OWN_IMAGE_PATHS_CACHE
+
+
+def is_system_critical_pid(pid: int) -> Tuple[bool, str]:
+    """该 PID 是否属于"绝不能由我们终止"的系统关键进程; 返回 (是否关键, 原因)
+
+    保守方向: **取不到证据时判为关键**。见上方模块注释里对两种代价的对比。
+    """
+    if pid <= 0:
+        return True, "无效或保留的 PID"
+    if pid in (0, 4):
+        return True, f"PID {pid} 是系统保留进程 (System/Idle), 其中包含 http.sys 等内核驱动宿主"
+    try:
+        img = query_process_image_path(pid)
+    except Exception:
+        img = ""
+    if not img:
+        return True, "无法读取镜像路径 (权限不足或已退出) —— 保守判为系统关键, 不终止"
+    norm = _normalize_image_path(img)
+    if norm in _own_image_paths():
+        return False, ""
+    low = norm.replace("/", "\\")
+    if "\\windows\\system32\\" in low or "\\windows\\syswow64\\" in low:
+        return True, f"镜像位于系统目录, 属系统组件: {img}"
+    return False, ""
+
+
 def kill_process_by_pid_safe(pid: int) -> Tuple[bool, str]:
-    """安全终止指定 PID 进程，返回 (是否成功, 说明文字)"""
+    """安全终止指定 PID 进程，返回 (是否成功, 说明文字)
+
+    ⚠ 这是**用户可见操作**的路径 (UI 的"结束进程"按钮)。系统关键进程一律拒绝,
+    并如实说明原因 —— 不提供"仍要终止"的静默通道 (缺陷 W8, 2026-10-04)。
+    """
     import os
     if pid <= 0:
         return False, "无效的进程 PID"
     if pid == os.getpid():
         return False, "无法终止当前客户端自身进程"
 
+    # ★ 系统关键进程闸门
+    critical, why = is_system_critical_pid(pid)
+    if critical:
+        return False, f"已拒绝终止 (PID: {pid}): {why}"
+
     try:
         # 1. 尝试快速终止
         fast_terminate_pid(pid)
         # 等待 150ms 确认
         time.sleep(0.15)
-        if not is_process_running(pid):
+        # ⚠ is_process_running(pid) 在本文件里是把入参当**进程名**比的 (见其 docstring),
+        #   传 PID 进去永远匹配不到任何进程名 ⇒ 恒为 False ⇒ 这里会**假报成功**。
+        #   本函数原先就踩了这个坑 ("结束进程"看起来成功、实际没杀掉)。改用按 PID 判定。
+        if not _is_pid_alive(pid):
             return True, f"已成功释放进程 (PID: {pid})"
-    except Exception as e:
+    except Exception:
         pass
 
     # 2. 尝试使用 taskkill /F /T
@@ -912,12 +1001,36 @@ def kill_process_by_pid_safe(pid: int) -> Tuple[bool, str]:
         si.wShowWindow = 0
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], startupinfo=si, capture_output=True)
         time.sleep(0.15)
-        if not is_process_running(pid):
+        if not _is_pid_alive(pid):
             return True, f"已成功结束进程 (PID: {pid})"
         else:
             return False, f"结束进程失败，可能需要管理员权限或系统核心保护 (PID: {pid})"
     except Exception as e:
         return False, f"操作异常: {e}"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """按 **PID** 判定进程是否仍存活 (与按名字匹配的 is_process_running 区分开)
+
+    为什么必须另写一个: 原 `is_process_running(pid)` 直接把入参当进程名去比对,
+    传 PID 进去恒为 False ⇒ 所有"是否已结束"的判定都假报成功。
+    """
+    if pid <= 0:
+        return False
+    try:
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                STILL_ACTIVE = 259
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return False
 
 
 
