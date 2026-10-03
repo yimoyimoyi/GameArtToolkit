@@ -118,20 +118,38 @@ class EchTunnelManager:
     LOG_MARK_DOH_ALL_FAILED = "全部 DoH 端点查询失败"
 
     def config_freshness(self, tail_lines: int = 500) -> Dict:
-        """从隧道日志派生 ECHConfig 新鲜度 (只读; 日志缺失/不可读时如实返回 unknown)"""
+        """从隧道日志派生 ECHConfig 新鲜度 (只读; 日志缺失/不可读时如实返回 unknown)
+
+        ★ 只读文件尾部, 不整读 (2026-10-04): 这份日志是**追加写、不轮转**的,
+        而这个函数会被 UI 渲染与状态刷新反复调用。整读一个无限增长的日志, 代价
+        会随运行时长线性上升 —— 属于"越跑越慢"的缺陷形态。按字节从尾部取一段
+        再切行, 代价就有界了。
+        """
         out: Dict = {"known": False, "last_update": None, "last_doh_failure": None,
                      "using_builtin_guess": None, "note": ""}
         try:
             if not LOG_FILE.exists():
                 out["note"] = f"日志不存在: {LOG_FILE}"
                 return out
-            lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail_lines = max(1, int(tail_lines))
+            # 每行约 100~200 字节; 取 tail_lines 的若干倍足够覆盖, 且设 1MB 上限。
+            want_bytes = min(1_048_576, max(64_1024, tail_lines * 512))
+            with open(LOG_FILE, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                start = max(0, size - want_bytes)
+                fh.seek(start)
+                blob = fh.read()
+            if start > 0:
+                # 我们是从中间切进去的, 第一行几乎肯定是半行 —— 丢掉它。
+                blob = blob.split(b"\n", 1)[-1]
+            lines = blob.decode("utf-8", "replace").splitlines()[-tail_lines:]
         except Exception as e:
             out["note"] = f"日志读取失败: {type(e).__name__}"
             return out
 
         stamp = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
-        for ln in lines[-max(1, int(tail_lines)):]:
+        for ln in lines:
             if self.LOG_MARK_UPDATED in ln:
                 m = stamp.match(ln)
                 out["last_update"] = m.group(1) if m else "(有更新, 无时间戳)"
@@ -358,6 +376,40 @@ def _state_signature(domains: List[str],
     }, ensure_ascii=False, sort_keys=True)
 
 
+def normalize_ech_allow_entry(entry) -> str:
+    """把一个白名单条目规范化为 Go 侧能真正匹配到的形式 (缺陷 W3, 2026-10-04)
+
+    Go 侧的匹配 (`main.go` 的 `Tunnel.allowed`) 是::
+
+        host == suffix || strings.HasSuffix(host, "." + suffix)
+
+    因此 `suffix` 只能是**裸主机名**:
+      · `booth.pm`    -> 匹配 `booth.pm` 与 `<任意>.booth.pm`  ✅ 这就是"子树"
+      · `*.booth.pm`  -> 两者都不成立(既不相等, 也不以 `.*.booth.pm` 结尾)  ❌ 永远不匹配
+
+    所以 `*.x` 必须转成裸 `x`。这是**语义等价**变换而非放宽: 前缀 `*.` 想表达的
+    "整棵子树"正是裸后缀在后缀匹配下已经具有的含义。
+
+    与 `nrpt_manager.build_namespace_entries` 剥 `*.` 是同一个修法、同一个理由 ——
+    NRPT 的 `.x` 后缀语义同理。两处都必须保持"校验/匹配对象是剥离后的裸域名"。
+
+    非字符串、空串一律返回空串(由调用方丢弃), 避免把一个畸形条目送进白名单,
+    因为白名单是**逐字节**比较的, 一个畸形条目只会静默地永不匹配。
+    """
+    if not isinstance(entry, str):
+        return ""
+    s = entry.strip().lower().rstrip(".")
+    if s.startswith("*."):
+        s = s[2:]
+    elif s == "*":
+        # 裸 `*` 没有可用的后缀语义; 放行它等于把隧道变成开放代理, 直接丢弃。
+        return ""
+    # NRPT 风格的前导点 (`.x`) 同样是"整棵子树"的意思 —— 与 runner 侧
+    # normalizeAllowEntry 保持同一口径, 否则两个入口会对同一个写法给出不同结果。
+    s = s.lstrip(".")
+    return s
+
+
 def build_ech_targets(profiles, allow_fn=None) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     """聚合 ECH 隧道的 (域名白名单, 全局 IP 池, 每主机 IP 池) —— **纯函数**, 便于单测
 
@@ -366,6 +418,14 @@ def build_ech_targets(profiles, allow_fn=None) -> Tuple[List[str], List[str], Di
       · 受控分组 (如 adult) 未被放开时, 该分组的画像**不进白名单** ——
         总闸的语义是"这些服务不许生效", 而白名单是"允许隧道转发到哪些目标"的前置面,
         把默认关闭的成人域名预先放进去与闸门语义矛盾;
+      · **通配必须转成裸后缀** (2026-10-04 定因, 缺陷 W3): 画像里写的是 `*.booth.pm`,
+        而 Go 侧的匹配是 `host == suffix || HasSuffix(host, "."+suffix)` ——
+        字面 `*.booth.pm` **永远匹配不到** `accounts.booth.pm`(既不相等, 也不以
+        `.*.booth.pm` 结尾) ⇒ 隧道对任意 booth 子域回 403。
+        而 `*.x` 与裸 `x` 在 Go 的后缀语义下**本来就是同一件事**, 故剥离是语义等价
+        变换, 不是放宽: 裸 `booth.pm` 同时覆盖 apex 与所有子域。
+        这正是"声明覆盖了但实际必然失败"的形态, 与 nrpt_manager 的
+        `build_namespace_entries` 剥 `*.` 是同一个修法、同一个理由;
       · 两个 IP 列表都**只保留 Cloudflare 网段内的地址** (见 CLOUDFLARE_V4_CIDRS 注释:
         非 CF 地址能建 TCP 但必然 ECH 握手失败, 而隧道只在 TCP 失败时换 IP ⇒ 直接 502);
       · **每主机池**取该画像 domains -> candidate_ips 的映射: 对权威解析不是 CF 的主机
@@ -385,15 +445,19 @@ def build_ech_targets(profiles, allow_fn=None) -> Tuple[List[str], List[str], Di
                     continue
             except Exception:
                 continue
-        p_domains = list(getattr(p, "domains", ()) or ())
+        # ★ 剥掉 `*.`: Go 侧的后缀匹配已覆盖整个子树, 字面通配反而一条都匹配不上。
+        #   顺手小写 —— 白名单是逐字节比较的, 大小写不一致同样等于不匹配。
+        p_domains = [normalize_ech_allow_entry(d)
+                     for d in (getattr(p, "domains", ()) or ())]
+        p_domains = [d for d in p_domains if d]
         # 只收 CF 网段内的候选: 非 CF 地址进池等于"第一个地址打死整条链路" (见上)
         p_ips = [ip for ip in (getattr(p, "candidate_ips", ()) or ()) if is_cloudflare_ip(ip)]
         domains.extend(p_domains)
         ip_pool.extend(p_ips)
         for d in p_domains:
             if p_ips:
-                host_ip_pool.setdefault(str(d).lower(), [])
+                host_ip_pool.setdefault(d, [])
                 for ip in p_ips:
-                    if ip not in host_ip_pool[str(d).lower()]:
-                        host_ip_pool[str(d).lower()].append(ip)
+                    if ip not in host_ip_pool[d]:
+                        host_ip_pool[d].append(ip)
     return (list(dict.fromkeys(domains)), list(dict.fromkeys(ip_pool)), host_ip_pool)

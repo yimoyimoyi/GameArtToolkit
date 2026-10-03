@@ -77,11 +77,14 @@ func NewTunnel(ech *ECHConfigManager, resolver *Resolver, domains []string) *Tun
 		t.allowAll = true
 	}
 	for _, d := range domains {
-		d = strings.ToLower(strings.TrimSpace(d))
+		d = normalizeAllowEntry(d)
 		if d != "" {
 			t.allow = append(t.allow, d)
 		}
 	}
+	// 给了域名却一个都没活下来 = 零覆盖。这不是"不限制", 而是"每个请求都 403",
+	// 两者后果相反, 所以必须以 allowAll=false + 空 allow 收场(全部拒绝),
+	// 绝不能因为 allow 为空就退回 allowAll —— 那会把一个配置错误变成开放代理。
 	return t
 }
 
@@ -95,6 +98,34 @@ func (t *Tunnel) allowed(host string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeAllowEntry 把 `-domains` 里的一个条目规范化成后缀匹配能用的形式。
+//
+// 为什么需要 (缺陷 W3, 2026-10-04): 匹配规则是
+// `host == suffix || HasSuffix(host, "."+suffix)`, 所以 `suffix` 必须是**裸主机名**。
+// 字面 `*.booth.pm` 既不等于 `accounts.booth.pm`, 也不以 `.*.booth.pm` 结尾 ⇒
+// **永远不匹配** —— 症状是"服务声明覆盖了该子域, 但隧道对每一个子域都回 403"。
+//
+// `*.x` 与裸 `x` 在本匹配规则下是同一件事, 所以剥离是语义等价变换。
+// Python 侧 (app/ech_tunnel.py 的 normalize_ech_allow_entry) 已经这么做; 这里再兜一层,
+// 是为了让**手工加的参数**或将来别的调用方也不会静默失效 —— 白名单失效是静默的,
+// 不会报错, 只会 403。
+func normalizeAllowEntry(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSuffix(s, ".")
+	// 前导点写法 (`.x`, NRPT 风格) 同样按裸后缀处理。
+	s = strings.TrimPrefix(s, ".")
+	if strings.HasPrefix(s, "*.") {
+		s = s[2:]
+	}
+	// 裸 `*` 没有后缀语义: 匹配规则是 `host == "*" || HasSuffix(host, ".*")`,
+	// 而合法主机名不含 `*`, 所以它既不匹配任何东西、又"看起来像放行"。
+	// 收敛成空串由调用方丢弃 —— 与 Python 侧 normalize_ech_allow_entry 同一口径。
+	if s == "*" {
+		return ""
+	}
+	return s
 }
 
 func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +218,16 @@ func (t *Tunnel) buildProxy(host string, echCfg []byte) *httputil.ReverseProxy {
 		// 这里必须保持一致, 否则流式响应(SSE/长轮询)会被卡住。
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[err] %s%s: %v", host, r.URL.Path, err)
+			// 只记 host, 不记 r.URL.Path。
+			//
+			// 为什么: 请求行里的路径与查询串可能带 API key / 会话 token / 单次
+			// 签名, 而这是一份**追加写、不轮转**的本地日志。项目在 nginx 侧已经
+			// 因为同一个原因做了处理 (access_log off, 实测旧实例的 access.log
+			// 曾达 183.9 MB 且记录解密后的完整请求行)。隧道这一跳承载的是同一批
+			// 流量, 没有理由把同样的东西再写一遍。
+			// host 已经由白名单限定 (else 分支根本走不到这里), 所以它不构成新的
+			// 隐私面; 排查"哪个域名在失败"也只需要它。
+			log.Printf("[err] %s: %v", host, err)
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}

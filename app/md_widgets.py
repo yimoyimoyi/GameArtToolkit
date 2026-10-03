@@ -1384,19 +1384,32 @@ class LatencyBadge(QWidget):
         self.via_proxy = False
         self.ech = False
         self.ech_ok = True
+        # 第三态: 隧道在跑但 ECHConfig 可疑 (见 set_latency docstring 的三态说明)
+        self.ech_degraded = False
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
         ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
 
     def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False,
-                    ech: bool = False, ech_ok: bool = True):
+                    ech: bool = False, ech_ok: bool = True, ech_degraded: bool = False):
         """ech=True 时展示 ECH 隧道状态: 该链路走加密 SNI 直连, 不依赖候选节点探测。
-        ech_ok=False 表示隧道未就绪 (此时已回退常规直连)。"""
+
+        三态是刻意的, 不能压成两态 (2026-10-04, 缺陷 W2):
+          · ech_ok=True,  ech_degraded=False -> "ECH 直连"      (隧道在, 配置新鲜)
+          · ech_ok=True,  ech_degraded=True  -> "ECH 配置可疑"  (进程/端口都在, 但
+                                                    ECHConfig 疑似仍在吃内置兜底)
+          · ech_ok=False                     -> "ECH 未就绪"    (已回退常规直连)
+
+        中间那一态为什么必须有: "DoH 被阻断 + 内置兜底过期"时隧道**进程健康、端口在听**,
+        却每个请求都失败。把它显示成绿色的"ECH 直连"就是本项目最忌讳的假可用;
+        而显示成红色的"未就绪"也不对 —— 它确实在跑, 只是大概率不可用。
+        """
         self.latency_ms = ms
         self.is_star = is_star
         self.via_proxy = via_proxy
         self.ech = ech
         self.ech_ok = ech_ok
+        self.ech_degraded = bool(ech_degraded) and bool(ech_ok)
         if ech:
             self.setMinimumWidth(96)
             self.setMaximumWidth(112)
@@ -1417,7 +1430,16 @@ class LatencyBadge(QWidget):
 
         palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
-        if self.ech and self.ech_ok:
+        if self.ech and self.ech_ok and self.ech_degraded:
+            # 中间态: 隧道在跑, 但 ECHConfig 疑似仍在吃内置兜底(DoH 全线失败 + 从未刷新)。
+            # 用琥珀色而不是红色: 红色代表"未就绪/已回退", 会让用户去重启一个其实在跑的
+            # 进程; 真正该做的是查 DoH 可达性。文案必须点明"可能不可用"。
+            bg_color = QColor("rgba(245, 158, 11, 0.16)") if is_dark else QColor("#FFFBEB")
+            border_color = QColor("#F59E0B") if is_dark else QColor("#FCD34D")
+            text_color = QColor("#FCD34D") if is_dark else QColor("#B45309")
+            dot_color = QColor("#F59E0B")
+            txt = "ECH 配置可疑"
+        elif self.ech and self.ech_ok:
             # ECH 隧道: 走的是加密 SNI 的直连通道, 与"某节点的延迟"不是同一维度,
             # 且探测层复现不了该路径。用独立的靛蓝色系与"ECH 直连"文案,
             # 避免被误读成超时/失败 —— 那与实际可用的事实相反。

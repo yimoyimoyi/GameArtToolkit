@@ -3050,7 +3050,18 @@ class MainWindow(QMainWindow):
         if is_ech_service(sid):
             from ech_tunnel import ech_tunnel
 
-            self.service_badges[sid].set_latency(0, ech=True, ech_ok=ech_tunnel.is_healthy())
+            # 用功能健康度而不是 is_healthy 来解码三态 (缺陷 W2, 2026-10-04):
+            #   ok=True                     -> "ECH 直连"     (隧道在, 配置新鲜)
+            #   ok=False 但 is_healthy=True -> "ECH 配置可疑" (进程/端口都在, 但
+            #                                  ECHConfig 疑似仍在吃内置兜底 ⇒ 请求会失败)
+            #   ok=False 且 is_healthy=False-> "ECH 未就绪"   (已回退常规直连)
+            # 只读一次 status(): is_functionally_healthy() 内部已经算过 config_freshness(),
+            # 重复调用会重复读日志文件。
+            st = ech_tunnel.status()
+            ok = bool(st.get("functionally_healthy"))
+            self.service_badges[sid].set_latency(
+                0, ech=True, ech_ok=ok,
+                ech_degraded=not ok and bool(st.get("healthy")))
         else:
             self.service_badges[sid].set_latency(latency, is_star=is_star, via_proxy=via_proxy)
 
@@ -3065,6 +3076,11 @@ class MainWindow(QMainWindow):
         is_dark = ThemeManager.get_instance().is_dark
         st = ech_tunnel.status()
         healthy = st["healthy"]
+        # 三态 (缺陷 W2, 2026-10-04): "进程/端口都在"不等于"能工作"。
+        # 已识别但未接线的那个状态就在这里接上 —— config_freshness() 早就写好了。
+        functional = bool(st.get("functionally_healthy"))
+        degraded = healthy and not functional
+        cfg_note = (st.get("ech_config") or {}).get("note") or ""
 
         card = QFrame()
         card.setProperty("class", "MDCard")
@@ -3074,8 +3090,14 @@ class MainWindow(QMainWindow):
         card_l.setSpacing(10)
 
         card_top = QHBoxLayout()
-        # 标题跟随实际状态: 隧道未就绪时不能仍宣称"经 ECH 直连"
-        suffix = "经 ECH 隧道直连" if healthy else "ECH 隧道未就绪"
+        # 标题跟随实际状态: 三态各有各的话, 不能压成"就绪/未就绪"两态。
+        # 中间态最要紧 —— 它以前会显示成绿色的"经 ECH 直连"。
+        if not healthy:
+            suffix = "ECH 隧道未就绪"
+        elif degraded:
+            suffix = "ECH 隧道在跑 · 配置可疑"
+        else:
+            suffix = "经 ECH 隧道直连"
         lbl_title = QLabel(f"{name} ({suffix})")
         lbl_title.setProperty("class", "CategoryTitle")
         lbl_title.setWordWrap(True)
@@ -3092,10 +3114,15 @@ class MainWindow(QMainWindow):
         card_top.addWidget(btn_single)
         card_l.addLayout(card_top)
 
-        # 状态行: 隧道健康度
-        if healthy:
+        # 状态行: 隧道健康度 (三态)
+        if healthy and not degraded:
             dot, text_c = ("#10B981" if is_dark else "#059669"), ("#34D399" if is_dark else "#059669")
             status_txt = f"隧道运行中 · 127.0.0.1:{st['port']}"
+        elif degraded:
+            # 进程与端口都在, 但 ECHConfig 疑似仍在吃内置兜底 ⇒ 请求大概率失败。
+            # 用琥珀色并说明原因, 而不是让用户看到一条绿色的"运行中"。
+            dot, text_c = ("#F59E0B" if is_dark else "#B45309"), ("#FCD34D" if is_dark else "#B45309")
+            status_txt = "隧道进程在跑, 但 ECHConfig 可能已失效"
         else:
             dot, text_c = ("#EF4444" if is_dark else "#DC2626"), ("#F87171" if is_dark else "#DC2626")
             status_txt = "隧道未就绪 · 已回退常规直连"
@@ -3111,6 +3138,16 @@ class MainWindow(QMainWindow):
         row.addWidget(lbl_status)
         row.addStretch()
         card_l.addLayout(row)
+
+        # 可疑态的成因行: 把 config_freshness() 的结论如实呈现 —— 只说"可疑"而不说
+        # 为什么可疑, 用户唯一能做的就是重启一个其实在跑的进程。这里的 note 直接
+        # 告诉他是"自启动以来未见成功刷新"(即 DoH 拿不到配置、在用 2026-09-23 的内置兜底)。
+        if degraded and cfg_note:
+            lbl_cfg = QLabel(f"↳ {cfg_note}")
+            lbl_cfg.setProperty("class", "ItemDesc")
+            lbl_cfg.setWordWrap(True)
+            lbl_cfg.setStyleSheet(f"color: {text_c}; font-size: 11px;")
+            card_l.addWidget(lbl_cfg)
 
         # 说明行: 解释为何不列节点延迟
         cand_n = len(CANDIDATE_IPS.get(sid, []))
