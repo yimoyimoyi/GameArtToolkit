@@ -1711,6 +1711,276 @@ PROFILES: List[ServiceProfile] = [
         candidate_ips=["104.21.95.170", "172.67.146.57", "104.18.42.239"],
         enable_cache=False,         # 大二进制先不落盘: 避免 zip/mp4 挤掉共享缓存区里的图缓存
     ),
+
+    # ==========================================================================
+    # 服务补充计划 · 批次 1（2026-10-04 落地）
+    #
+    # 来源: docs/service-expansion-feasibility-2026-10-03.md 第四节 Profile 草案
+    #      （该文档带 2026-10-03 的实测证据: 状态码 / 字节数 / 标题 / 3-3 次）
+    # 复核: docs/service-expansion-review-2026-10-03.md（18 个草案里 4 个依赖不存在的
+    #      机制、2 个分类错误；其要求的"批次 0 门槛"已在 §七 落地）
+    #
+    # 本轮(2026-10-04)实际复核了**候选地址是否仍然可用**（只读: TLS/TCP 与 CF 网段判定）,
+    # 结论写在各画像里。**未**重跑内容级验证（标题/字节数）—— 那是草案 2026-10-03 的
+    # 证据, 本轮沿用并在每条里标明来源, 不把"地址可达"冒称"内容可用"。
+    #
+    # 分组决策: 草案写的是 `group="acg"`, 但**复核报告 §六.1 与既有先例 (pawchive) 都把
+    #   成人平台放进受控分组 `adult`**: 该分组默认隐藏、且默认不可启用, 需在设置里显式
+    #   开启。按"安全与合规优先"的次序, 这里沿用 `adult`（如需改回 acg, 只改 group 一行,
+    #   但会立刻让这些站点出现在默认可见的二次元分组里）。
+    # ==========================================================================
+
+    # E-Hentai 全家: CF 托管 + 明文 SNI 被 RST ⇒ 只能走 ECH 隧道
+    ServiceProfile(
+        id="ehentai",
+        group="adult",
+        name="E-Hentai 图库",
+        desc="E-Hentai/ExHentai 图库与上传站 (Cloudflare 托管, 经本地 ECH 隧道绕开明文 SNI 阻断)",
+        # ⚠ 不含 forums.e-hentai.org: 实测 CF **托管挑战** 403 (cf-mitigated: challenge) 3/3,
+        #   挑战一旦出现即不可解, 登记它等于登记一个必然失败的域名。
+        domains=["e-hentai.org", "www.e-hentai.org", "repo.e-hentai.org",
+                 "upld.e-hentai.org", "exhentai.org", "ehwiki.org", "hentaiverse.org"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_ehentai",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",       # 仅"隧道不健康"的退化分支取值 (与 pixiv_web/discord 同款)
+        # 2026-10-03 实测: e-hentai.org / 200 · 60,751B 标题 "E-Hentai Galleries …" (3/3);
+        #                  repo/upld 301 (3/3); exhentai 302 → forums…/remoteapi.php (无 cookie 正常表现)
+        # 2026-10-04 复核: 6 个候选地址**全部**落在 CF 网段且 443 可达;
+        #                  而系统解析给出 199.59.x / 31.13.x 一类投毒值 ⇒ 必须靠静态池
+        candidate_ips=["104.18.42.239", "172.64.145.17", "104.18.10.118",
+                       "104.21.56.202", "172.67.187.219", "172.66.140.62"],
+    ),
+    # nhentai 主站 (CF ⇒ ECH)
+    ServiceProfile(
+        id="nhentai",
+        group="adult",
+        name="nhentai 本子库",
+        desc="nhentai 主站 (Cloudflare 托管, 经本地 ECH 隧道)",
+        domains=["nhentai.net", "www.nhentai.net"],
+        icon="book",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_nhentai",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # ⚠ 图床 i/t.nhentai.net **不并进本画像**: 实测它们经 ECH 会得到 520 (CF 回源错误),
+        #   两者后端行为不同, 合池必错配 (草案也把这条列为"必须拆画像的反例")。
+        # 2026-10-03 实测: / 200 · 44,035B 标题 "nhentai: hentai doujinshi and manga" (3/3)
+        # 2026-10-04 复核: 3 个候选全在 CF 网段且可达
+        candidate_ips=["104.26.4.188", "104.26.5.188", "172.67.74.203"],
+    ),
+    # FurAffinity (CF ⇒ ECH)
+    ServiceProfile(
+        id="furaffinity",
+        group="adult",
+        name="FurAffinity 兽圈创作社区",
+        desc="FurAffinity 主站与作品图床 (Cloudflare 托管, 经本地 ECH 隧道)",
+        domains=["furaffinity.net", "www.furaffinity.net", "d.furaffinity.net"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_furaffinity",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # 2026-10-03 实测: www 200 · 129,706B (3/3); d.* (图床) 200 (3/3)
+        # 2026-10-04 复核: 2 个候选全在 CF 网段且可达; 系统解析给 199.59.x (投毒)
+        candidate_ips=["104.20.18.254", "172.66.163.196"],
+        enable_cache=True,          # 静态图片, 值得本地落盘
+    ),
+    # DLsite 商店 (CF ⇒ ECH)
+    ServiceProfile(
+        id="dlsite",
+        group="adult",
+        name="DLsite 同人商店",
+        desc="DLsite 商店与图片 CDN (Cloudflare 托管, 经本地 ECH 隧道)",
+        # ⚠ 不含 play.dlsite.com: 播放器是 AWS 源站且要**掩护 SNI**, 通道性质完全不同 ⇒ 单独画像
+        domains=["dlsite.com", "www.dlsite.com", "img.dlsite.jp"],
+        icon="shopping_bag",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_dlsite",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # 2026-10-03 实测: www 301 · 281B (3/3); img.dlsite.jp 200 · 434,454B (3/3)
+        # 2026-10-04 复核: 4 个候选全在 CF 网段且可达; 系统解析给 108.160.165.48 (投毒)
+        candidate_ips=["104.18.24.157", "104.18.25.157", "104.18.42.239", "172.64.145.17"],
+    ),
+    # Cara (CF ⇒ ECH)
+    ServiceProfile(
+        id="cara",
+        group="adult",
+        name="Cara 艺术家社区",
+        desc="Cara 艺术家社区 (Cloudflare 托管, 经本地 ECH 隧道)",
+        domains=["cara.app", "www.cara.app"],
+        icon="palette",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_cara",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # 2026-10-03 实测: 307 → /explore 属正常规范化 (已人工看 Location, 非工具假绿) 3/3
+        # 2026-10-04 复核: 2 个候选全在 CF 网段且可达; 系统解析**恰好**给出同样的地址
+        #                 (说明该域解析未被投毒, 但仍放 CF 边缘以避免"照抄 DoH 值"这类错配)
+        candidate_ips=["104.18.4.45", "104.18.5.45"],
+    ),
+    # ArtStation 素材 CDN (CF ⇒ ECH)
+    ServiceProfile(
+        id="artstation_cdn",
+        group="adult",
+        name="ArtStation 素材 CDN",
+        desc="ArtStation 作品/素材 CDN (Cloudflare 托管, 经本地 ECH 隧道)",
+        # ⚠ 只登记图床 cdna, **不含主站**: 主站实测 2/3 且会命中 CF 托管挑战 ⇒ 归 B 类缓入
+        domains=["cdna.artstation.com"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_artstation_cdn",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",
+        # 2026-10-03 实测: 根路径 200 (返回 "OK") 3/3
+        #   ⚠ 该 200 只有"图床可能可用"的价值, **不是**内容级可用证据 (草案 §四/复核 §四.3 自陈)
+        # 2026-10-04 复核: 2 个候选全在 CF 网段且可达; 系统解析给 128.121.146.101 (可疑)
+        candidate_ips=["104.19.170.40", "104.19.169.40"],
+        enable_cache=True,          # 素材/作品图, 值得本地落盘
+    ),
+    # Hitomi: 域名级 SNI 被 RST, 但自有服务器真实 IP 可用 ⇒ DIRECT (钉静态 IP)
+    ServiceProfile(
+        id="hitomi",
+        group="adult",
+        name="Hitomi.la 图库",
+        desc="Hitomi.la 图库 (DNS 被污染, 钉静态 IP 直连)",
+        domains=["hitomi.la"],
+        icon="image",
+        mode=ServiceMode.DIRECT,    # 走解析层直指该 IP, 不经 nginx (NGINX_BYPASS_MODES)
+        ssl_sni_mode="host",
+        # 2026-10-03 实测: hitomi.la @185.165.169.231 → 200 · 5,145B 标题 "Hitomi.la" (3/3)
+        # 2026-10-04 复核: 对**真实 SNI=hitomi.la** 的 TLS 握手成功 (证书链可协商);
+        #                  而系统解析给出 128.242.245.125 / 2001::68f4:2b34 (投毒) ⇒ 必须钉 IP
+        # ⚠ 单候选无容灾 (复核 §四.4 已点): 该 IP 失活时本画像没有可换的节点, 只能靠
+        #   健康巡检重排 —— 而池里只有一个。补足第二个经静态复核的 IP 属后续工作。
+        candidate_ips=["185.165.169.231"],
+    ),
+    # Pinterest 图床 (Fastly, DIRECT)
+    ServiceProfile(
+        id="pinimg",
+        group="adult",
+        name="Pinterest 图床",
+        desc="Pinterest 图片 CDN (Fastly, 钉静态 IP 直连)",
+        # ⚠ 只登记图床; 主站 www.pinterest.com 实测仅 1/3 (Akamai 按 SNI 选证书) ⇒ 不登记
+        domains=["i.pinimg.com"],
+        icon="image",
+        mode=ServiceMode.DIRECT,
+        ssl_sni_mode="host",
+        # 2026-10-03 实测: @151.101.76.84 /robots.txt 200 · 2,756B (3/3)
+        # 2026-10-04 复核: 真实 SNI=i.pinimg.com 的 TLS 握手成功; 系统解析给
+        #                  108.160.166.61 / 2a03:2880:…:face:b00c (投毒段) ⇒ 必须钉 IP
+        # ⚠ 单候选无容灾。草案注释建议"替换为实测的第二个 Fastly 边缘", 但**本轮没有**
+        #   实测出第二个可用的边缘地址 ⇒ 这里只放已核实的那一个, 不编造候选
+        #   (往池里塞未验证地址比池子小更糟: 它会成为"第一个打死整条链路"的那个)。
+        candidate_ips=["151.101.76.84"],
+        enable_cache=True,          # 纯静态图片, 值得本地落盘
+    ),
+
+    # ==========================================================================
+    # 服务补充计划 · 批次 2（2026-10-04 落地）—— 空 SNI / 掩护 SNI 通道
+    #
+    # 来源同上；复核报告把这一类判为 **B 类（时变通道，需缓入）**，理由两条：
+    #   ① 空 SNI 只瞒过 TLS 层, **HTTP Host 仍是明文**, GFW 可按 Host 封;
+    #   ② 这类通道此前**没有证书门槛** —— `VENDOR_CERT_SUFFIXES` 只登记了 google,
+    #      于是"源站忽略 SNI"与"空 SNI"两类画像根本没有防线, 别家 vhost / 链路侧
+    #      劫持页的 2xx 会被当成可用收进池 (实测形态: 证书 fallback.wgcz.net / flirtify.com)。
+    #
+    # 因此本批**逐条补上 `cert_families`**（证书必须仍是目标域自己的, 见 _cert_gate）,
+    # 并统一 `experimental_default_off=True`（时变通道不纳入默认启用清单）。
+    #
+    # 2026-10-04 本轮独立复核（只读 TLS 握手 + 读对端证书域族）:
+    #   · ehentai_img 3/3 · nhentai_img 2/3 · dlsite_play 2/2 · sankaku 2/2
+    #   · 每个可用候选都满足"**真实 SNI 失败** + 空/掩护 SNI 成功 + 证书域族 == 目标域族"
+    #     —— 第三条同时证明了"没有打到别家 vhost 上"。
+    #   · nhentai_img 的 109.202.100.218 已**失效**（空 SNI 亦握手超时）⇒ 从池中剔除,
+    #     按"只放已核实地址"的口径降为 2 个候选。
+    # ==========================================================================
+    ServiceProfile(
+        id="ehentai_img",
+        group="adult",
+        name="E-Hentai 图床",
+        desc="E-Hentai 缩略图与原图服务器 (自有服务器非 CF, 空 SNI 可直连, 图片可缓存)",
+        # 与 ehentai 主站**必须拆画像**: 主站是 CF 托管走 ECH, 此处是自有服务器走空 SNI,
+        # 后端行为完全不同 (合池必错配 —— 这正是本计划反复强调的一条)。
+        domains=["ehgt.org", "www.ehgt.org"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_ehentai_img",
+        ssl_sni_mode="empty",
+        # ★ 这个门槛是本画像唯一的防线 (运行期 proxy_ssl_verify 必须 off):
+        #   证书域族必须是 ehgt.org —— 否则说明打到了别家 vhost 或劫持页。
+        cert_families=("ehgt.org",),
+        experimental_default_off=True,   # 时变通道, 不纳入默认启用
+        # 2026-10-03 草案实测: 真实缩略图 /w/02/689/24860-taj1rbzd.webp →
+        #                     200 · image/webp · 6,554B (2 IP × 2 次全中)
+        # 2026-10-04 复核: 3 个候选都是"真 SNI 失败 + 空 SNI 通 + 证书域族 ehgt.org"
+        candidate_ips=["89.39.106.43", "62.112.8.21", "109.236.85.28"],
+        enable_cache=True,          # 纯静态图片, 值得本地落盘
+    ),
+    ServiceProfile(
+        id="nhentai_img",
+        group="adult",
+        name="nhentai 图床",
+        desc="nhentai 缩略图与原图服务器 (自有服务器非 CF, 空 SNI 可直连, 图片可缓存)",
+        # ⚠ 与 nhentai 主站拆画像的必要性有**实测反例**: 图床走 ECH 会得到 520 (CF 回源错误)。
+        domains=["i.nhentai.net", "t.nhentai.net"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_nhentai_img",
+        ssl_sni_mode="empty",
+        cert_families=("nhentai.net",),   # 空 SNI 下的唯一防线 (见 ehentai_img 注释)
+        experimental_default_off=True,
+        # 2026-10-03 草案实测: 空 SNI 握手通过 · 证书 CN=*.nhentai.net · HTTP 200 (真 SNI 一律 RST)
+        # 2026-10-04 复核: 213.152.165.53 / .54 通过 (证书域族 nhentai.net);
+        #                  ⚠ 109.202.100.218 已失效 (空 SNI 也握手超时) ⇒ 剔除, 池降为 2
+        candidate_ips=["213.152.165.53", "213.152.165.54"],
+        enable_cache=True,
+    ),
+    ServiceProfile(
+        id="dlsite_play",
+        group="adult",
+        name="DLsite 播放器",
+        desc="DLsite 作品播放器 (AWS 源站忽略 SNI, 用无害 SNI 掩护绕过域名级阻断)",
+        # ⚠ 与 dlsite 商店拆画像: 商店是 CF 托管走 ECH, 播放器是 AWS 源站走掩护 SNI。
+        domains=["play.dlsite.com"],
+        icon="play",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_dlsite_play",
+        cdn_vendor="fastly",
+        ssl_sni_mode="www.fastly.com",   # 证书仍是 play.dlsite.com ⇒ 源站忽略 SNI
+        cert_families=("dlsite.com",),   # 掩护 SNI 下必须验证"证书仍是目标自己的"
+        experimental_default_off=True,
+        # 2026-10-03 草案实测: cover=www.fastly.com @54.95.70.54 → 200,
+        #                     证书 CN=play.dlsite.com (3/3)
+        # 2026-10-04 复核: 两个候选都满足"真 SNI 失败 + 掩护 SNI 通 + 证书域族 dlsite.com"
+        candidate_ips=["54.95.70.54", "3.115.169.42"],
+    ),
+    ServiceProfile(
+        id="sankaku",
+        group="adult",
+        name="Sankaku Channel 图库",
+        desc="Sankaku 图库与新闻站 (自有 CDN 忽略 SNI, 掩护 SNI 可直连, 图片可缓存)",
+        domains=["chan.sankakucomplex.com", "www.sankakucomplex.com", "sankakucomplex.com"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_sankaku",
+        cdn_vendor="fastly",
+        ssl_sni_mode="www.fastly.com",
+        cert_families=("sankakucomplex.com",),
+        experimental_default_off=True,
+        # 2026-10-03 草案实测: 302 / 200, 证书 CN=iapi.sankakucomplex.com (自有 CDN, 忽略 SNI), 3/3
+        # 2026-10-04 复核: 两个候选都满足"真 SNI 失败 + 掩护 SNI 通 + 证书域族 sankakucomplex.com"
+        candidate_ips=["143.192.150.197", "143.192.150.194"],
+        enable_cache=True,
+    ),
 ]
 
 # 索引字典与导出辅助

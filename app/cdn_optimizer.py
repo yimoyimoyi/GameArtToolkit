@@ -1857,7 +1857,18 @@ class CDNOptimizer:
 
             lines.append(f"upstream upstream_{srv_id} {{")
             if fallback:
-                lines.append(f"    # 警告: 服务 {srv_id} 双通道探测全部失败, 回退候选池兜底")
+                if srv_id in self.last_ech_degraded:
+                    # ★ ECH 服务的降级原因**不是**"探测发现服务不行" (2026-10-04):
+                    #   探测发的是普通 TLS 握手, 对 CF 托管 + 明文 SNI 被阻断的服务
+                    #   **本来就必然失败**, 与"带 ECH 能否成功"无关 (见 1724 行上方注释)。
+                    #   写成"双通道探测全部失败"会让人去查节点/网络, 而真正的原因是
+                    #   隧道未就绪 —— 正是本项目根因一(注释描述了一个不成立的前提)的形态。
+                    lines.append(f"    # 警告: 服务 {srv_id} 标记了 ECH 但隧道未就绪, "
+                                 f"本次回退候选池兜底")
+                    lines.append("    #   注意: 普通 TLS 探测对 ECH 类服务本就无法证伪; "
+                                 "此回落走明文 SNI, 对 CF 边缘很可能被 403/421 拒绝")
+                else:
+                    lines.append(f"    # 警告: 服务 {srv_id} 双通道探测全部失败, 回退候选池兜底")
             
             if not valid_ips:
                 # 极端场景防护: 若完全无有效候选 IP，写入 down 节点保证 Nginx 语法不报错
