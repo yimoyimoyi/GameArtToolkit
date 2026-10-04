@@ -312,6 +312,17 @@ RESPONSE_KEEP = {
     "content-type", "content-length", "content-range", "accept-ranges",
     "last-modified", "etag", "cache-control", "expires", "date", "age",
     "content-encoding", "content-disposition", "vary", "server",
+    # --- 重定向族 (2026-10-04 修: 原先**漏了 `location`**) ---
+    # 缺陷实况: civitai 的图片链靠 301 中转 —— `image.civitai.com/<...>/x.jpeg` 回
+    #   301 + Location: https://blobs-b2.civitai.com/file/... 浏览器再去取真图。
+    #   白名单缺 `location` ⇒ 腿把 301 的 Location **丢掉**, 浏览器拿到一个**没有目标的
+    #   301**, 只能判定加载失败 (实测: 直连腿 44411 的响应头里完全没有 location, 而同一
+    #   地址的原生 HTTP/3 响应有它)。表现为"只有 civitai 的图片不加载"。
+    # 为什么这个缺陷长期没暴露: googlevideo 的视频通路是直接 200/206 (Range 切片),
+    #   **从不依赖重定向**, 所以白名单缺 location 一直没影响。
+    # 为什么必须靠白名单而不是"放行全部": 见本节顶部注释 —— 反面是把 hop-by-hop 与
+    #   连接管理头直接透传给客户端, 会破坏 keep-alive 语义。
+    "location", "refresh",
     # --- 跨源 (CORS) 族: 缺一个就可能让 fetch/MSE 整体失败 ---
     "access-control-allow-origin", "access-control-allow-credentials",
     "access-control-expose-headers", "access-control-allow-methods",
