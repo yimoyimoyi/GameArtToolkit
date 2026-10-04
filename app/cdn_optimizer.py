@@ -712,7 +712,8 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                          ok_statuses: Optional[set] = None,
                          proxy_connect_domain: bool = False,
                          cert_vendor: str = "",
-                         cert_families: Tuple[str, ...] = ()) -> Dict:
+                         cert_families: Tuple[str, ...] = (),
+                         probe_path: Optional[Tuple[str, str]] = None) -> Dict:
     """单链路三态探测: TCP → TLS(按 SNI 模式 + ALPN) → HTTP 状态码
 
     单节点独立生命周期计时:
@@ -842,9 +843,16 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                     domains_to_probe.insert(0, domain)
                 ok_set = set(ok_statuses) if ok_statuses else set()
 
+                # ★ 真实内容链接 (profile.probe_path = (host, path)):
+                #   有一类服务**对根路径不应答**(实测 nhentai_img: `/` 回 0 字节,
+                #   而 /galleries/9/1.jpg 回 200 + 256054B) ⇒ 固定 `GET /` 会把它
+                #   永远判死。设了 probe_path 就用它, 且 host 也一并用该值。
+                _p_host, _p_path = (probe_path if probe_path else (None, None))
+                _req_host = _p_host or domain
+                _req_path = _p_path or "/"
                 req_headers = (
-                    f"GET / HTTP/1.1\r\n"
-                    f"Host: {domain}\r\n"
+                    f"GET {_req_path} HTTP/1.1\r\n"
+                    f"Host: {_req_host}\r\n"
                     f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) GameArtToolkit/2.0\r\n"
                     f"Connection: close\r\n\r\n"
                 )
@@ -1184,18 +1192,22 @@ class CDNOptimizer:
         # 画像声明的证书**域族**门槛 (空 = 不检查): "证书必须仍是目标域自己的" ——
         # 专治 cdn_vendor 覆盖不到的通道 (源站忽略 SNI / 空 SNI), 见 probe_ip_endpoint_v2
         cert_families = tuple(getattr(profile, "cert_families", ()) or ())
+        # ★ 真实内容链接 (空 = 沿用 GET /); 见 ServiceProfile.probe_path 的注释
+        probe_path = getattr(profile, "probe_path", None) or None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ip_list) or 1, max_workers)) as executor:
             def run_one(ip):
                 direct = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=None,
                                               measure_throughput=measure_thp,
                                               probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                              cert_vendor=cert_vendor, cert_families=cert_families)
+                                              cert_vendor=cert_vendor, cert_families=cert_families,
+                                              probe_path=probe_path)
                 proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=timeout, sni_mode=sni_mode, proxy=proxy,
                                                  measure_throughput=False,
                                                  probe_domains=probe_domains, ok_statuses=ok_statuses,
                                                  proxy_connect_domain=proxy_connect_domain,
                                                  cert_vendor=cert_vendor,
-                                                 cert_families=cert_families) if proxy else None
+                                                 cert_families=cert_families,
+                                                 probe_path=probe_path) if proxy else None
                 return ip, direct, proxy_res
 
             future_to_ip = {executor.submit(run_one, ip): ip for ip in ip_list}
@@ -1315,6 +1327,8 @@ class CDNOptimizer:
             cert_vendor = str(getattr(profile, "cdn_vendor", "") or "").strip().lower()
             # 画像声明的证书域族门槛 (空 = 不检查), 见 probe_ip_endpoint_v2
             cert_families = tuple(getattr(profile, "cert_families", ()) or ())
+            # ★ 真实内容链接 (空 = 沿用 GET /); 见 ServiceProfile.probe_path 的注释
+            probe_path = getattr(profile, "probe_path", None) or None
 
             # 按服务级存活率兜底: 存活数低于下限时该服务全池进 Stage 2
             final_ips = _apply_prefilter_floor(ips, alive_ips_set, PROBE_DEFAULTS.prefilter_floor)
@@ -1322,21 +1336,23 @@ class CDNOptimizer:
             for ip in final_ips:
                 flat_tasks.append((srv_id, ip, domain, sni_mode, task_timeout, measure_thp,
                                    probe_domains, ok_statuses, proxy_connect_domain, cert_vendor,
-                                   cert_families))
+                                   cert_families, probe_path))
 
         def run_both(task):
             (srv_id, ip, domain, sni_mode, task_timeout, measure_thp, probe_domains,
-             ok_statuses, proxy_connect_domain, cert_vendor, cert_families) = task
+             ok_statuses, proxy_connect_domain, cert_vendor, cert_families, probe_path) = task
             direct = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=None,
                                           quick_retry=True, measure_throughput=measure_thp,
                                           probe_domains=probe_domains, ok_statuses=ok_statuses,
-                                          cert_vendor=cert_vendor, cert_families=cert_families)
+                                          cert_vendor=cert_vendor, cert_families=cert_families,
+                                          probe_path=probe_path)
             proxy_res = probe_ip_endpoint_v2(ip, domain, timeout=task_timeout, sni_mode=sni_mode, proxy=proxy,
                                              quick_retry=False, measure_throughput=False,
                                              probe_domains=probe_domains, ok_statuses=ok_statuses,
                                              proxy_connect_domain=proxy_connect_domain,
                                              cert_vendor=cert_vendor,
-                                             cert_families=cert_families) if proxy else None
+                                             cert_families=cert_families,
+                                             probe_path=probe_path) if proxy else None
             return srv_id, ip, direct, proxy_res
 
         # 5. Stage 2: 深度三态探测 (单任务独立生命周期计时, 绝无全局强杀误断)
@@ -2341,7 +2357,8 @@ class CDNHealthMonitor:
                                          measure_throughput=measure_thp,
                                          probe_domains=probe_domains, ok_statuses=ok_statuses,
                                          proxy_connect_domain=proxy_connect_domain,
-                                         cert_vendor=str(getattr(profile, "cdn_vendor", "") or "").strip().lower())
+                                         cert_vendor=str(getattr(profile, "cdn_vendor", "") or "").strip().lower(),
+                                         probe_path=getattr(profile, "probe_path", None) or None)
 
         if (probe_res.get("tls_ok", False) and probe_res.get("http_ok", False)
                 and not _suspect_status(probe_res.get("http_status"))

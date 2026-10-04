@@ -120,6 +120,25 @@ class ServiceProfile:
     measure_throughput: bool = False          # 是否在测速时实测下行吞吐 (B/s), 用于大文件/git pack 排序
     probe_ok_statuses: Optional[Tuple[int, ...]] = None  # 额外放行的 HTTP 状态码 (默认 {2xx,3xx}+500; 用于根路径无文档/无权限的虚拟主机如 S3 403 / githubassets 404)
     probe_domains: Tuple[str, ...] = ()       # 探测验证的域名列表 (空 = 仅 domains[0]; 多域全部非可疑才算干净, 防 GFW 按子域特判封锁)
+    # ★ 探测用的**真实内容链接** `(host, path)` (空 = 沿用旧的 `GET /`)。
+    #   为什么需要它 (2026-10-04 实测, nhentai_img 案例):
+    #     有一类服务**对根路径不应答** —— 实测:
+    #       213.152.165.53  i.nhentai.net  /                  -> 连接 200 但 **0 字节**
+    #       213.152.165.53  i.nhentai.net  /galleries/9/1.jpg -> 200 + **256054B**
+    #     而 `probe_ip_endpoint_v2` 硬编码请求 `GET /` ⇒ 该画像**永远 0 个 rank0**
+    #     (实测 4 个 probe_timeout 档位 1.5/3/5/8 全是 0/5), 于是 `apply_optimal`
+    #     永远回退候选池兜底 —— 表现为"检测不可用、实际可用"。
+    #   实测判别力对照 (好候选 vs 已知坏候选):
+    #     · github_web —— 根路径已能判别 (坏候选稳定回 400) ⇒ 真实链接**无增益**, 故不设;
+    #     · nhentai_img —— 根路径 0 字节(判不了), 真实图片路径给 200+256KB ⇒ **决定性**。
+    #   ⇒ 只在"根路径确实判不了"的画像上设它, 不搞一刀切 (见下方取舍说明)。
+    # ⚠ 三条实测约束, 设错会把好候选全判死:
+    #   ① 必须是**(host, path)** 而不是裸 path —— 同一 IP 对不同 host 行为不同
+    #      (t3.nhentai.net 只在 /galleries/9/1t.jpg 上回 200, i.nhentai.net 只在 1.jpg 上);
+    #   ② 必须与 `ssl_sni_mode` 协同 —— nhentai_img 只有**空 SNI** 能取到图,
+    #      真实/apex SNI 都 RST; 用真实链接但错 SNI 一样失败;
+    #   ③ 必须选**不带鉴权**且**不随内容变更**的 URL —— 链接一失效, 全部候选被判死。
+    probe_path: Optional[Tuple[str, str]] = None
     cdn_vendor: str = ""                      # 上游 CDN 厂商 (fastly/akamai/cloudflare/cloudfront), 决定伪 SNI 是否可行
     # 探测阶段的**证书域族硬门槛** (空 = 不检查)。2026-10-03 新增。
     #
@@ -2010,6 +2029,14 @@ PROFILES: List[ServiceProfile] = [
         #     ⇒ 记在此处待将来批量做 (若出现第二个同类画像)。
         candidate_ips=["77.247.178.1", "213.152.165.53", "213.152.165.54",
                        "109.202.100.218"],
+        # ★ 真实内容链接 —— 修掉"探测永远判它死"的根因 (见 probe_path 字段注释)。
+        #   为什么必须是这一条: 本画像**对根路径不应答**(实测 `/` 回 0 字节), 而固定
+        #   `GET /` 的探测因此永远 0 个 rank0。改用真实图片路径后能拿到 200 + 256054B。
+        #   `media_id=9` 是 nhentai 最老的公开画廊之一, 路径 `/galleries/<media_id>/<n>.jpg`
+        #   由 API 给出、长期不变 (实测 256054B 稳定复现); 且**无需鉴权、无防盗链**。
+        #   ⚠ 若将来该路径失效, 探测会把它判死并回退候选池 —— 与设它之前的现状相同,
+        #     不会更糟 (这是"宁可退化为旧行为"的取舍)。
+        probe_path=("i.nhentai.net", "/galleries/9/1.jpg"),
         enable_cache=True,
     ),
     ServiceProfile(
