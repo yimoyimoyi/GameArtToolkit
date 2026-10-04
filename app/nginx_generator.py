@@ -435,9 +435,57 @@ class NginxConfGenerator:
         # 两者都是**生成期就写死的字面量**, 因此 keepalive 语义不受影响。
         conn_header = '"upgrade"' if getattr(profile, "websocket", False) else '""'
 
+        # ★ 路径专属 location 排在 `location /` **之前** (2026-10-04 实现 path_rules)。
+        #   语义上 nginx 按最长前缀优先, 顺序无关; 但读配置的人从上往下看, 把特例放在
+        #   通配之前才不会有"为什么这条被吃掉了"的错觉。
+        lines.extend(cls._render_path_rule_locations(profile, ssl_lines, host_header, scheme))
+
+        # 通用 `location /` —— 管线与 path_rules **共用同一实现**, 不复制模板
+        lines.append("    location / {")
+        lines.extend(cls._render_location_body(
+            profile, upstream=profile.upstream_name, scheme=scheme,
+            host_header=host_header, conn_header=conn_header, ssl_lines=ssl_lines))
         lines.extend([
-            "    location / {",
-            f"        proxy_pass {scheme}://{profile.upstream_name};",
+            "    }",
+            "}\n"
+        ])
+        return "\n".join(lines)
+
+    # ----------------------------------------------------------------------
+    # location 体渲染 (通用 `location /` 与 path_rules 共用的**单一真源**)
+    # ----------------------------------------------------------------------
+    @classmethod
+    def _render_location_body(cls, profile: ServiceProfile, upstream: str, scheme: str,
+                              host_header: str, conn_header: str, ssl_lines: list,
+                              rule=None, cache_suffix: str = "",
+                              extra_headers: Optional[Dict[str, str]] = None) -> list:
+        """产出一个 location 块的完整行 (不含 `location x {` 与 `}` 本身)
+
+        为什么要抽出来 (2026-10-04, 实现 path_rules 时): 路径专属 location 必须与通用
+        location **同款**代理管线 —— 缺 `proxy_http_version 1.1` 就没有 keepalive,
+        缺 `Connection ""` 字面量就每次新建连接。复制一份的下场是本项目反复踩过的
+        "两处模板漂移", 故收敛为唯一实现。
+
+        缓冲/超时的判据 (与原实现逐字等价, 只是可被 rule 覆盖):
+          · 零缓冲的条件 = 未开缓存 且 (dev 组 ‖ 该 rule 显式 buffering=False);
+          · 超时默认 dev 组 3600s、其余 60s, rule.read_timeout / send_timeout 可覆盖。
+        """
+        # 零缓冲判定: 未开缓存且 (dev 组或该路径显式关缓冲)
+        no_buf = False
+        if not profile.enable_cache:
+            if profile.group == "dev" or (rule is not None and rule.buffering is False):
+                no_buf = True
+
+        default_to = 3600 if profile.group == "dev" else 60
+        read_to, send_to = default_to, default_to
+        if rule is not None:
+            if rule.read_timeout is not None:
+                read_to = int(rule.read_timeout)
+            if rule.send_timeout is not None:
+                send_to = int(rule.send_timeout)
+
+        out = [
+            f"        proxy_pass {scheme}://{upstream};",
             "        proxy_http_version 1.1;",
             "        proxy_set_header Upgrade $http_upgrade;",
             # 必须是字面量空串, 不能写 $connection_upgrade —— 实测两者的行为并不等价:
@@ -451,12 +499,12 @@ class NginxConfGenerator:
             "        proxy_set_header Accept-Encoding $http_accept_encoding;",
             "        proxy_set_header Accept-Language $http_accept_language;",
             *ssl_lines,
-        ])
+        ]
 
         # 本地静态资源/图片磁盘缓存挂载
         if profile.enable_cache:
-            lines.extend([
-                "        # 开启本地磁盘缓存 (消除频次冲击与 0ms 秒开)",
+            out.extend([
+                "        # 开启本地磁盘缓存 (消除频次冲击与 0ms 秒开)" + cache_suffix,
                 "        proxy_cache pixiv_img_cache;",
                 "        proxy_cache_valid 200 304 7d;",
                 "        proxy_cache_valid 404 1m;",
@@ -468,53 +516,76 @@ class NginxConfGenerator:
 
         # Steam 商店与社区防网关 Portal 劫持重定向 (阻断深澜 srun 等局域网认证页面渗透到客户端)
         if profile.id in ("steam_store", "steam_community"):
-            lines.append("        # 防网关 Portal 劫持重定向，阻断局域网登录地址下发给客户端")
-            lines.append("        proxy_redirect ~*^https?://(?:172\\.|192\\.168\\.|10\\.|.*srun.*|.*portal.*)(.*)$ /;")
+            out.append("        # 防网关 Portal 劫持重定向，阻断局域网登录地址下发给客户端")
+            out.append("        proxy_redirect ~*^https?://(?:172\\.|192\\.168\\.|10\\.|.*srun.*|.*portal.*)(.*)$ /;")
 
         # Steam 社区重定向防死循环自适应
         if profile.id == "steam_community":
-            lines.extend([
+            out.extend([
                 "        proxy_redirect default;",
                 "        proxy_redirect http:// https://;",
             ])
             if profile.group != "dev":
-                lines.append("        proxy_force_ranges on;")
+                out.append("        proxy_force_ranges on;")
 
         # 针对开发生态 (Git/GitHub/GitLab/大文件) 开启全链路流式零缓冲、Range 穿透与超长超时
-        if profile.group == "dev":
-            lines.append("        # 大文件与 Git Smart HTTP 极速流式透传配置 (彻底消灭磁盘 I/O 缓冲假死)")
-            # ⚠ proxy_buffering off 与 proxy_cache **互斥** —— 二者不可同时出现在一个 location。
-            # 实测依据 (2026-10-01, 本地 nginx 最小复现, 见 cache_probe 实验): 同一 location
-            # 同时写 `proxy_cache` 与 `proxy_buffering off` + `proxy_max_temp_file_size 0` 时,
-            # 第二次请求 `$upstream_cache_status` 仍是 MISS、源站被重新命中 (seq 4→5);
-            # 仅把缓冲改回 on, 第二次即 HIT。原因: nginx 需要缓冲响应体才能落盘缓存。
-            # 影响面 (修复前): 所有 group=dev 且 enable_cache=True 的画像缓存**全是空转**
-            # (google_fonts / jsdelivr / npm / pypi / crates 等), 白白多打一次回源。
-            # 故: 开了缓存的画像保留缓冲 (缓存优先), 未开缓存的才走零缓冲流式透传。
+        #
+        # ⚠ 逐字等价于重构前的实现, 别"顺手化简" (2026-10-04 曾在重构中漏掉这一段,
+        #   由"渲染结果与磁盘既有配置逐字节对比"当场抓到):
+        #   dev 组**无条件**带 Range 透传 + request 零缓冲 + force_ranges, 与是否开缓存无关;
+        #   只有 **response** buffering 由 enable_cache 决定 (开缓存必须保留缓冲, 否则缓存空转)。
+        _dev_block = (profile.group == "dev" and rule is None)
+        if _dev_block:
             if profile.enable_cache:
-                lines.append("        proxy_buffering on;   # 本画像开了磁盘缓存, 必须保留缓冲否则缓存不生效 (见上)")
+                out.append("        # 大文件与 Git Smart HTTP 极速流式透传配置 (彻底消灭磁盘 I/O 缓冲假死)")
+                # ⚠ proxy_buffering off 与 proxy_cache **互斥** —— 二者不可同时出现在一个 location。
+                # 实测依据 (2026-10-01, 本地 nginx 最小复现, 见 cache_probe 实验): 同一 location
+                # 同时写 `proxy_cache` 与 `proxy_buffering off` + `proxy_max_temp_file_size 0` 时,
+                # 第二次请求 `$upstream_cache_status` 仍是 MISS、源站被重新命中 (seq 4→5);
+                # 仅把缓冲改回 on, 第二次即 HIT。原因: nginx 需要缓冲响应体才能落盘缓存。
+                # 影响面 (修复前): 所有 group=dev 且 enable_cache=True 的画像缓存**全是空转**
+                # (google_fonts / jsdelivr / npm / pypi / crates 等), 白白多打一次回源。
+                # 故: 开了缓存的画像保留缓冲 (缓存优先), 未开缓存的才走零缓冲流式透传。
+                out.append("        proxy_buffering on;   # 本画像开了磁盘缓存, 必须保留缓冲否则缓存不生效 (见上)")
+                out.extend([
+                    "        proxy_request_buffering off;",
+                    "        proxy_force_ranges on;",
+                    "        proxy_set_header Range $http_range;",
+                    "        proxy_set_header If-Range $http_if_range;",
+                ])
             else:
-                lines.extend([
+                out.append("        # 大文件与 Git Smart HTTP 极速流式透传配置 (彻底消灭磁盘 I/O 缓冲假死)")
+                out.extend([
                     "        proxy_buffering off;",
                     "        proxy_max_temp_file_size 0;",
+                    "        proxy_request_buffering off;",
+                    "        proxy_force_ranges on;",
+                    "        proxy_set_header Range $http_range;",
+                    "        proxy_set_header If-Range $http_if_range;",
                 ])
-            lines.extend([
+        elif no_buf:
+            # 路径规则显式关缓冲 (dev 组未开缓存的情形已由上面的 no_buf 覆盖)
+            out.extend([
+                "        proxy_buffering off;",
+                "        proxy_max_temp_file_size 0;",
                 "        proxy_request_buffering off;",
                 "        proxy_force_ranges on;",
                 "        proxy_set_header Range $http_range;",
                 "        proxy_set_header If-Range $http_if_range;",
-                "        proxy_read_timeout 3600s;",
-                "        proxy_send_timeout 3600s;",
-                # 连接超时不再在这里写死 —— 见文件头的"上游快速失败策略"。
-                # 原注释曾写"持续失败的节点由 max_fails=3/fail_timeout=30s 熔断",
-                # 那句话**与代码不符** (cdn_optimizer 早已改成 max_fails=1/fail_timeout=5s),
-                # 属于典型的"注释描述了一个不存在的实现", 已随本次收口删除。
             ])
-        else:
-            lines.extend([
-                "        proxy_read_timeout 60s;",
-                "        proxy_send_timeout 60s;",
-            ])
+
+        # 路径规则自己的头 (追加/覆盖; 空值表示删除该头, 与 nginx 语义一致)
+        for _k, _v in (extra_headers or {}).items():
+            out.append(f"        proxy_set_header {_k} {_v};")
+
+        # 连接超时不再在这里写死 —— 见文件头的"上游快速失败策略"。
+        # 原注释曾写"持续失败的节点由 max_fails=3/fail_timeout=30s 熔断",
+        # 那句话**与代码不符** (cdn_optimizer 早已改成 max_fails=1/fail_timeout=5s),
+        # 属于典型的"注释描述了一个不存在的实现", 已随本次收口删除。
+        out.extend([
+            f"        proxy_read_timeout {read_to}s;",
+            f"        proxy_send_timeout {send_to}s;",
+        ])
 
         # 状态码白名单仅限 nginx 编译期支持的这几个 (403/404/429/500/502/503/504),
         # 写 http_400 会导致 nginx 直接 [emerg] invalid value 起不来 —— 已实测验证。
@@ -530,17 +601,58 @@ class NginxConfGenerator:
             if getattr(profile, "retry_on_404", False)
             else "http_403 http_429 http_500 http_502 http_503 http_504"
         )
-        lines.extend([
-            f"        proxy_next_upstream error timeout {retry_codes} non_idempotent;",
-        ])
+        out.append(f"        proxy_next_upstream error timeout {retry_codes} non_idempotent;")
         # 三件套 (connect / tries / 总预算) 统一由 upstream_failover_lines 产出 ——
         # 不再在这里手写, 否则又会和别的模板漂移 (原先就是那样)。
-        lines.extend(upstream_failover_lines("        "))
-        lines.extend([
-            "    }",
-            "}\n"
-        ])
-        return "\n".join(lines)
+        out.extend(upstream_failover_lines("        "))
+        return out
+
+    @classmethod
+    def _render_path_rule_locations(cls, profile: ServiceProfile, ssl_lines: list,
+                                    host_header: str, scheme: str) -> list:
+        """把 `profile.path_rules` 渲染成**额外的 location 块** (2026-10-04 新增)
+
+        在此之前 `path_rules` 是**只声明不渲染**的死字段 (见 service_profile.PathRule 注释),
+        于是"某路径关缓冲 / 改超时"根本无法表达 —— civitai 草案的 `/api/download/` 关缓冲
+        要求正是卡在这里。
+
+        两条硬约束在生成期**响亮报错** (而不是静默降级):
+          ① `buffering=False` 与 `enable_cache=True` 互斥 —— nginx 需要缓冲才能落盘缓存,
+             同时写会让缓存**永远 MISS** (实测过), 属"看起来生效其实空转";
+          ② 同路径重复声明 ⇒ location 重名 ⇒ nginx [emerg] 拒载整个配置。
+        """
+        rules = list(getattr(profile, "path_rules", ()) or ())
+        if not rules:
+            return []
+        seen = set()
+        out: list = []
+        for rule in rules:
+            path = str(getattr(rule, "path", "") or "").strip()
+            if not path:
+                raise ValueError(f"画像 {profile.id}: path_rule 缺少 path")
+            if path in seen:
+                raise ValueError(
+                    f"画像 {profile.id} 重复声明了同一路径 {path!r} —— "
+                    f"nginx 会因 location 重名而 [emerg] 拒载")
+            seen.add(path)
+            if rule.buffering is False and profile.enable_cache:
+                raise ValueError(
+                    f"画像 {profile.id} 的路径 {path!r} 声明了 buffering=False, 但该画像 "
+                    f"enable_cache=True —— 二者互斥 (nginx 需要缓冲才能落盘缓存, 同时写会让"
+                    f"缓存永远 MISS)。请二选一。")
+            upstream = rule.proxy_pass or profile.upstream_name
+            if not upstream:
+                raise ValueError(f"画像 {profile.id} 的路径 {path!r} 无法确定上游")
+            conn = '"upgrade"' if getattr(rule, "websocket", False) else '""'
+            out.append(f"    location {path} {{")
+            out.append(f"        # [path_rule] buffering={rule.buffering}")
+            out.extend(cls._render_location_body(
+                profile, upstream=upstream, scheme=scheme, host_header=host_header,
+                conn_header=conn, ssl_lines=ssl_lines, rule=rule,
+                cache_suffix=" (path_rule)", extra_headers=rule.custom_headers))
+            out.append("    }")
+            out.append("")
+        return out
 
     @classmethod
     def _render_pixiv_web_server(cls, profile: ServiceProfile,

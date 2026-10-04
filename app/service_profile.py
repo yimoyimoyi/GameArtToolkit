@@ -91,12 +91,34 @@ def suggest_cover_sni(vendor: str) -> Optional[str]:
 
 @dataclass
 class PathRule:
-    """特定路径的路由与转发规则"""
+    """特定路径的路由与转发规则
+
+    ⚠ 2026-10-04 之前本类**只是声明, 从未被渲染** —— `nginx_generator` 里没有任何地方
+    读过 `path_rules`, 测试也从未覆盖。也就是说 "改这个字段" 曾经**完全没有效果**, 而
+    画像作者会以为它生效了 (civitai 草案正是栽在这里: 它要求 `/api/download/` 关缓冲,
+    而那条要求当时无法表达)。现在由 `NginxConfGenerator._render_path_rule_locations`
+    真正渲染; `tests/test_nginx_path_rules.py` 守住"字段真的会出现在配置里"。
+
+    字段语义:
+      · `path`            : location 前缀。nginx 按**最长前缀优先**匹配, 故更具体的路径
+                            天然压过 `location /`, 与书写顺序无关。
+      · `proxy_pass`      : 覆盖上游; 省略则沿用画像的 `upstream_name`。
+      · `buffering`       : False ⇒ 关缓冲 (大文件直通, 不落磁盘临时文件)。
+                            ⚠ 与 `enable_cache=True` **互斥** (nginx 需要缓冲才能落盘缓存),
+                            同时声明会在生成期**响亮报错**, 而不是静默让缓存空转。
+      · `websocket`       : True ⇒ 写 `Connection "upgrade"` (否则该路径的 WS 升级头会被清掉)。
+      · `custom_headers`  : 追加/覆盖 `proxy_set_header`。
+      · `read_timeout` / `send_timeout` : 该路径自己的超时 (秒)。省略则用画像默认值
+                            (dev 组 3600s, 其余 60s)。大文件下载必须有它 —— 否则模型
+                            动辄 2–7 GB, 60s 的读超时会在回源停顿处直接掐断。
+    """
     path: str
     proxy_pass: Optional[str] = None
     buffering: bool = True
     websocket: bool = False
     custom_headers: Dict[str, str] = field(default_factory=dict)
+    read_timeout: Optional[int] = None
+    send_timeout: Optional[int] = None
 
 
 @dataclass
