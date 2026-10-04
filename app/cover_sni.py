@@ -193,7 +193,7 @@ PROBE_PATH = "/search?q=test"
 OK_STATUSES = {200, 204, 301, 302, 303, 307, 308}
 
 # Fastly 通道的掩护候选 —— **每一个都有实测证据** (2026-10-03, 三窗口 × 6 节点 × 11 域 = 198 条 HTTP 实测,
-# scripts/probe_fastly_cover_pool.py --http-only-tls-ok, 见 docs/reddit-cover-sni-channel.md §2.5):
+# scripts/probe_fastly_cover_pool.py --http-only-tls-ok, 见 docs/archive/reddit-cover-sni-channel.md §2.5):
 #
 #   掩护域 @ 节点                窗口1/2/3 可用域数        结论
 #   www.fastly.com @199.232.161.140   11/11, 11/11, 11/11  ★ 首选: 三窗口全绿, 状态与画像记载逐字一致
@@ -245,7 +245,7 @@ class ChannelSpec:
     #   "all_nodes" = 整池节点全部过证书门槛 (google 的既有语义, 逐字保留)
     #   "any_node"  = 至少一个节点过全部四关 (Fastly 用: 候选池里本就存在长期不通的节点,
     #                 要求整池全绿等于永远判不可用 —— 实测 199.232.113.140 在首个窗口起
-    #                 40 分钟内始终 RST/502 (末次回归才 2/2 通过, 见 docs/reddit-cover-sni-channel.md))
+    #                 40 分钟内始终 RST/502 (末次回归才 2/2 通过, 见 docs/archive/reddit-cover-sni-channel.md))
     pass_rule: str = "all_nodes"
     # 该通道是否属"跨租户掩护"(证书按 IP 而非 SNI 选) —— 仅用于 UI 文案/诊断
     cross_tenant: bool = False

@@ -80,7 +80,7 @@ def check_gate_wiring() -> list:
 # 测量 B: 投毒前缀表
 # ===========================================================================
 # 实测投毒取值 (来源: docs/googlevideo-quic-channel.md 与
-# docs/googlevideo-node-availability.md 记录的 DoH 原始应答) 及其被投毒的名字。
+# docs/archive/googlevideo-node-availability.md 记录的 DoH 原始应答) 及其被投毒的名字。
 # ⚠ 只收**实测到的**取值, 与 `_DNS_POISON_PREFIX` 注释口径一致 —— 不凭记忆堆砌。
 MEASURED_POISON = {
     "69.171.235.22":   "www.google.com (alidns)",

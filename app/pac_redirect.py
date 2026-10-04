@@ -40,7 +40,7 @@ googlevideo 的节点名是**动态且海量**的 (rr1---sn-xxxx.googlevideo.com
 2. PAC 必须 **DIRECT 兜底**: 未命中的流量一律直连, 绝不把无关流量卷进本机代理。
 3. 转发器**总是**把隧道对到本机 nginx —— 选哪些域名走它由 PAC 决定, 保持单一职责。
 
-复现与证据: docs/googlevideo-sabr-analysis.md §13.3.6 起, 以及本次会话的
+复现与证据: docs/archive/googlevideo-sabr-analysis.md §13.3.6 起, 以及本次会话的
 scripts/probe_pac_playback.py --full-domains (553 域名 / HTTP PAC / 播放成功)。
 """
 
@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # 本地转发器与 PAC 服务的默认端口。取高位空闲段, 避免与项目既有端口冲突:
-# 443=nginx, 44411=h3 腿, 44401=ECH, 44301/44311+=relay, 53=NRPT 解析器。
+# 443=nginx, 44411=h3 腿, 44401=ECH, 44301/44311-44438=relay, 53=NRPT 解析器。
 PAC_PROXY_PORT = 44500
 PAC_HTTP_PORT = 44501
 PAC_UPSTREAM_HOST = "127.0.0.1"
