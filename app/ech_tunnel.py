@@ -8,7 +8,7 @@ docs/ech-tunnel-proposal.md。
 
 端口规划 (重要):
     44301  L4 Relay SNI 主端口
-    44311-44374  L4 Relay 代理转发端口段 (RELAY_PORT_BASE + crc32 % 64)
+    44311-44438  L4 Relay 代理转发端口段 (RELAY_PORT_BASE + crc32 % RELAY_PORT_SPAN)
     44401  ← ECH 隧道, 本模块
 
 必须避开 relay 段: 实测占用该段会导致 relay 端口 bind 失败

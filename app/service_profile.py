@@ -2276,6 +2276,99 @@ PROFILES: List[ServiceProfile] = [
         # 两者都在 CF 网段 (build_ech_targets 只收 CF 段内的候选, 故它们都能进隧道池)。
         candidate_ips=["104.21.53.75", "172.67.210.98"],
     ),
+    # --------------------------------------------------------------------------
+    # Civitai (2026-10-04 接入)
+    #
+    # ⚠ 本条**修正了归档草案的通道判定**: 草案 (service-expansion-feasibility-2026-10-03
+    #   §8.4/8.5) 写"civitai.com 全家族在 Cloudflare ⇒ ECH 隧道", 但**实测该 zone 不发布
+    #   ECH 配置** —— HTTPS RR 明确回 `ech=no` (对照 hlib.cc 回 `ech=AEX+DQBB...`)。
+    #   而 ECH 隧道必须服务端发布 ECHConfig 才能解密内层 SNI, 故:
+    #     · 项目自己的隧道实测 civitai.com → **502**, 日志 `wsarecv: forcibly closed`
+    #       (CF 边缘直接重置);
+    #     · 三条 TCP 路全灭: 真 SNI → RST; 空 SNI → handshake_failure;
+    #       掩护 SNI `cloudflare-ech.com` 能握手 (TLS1.3/h2) 但证书是掩护域自己的,
+    #       带真实 Host 取回的是 CF **通用 403 页** (553B), 没有 ECH 就解不开内层 SNI。
+    #   ⇒ 结论: civitai **不能走 ECH/掩护 SNI**。
+    #
+    # ★ 真正可用的通道是 **HTTP/3**: 它的 HTTPS RR 声明 `alpn=h3`, 而实测 QUIC 通:
+    #     两个地址 (172.66.152.186 / 104.20.38.219) 均 HTTP/3 200 · 141,808 B,
+    #     标题 "Civitai | Discover and Create AI Art"。
+    #   这与 googlevideo 的先例同型 (TCP 全灭、QUIC 独活), 故复用**同一条 h3 上游腿**
+    #   (app/h3_upstream, 默认 127.0.0.1:44411); 该腿的解析器本就按 Host 自行解析,
+    #   且注释明确支持"也能服务普通 h3 目标"。
+    ServiceProfile(
+        id="civitai_web",
+        group="acg",
+        name="Civitai 模型站",
+        desc="AI 绘画模型社区 (TCP 三路全灭, 经本地 HTTP/3 上游腿直连 Cloudflare)",
+        # 内容域按方案清单登记; blobs-b2 是图片**真载体** (实测页面 43 次 200, 而
+        # image.civitai.com 只做 301 中转), 漏了它就会"页面能开、图全挂"。
+        # ⚠ 这些名字都**不是** CF 网段排除对象, 而是 h3 腿按 Host 解析的目标。
+        domains=["civitai.com", "www.civitai.com", "auth.civitai.com",
+                 "image.civitai.com", "imagecache.civitai.com",
+                 "blobs-b2.civitai.com", "faro.civitai.com"],
+        icon="image",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_civitai_web",
+        h3_upstream=True,          # ★ 唯一可用通道 (见上)
+        skip_cdn_probe=True,       # 上游是本地腿, 明文探测复现不了 h3 路径
+        ssl_sni_mode="host",       # 仅腿不健康时的退化分支 (该分支对 CF 会被 403)
+        # 候选地址仍写出来: 它们是腿可用的目标地址, 也是 hosts/DNS 层钉 IP 的依据。
+        candidate_ips=["172.66.152.186", "104.20.38.219"],
+        probe_domains=("civitai.com",),
+        # 退化分支下 CF 对"无 ECH 的明文握手"回 403/421 属确定性响应, 不当作链路故障
+        probe_ok_statuses=(403, 404, 421),
+        # ★ 内容级验证已通过 (2026-10-04, 用真实图片 URL):
+        #     image.civitai.com/<hash>/<uuid>/original=true/…jpeg
+        #       → 301 → blobs-b2.civitai.com/file/blobs-managed-public/<id>
+        #       → **HTTP/3 200 · 354,229 B · content-type: image/jpeg · JPEG magic 正确**
+        #     (两个地址都是; 约 2.5 s —— 含两次握手与一次重定向)
+        #   这同时印证了"image 只做中转、blobs-b2 才是真载体"的判定, 故两者都必须登记。
+        #   ⇒ 内容可用性已确认, 与 googlevideo(播放未验证故默认关闭)不同, 本画像可默认启用。
+        # 刻意**不**接管 civitai.red: 它靠**浏览器自己**过 CF 托管挑战活着, 一旦被 hosts
+        # 劫持到本地, 挑战就交给本机上游去解 ⇒ 大概率过不了, 反而把"能直连"的入口弄坏
+        # (方案 §8.3 实测: direct 模式下 civitai.red 页面 158 请求成功)。
+    ),
+    # Civitai 模型下载出口 (Cloudflare R2)
+    #
+    # ★ 为什么单独成画像且**不走本机 nginx** (2026-10-04 实测):
+    #   · 模型下载会 307 跳到 R2 签名 URL, 主机形如
+    #     `civitai-delivery-worker-prod.<hash>.r2.cloudflarestorage.com`;
+    #   · 该主机**用自身真实 SNI 就能握手** (实测 TLS1.3, 证书 SAN 就是它自己
+    #     `*.5ac...r2.cloudflarestorage.com`), 即**没有被 SNI 阻断** —— 与主域相反;
+    #   · 因此它**不需要** ECH/掩护/h3 中的任何一条, 让它**直连**最快: 不经本机 nginx、
+    #     不经 Go 隧道, 2–7 GB 的字节流不占本机磁盘与 CPU。
+    #   ⇒ mode=DIRECT: 只在**解析层**把它钉到干净 IP (防系统解析被投毒), 数据面直连。
+    #   ⚠ 这也顺手避开一个陷阱: `build_ech_targets` 只收 **CF 网段内**的候选, 而该主机
+    #     在 CF 网段 (172.64.190.1) —— 若把它塞进任何 ech_enabled 画像, 它会被自动拉进
+    #     ECH 隧道, 正是最慢的那条路。
+    ServiceProfile(
+        id="civitai_dl",
+        group="acg",
+        name="Civitai 模型下载",
+        desc="模型文件下载出口 (Cloudflare R2, 真实 SNI 可用 ⇒ 直连最快)",
+        # ⚠ 必须写**全名**: 隧道/白名单按后缀匹配, 只写 `cloudflarestorage.com` 会把
+        #   **所有** R2 桶都放进来 (方案 §8.4 已点明这一点)。
+        domains=["civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com"],
+        icon="folder",
+        mode=ServiceMode.DIRECT,   # 只钉真实 IP, 不经本机反代
+        upstream_name="upstream_civitai_dl",
+        ssl_sni_mode="host",       # 真实 SNI 实测可用 (证书就是它自己)
+        # 不声明 cert_families: DIRECT 走解析层, 证书由浏览器自己按真实 SNI 校验,
+        # 这里没有探测阶段可言 (cert_families 只在探测/掩护通道有意义)。
+        # ⚠ 顺序是**实测**定的, 不是照抄 DoH 答案顺序 (2026-10-04):
+        #   DoH 回 ['172.64.66.1', '172.64.190.1'], 但 DIRECT 模式下只有
+        #   `candidate_ips[0]` 会被真正钉进解析层 ⇒ **第一位就是实际用的那个**。
+        #   实测 (各 3 次同刻对照, R2 主机名做 SNI):
+        #     172.64.66.1   3/3 成功 (722 / 1746 / 1316 ms)  ← 稳定且更快
+        #     172.64.190.1  2/3 成功 (736 / 1370 / 第三次 RST) ← 时变, 会 RST
+        #   故把稳定的那个放首位, 时变的留作备选。
+        candidate_ips=["172.64.66.1", "172.64.190.1"],
+        stable_ips=["172.64.66.1"],
+        # 不设 path_rules: 本画像在 nginx 侧**没有 server 块** (DIRECT ∈ NGINX_BYPASS_MODES),
+        # path_rules 是 L7 概念, 放这里等于死配置 —— 直连路径本就没有"缓冲/超时"可调,
+        # 那正是它比反代快的原因。
+    ),
 ]
 
 # 索引字典与导出辅助

@@ -66,7 +66,7 @@ if sys.version_info < (3, 10):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# 端口: 44301=L4 Relay SNI, 44311-44374=relay 转发段, 44401=ECH 隧道。
+# 端口: 44301=L4 Relay SNI, 44311-44438=relay 转发段, 44401=ECH 隧道。
 # 44411 紧邻 ECH 段且当前空闲 —— 统一"4xxxx = 本地明文回环上游"的语义。
 PORT = 44411
 

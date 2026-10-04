@@ -40,8 +40,16 @@ UPSTREAM_CONF_PATH = NGINX_DIR / "conf" / "upstream-dynamic.conf"
 # 默认本地代理 (Clash mixed 端口, HTTP CONNECT 隧道, 仅作探测筛选)
 DEFAULT_PROXY = ("127.0.0.1", 7897)
 
-# L4 Relay 代理转发端口基址: 44311 + CANDIDATE_IPS 顺序索引, 避开 SNI 主端口 44301
+# L4 Relay 代理转发端口段: [RELAY_PORT_BASE, RELAY_PORT_BASE + RELAY_PORT_SPAN), 避开
+# SNI 主端口 44301。段内端口由 relay_port_for() 做确定性哈希分配。
+#
+# ⚠ SPAN 是**全局端口资源**, 属人工扩容项: 2026-10-04 起因画像增至 66 个, 原先的 64 个
+#   槽位已经**放不下**, 而当时的探测没有限界 ⇒ 端口会悄悄越界到 44375/44376 (违背三处
+#   文档声明的 44311-44374, 也可能撞上别的组件)。现在探测是限界的, 段满会**响亮报错**;
+#   这次把段扩到 128 个槽 (44311-44438) 以容纳当前画像数并留出余量。
+#   改这个值时请同时核对: ech_tunnel.py / h3_upstream.py / nginx_manager.py 的端口规划注释。
 RELAY_PORT_BASE = 44311
+RELAY_PORT_SPAN = 128
 
 from service_profile import PROFILES, SITE_FILE_FOR_GROUP
 
@@ -237,20 +245,38 @@ _RELAY_PORT_MAP: Dict[str, int] = {}
 
 
 def relay_port_for(srv_id: str) -> int:
-    """确定性 relay 端口映射: crc32 稳定哈希 + 全量线性探测防冲突
+    """确定性 relay 端口映射: crc32 稳定哈希 + **限界**线性探测防冲突
 
-    - 按服务 ID 排序后统一分配, 不依赖 CANDIDATE_IPS 插入顺序
-      (新增 Profile 不再引发既有服务端口漂移冲突, 跨会话/跨进程稳定)
-    - 哈希基址落在 [RELAY_PORT_BASE, RELAY_PORT_BASE+64), 冲突时
-      线性探测取下一个未被其他服务最终占用的空闲端口
-    - 未知服务回退基址 (保持向后兼容)
+    为什么必须限界 (2026-10-04 实测缺陷): 原实现探测是裸 `port += 1`, 完全不受
+    区间约束 —— 于是当画像多到哈希冲突链足够长时, 分配出去的端口会**悄悄越界**。
+    实测 66 个画像时 `youtube_web -> 44376`、`yande_re -> 44375`, 而文档里的段是
+    `44311-44374` (64 个槽) —— 三处注释与其他模块都按那个段理解 (端口规划是全局资源,
+    越界就可能撞上隧道/腿/其它组件)。这是"静默违背自己声明的契约"的典型形态。
+
+    现在的语义:
+      · 槽位共 `RELAY_PORT_SPAN` 个, 探测在段内**环形**进行 ⇒ 结果恒在段内;
+      · 段满时**响亮报错**, 而不是继续往后借端口 —— 端口段是需要扩容的全局资源,
+        必须由人显式决定 (改 RELAY_PORT_SPAN), 不能靠越界偷偷糊过去。
+      · 按服务 ID 排序后统一分配 ⇒ 不依赖 CANDIDATE_IPS 插入顺序, 跨会话稳定。
     """
     if not _RELAY_PORT_MAP:
         used: set = set()
         for sid in sorted(CANDIDATE_IPS.keys()):
-            port = RELAY_PORT_BASE + (zlib.crc32(sid.encode("utf-8")) % 64)
-            while port in used:
+            base = RELAY_PORT_BASE + (zlib.crc32(sid.encode("utf-8")) % RELAY_PORT_SPAN)
+            port = base
+            # 环形探测: 保证落回段内; 段满则循环 RELAY_PORT_SPAN 次后放弃并报错
+            for _ in range(RELAY_PORT_SPAN):
+                if port not in used:
+                    break
                 port += 1
+                if port >= RELAY_PORT_BASE + RELAY_PORT_SPAN:
+                    port = RELAY_PORT_BASE
+            else:
+                raise RuntimeError(
+                    f"relay 端口段已满 ({RELAY_PORT_SPAN} 个槽位, "
+                    f"{RELAY_PORT_BASE}-{RELAY_PORT_BASE + RELAY_PORT_SPAN - 1}), "
+                    f"无法为 {sid!r} 分配端口 —— 请扩大 RELAY_PORT_SPAN "
+                    f"(它是全局端口资源, 不由单个画像决定)")
             used.add(port)
             _RELAY_PORT_MAP[sid] = port
     return _RELAY_PORT_MAP.get(srv_id, RELAY_PORT_BASE)

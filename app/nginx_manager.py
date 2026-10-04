@@ -26,7 +26,7 @@ PID_FILE = NGINX_DIR / "logs" / "nginx.pid"
 # ⚠ 单一真源: nginx.conf 里那个 `listen 127.0.0.1:<此端口>` 必须与本值一致。
 #   为什么单列一个端口而不是复用 80/443: 那两处已被 default_server 与全部 site-*.conf
 #   占用 (host 路由), 再塞一个状态 location 会与"未登记域名一律 444"的语义纠缠。
-#   该端口与既有段无冲突: relay 44311-44374 / ECH 44401 / h3 腿 44411 / PAC 44500-44501。
+#   该端口与既有段无冲突: relay 44311-44438 / ECH 44401 / h3 腿 44411 / PAC 44500-44501。
 NGINX_STATUS_PORT = 44421
 
 
