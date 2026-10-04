@@ -172,6 +172,20 @@ scripts/probe_*.py
 #     · probe_gvs_alt_paths.py — 替代通路 (端口 / 传输) 的判据 ⇒ §7.6.5
 !scripts/probe_gvs_nodes.py
 !scripts/probe_gvs_alt_paths.py
+# ★ 例外 (2026-10-04, 同一理由): "探测报不可用而实际可用" 的判据载体 ——
+#   diag_* 诊断、verify_* 端到端验证。它们承载的结论同样写在被忽略的 docs/ 里:
+#     · diag_probe_false_negatives.py — 生产判据 vs 原始状态码 (哪些被判可疑)
+#     · diag_tcp_vs_quic.py           — 同 IP 只换传输 (TCP 挂 / QUIC 通)
+#     · diag_direct_vs_proxy.py       — 直连 vs 经代理 (区分"服务不可用"与"本机路径不通")
+#     · verify_image_fetch_via_proxy.py / verify_gallery_images_via_proxy.py
+#                                     — 经服务后**图片能否真正取到** (不是只看状态码)
+#     · verify_xbox_github_paths.py   — xbox / GitHub 家族的直连 vs 代理可达性
+!scripts/diag_probe_false_negatives.py
+!scripts/diag_tcp_vs_quic.py
+!scripts/diag_direct_vs_proxy.py
+!scripts/verify_image_fetch_via_proxy.py
+!scripts/verify_gallery_images_via_proxy.py
+!scripts/verify_xbox_github_paths.py
 scripts/audit_*.py
 scripts/test_*.py
 scripts/benchmark_*.py

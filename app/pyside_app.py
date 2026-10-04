@@ -117,6 +117,43 @@ def is_ech_service(sid: str) -> bool:
     return bool(profile and getattr(profile, "ech_enabled", False))
 
 
+def single_test_unsupported_reason(sid: str) -> str:
+    """该服务**是否不该做按候选 IP 的测速**; 返回原因 (空串 = 可以测)
+
+    为什么需要它 (2026-10-04, 用户实测反馈"近期新增的服务基本都是 ECH + 测速必失败"):
+      有一类服务的**上游是本机的一条腿/隧道**, 与候选池里的边缘地址无关:
+        · ECH 隧道类 (`ech_enabled`, 上游 127.0.0.1:44401) —— 候选池里的 CF 边缘在
+          **普通握手**下必然失败 (实测: 同一个 IP, 裸 TLS 在发 ClientHello 后 70~290ms
+          被 RST, 而经 ECH 隧道同一 IP 返回 200。SNI 是否加密是唯一变量);
+        · 本地 h3 腿类 (`h3_upstream`, 上游 127.0.0.1:44411) —— 候选池为**空**,
+          按 IP 测速没有任何对象。
+      对这两类跑 `test_service_dual` 只会得到"逐个 IP 超时" ⇒ UI 显示红色"超时"、
+      巡检连续失败还会触发无意义自愈 + reload nginx。**这是纯误报。**
+
+    ★ 判据为什么用**静态画像事实** (`ech_enabled` / `h3_upstream` / 空候选池),
+      而不是 `cdn_opt.last_ech_services`:
+        后者由"上一次生成 upstream 时隧道是否健康"决定, **会随隧道状态脱钩** ——
+        恰好在隧道不健康时就退回"按候选池判", 于是误报在最需要如实告知时出现。
+      (巡检 `check_and_heal_service` 仍用 `last_ech_services`, 那是另一件事:
+       它要判"当前这条链路是什么", 见 tests/test_ech_health_diversion.py 的理由。)
+
+    为什么做成模块级纯函数: `render_cdn_results` 会被轻量替身对象调用
+    (见 is_ech_service 的同款注释), 且这样它能被离线单测直接钉住。
+    """
+    from service_profile import PROFILES_BY_ID
+
+    p = PROFILES_BY_ID.get(sid)
+    if p is None:
+        return ""
+    if getattr(p, "ech_enabled", False):
+        return "该服务经 ECH 隧道出网, 候选 IP 在普通握手下一律失败, 按 IP 测速无意义"
+    if getattr(p, "h3_upstream", False):
+        return "该服务经本地 HTTP/3 上游腿出网 (无候选 IP 池), 按 IP 测速无意义"
+    if not (getattr(p, "candidate_ips", None) or CANDIDATE_IPS.get(sid)):
+        return "该服务没有候选 IP 池 (上游是本机代理端口), 按 IP 测速无意义"
+    return ""
+
+
 # 巡检周期从配置读取 (health_check_interval_seconds), 支持设置页运行中调整
 health_monitor = CDNHealthMonitor(cdn_opt,
                                   check_interval=float(load_config().get("health_check_interval_seconds") or 30),
@@ -365,7 +402,11 @@ class CDNTestWorker(QThread):
         self._stop_requested = True
 
     def run(self):
-        results = cdn_opt.test_all_services()
+        try:
+            results = cdn_opt.test_all_services()
+        except Exception as e:
+            print(f"[CDNTestWorker] 全量测速异常: {e}")
+            results = {}
         if not self._stop_requested:
             self.finished.emit(results)
 
@@ -427,7 +468,11 @@ class SingleCDNTestWorker(QThread):
         self._stop_requested = True
 
     def run(self):
-        results = cdn_opt.test_service_dual(self.srv_id)
+        try:
+            results = cdn_opt.test_service_dual(self.srv_id)
+        except Exception as e:
+            print(f"[SingleCDNTestWorker] 服务 [{self.srv_id}] 独立测速异常: {e}")
+            results = []
         if not self._stop_requested:
             self.finished.emit(self.srv_id, results)
 
@@ -576,10 +621,10 @@ class SteamAccountCard(QFrame):
         top_box.addLayout(meta_box)
         top_box.addStretch()
 
-        if is_active:
-            lbl_active_tag = QLabel("● 当前活跃")
-            lbl_active_tag.setProperty("class", "ActiveTagLabel")
-            top_box.addWidget(lbl_active_tag)
+        self.lbl_active_tag = QLabel("● 当前活跃")
+        self.lbl_active_tag.setProperty("class", "ActiveTagLabel")
+        self.lbl_active_tag.setVisible(is_active)
+        top_box.addWidget(self.lbl_active_tag)
 
         layout.addLayout(top_box)
 
@@ -593,12 +638,26 @@ class SteamAccountCard(QFrame):
         bot_box.addWidget(lbl_time)
         bot_box.addStretch()
 
-        btn_switch = QPushButton("重连" if is_active else "免密切换")
-        btn_switch.setProperty("class", "MDBtnTonal" if is_active else "MDBtnPrimary")
-        btn_switch.clicked.connect(lambda: self.double_clicked.emit(self.steamid))
-        bot_box.addWidget(btn_switch)
+        self.btn_switch = QPushButton("重连" if is_active else "免密切换")
+        self.btn_switch.setProperty("class", "MDBtnTonal" if is_active else "MDBtnPrimary")
+        self.btn_switch.clicked.connect(lambda: self.double_clicked.emit(self.steamid))
+        bot_box.addWidget(self.btn_switch)
 
         layout.addLayout(bot_box)
+
+    def set_active_state(self, is_active: bool):
+        """原位平滑更新活跃状态，无需销毁卡片重绘"""
+        self.is_active = is_active
+        self.setProperty("class", "AccountCardActive" if is_active else "AccountCard")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if hasattr(self, "lbl_active_tag") and self.lbl_active_tag:
+            self.lbl_active_tag.setVisible(is_active)
+        if hasattr(self, "btn_switch") and self.btn_switch:
+            self.btn_switch.setText("重连" if is_active else "免密切换")
+            self.btn_switch.setProperty("class", "MDBtnTonal" if is_active else "MDBtnPrimary")
+            self.btn_switch.style().unpolish(self.btn_switch)
+            self.btn_switch.style().polish(self.btn_switch)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击卡片直接触发免密切换"""
@@ -929,29 +988,13 @@ class CoverSniCard(QFrame):
             self.lbl_detail.setText("\n".join(lines))
             return
 
-        levels, detail = [], []
+        levels = []
         for s in states:
             age = s.age()
             fresh = "刚刚" if age < 60 else f"{int(age // 60)} 分钟前"
             levels.append(f"{_name(s)}: {s.level_label} (策略={s.strategy}) · {fresh} 复检")
-            cur = next((r for r in s.results if r.strategy == s.strategy), None)
-            if cur:
-                detail.append(f"[{_name(s)}] 节点 TLS 通过 {cur.tls_ok}/{cur.total}, "
-                              f"真实 Host 探活 {cur.http_ok}/{cur.total}")
-                if getattr(cur, "passing_ips", None):
-                    detail.append(f"  可用节点: {'、'.join(cur.passing_ips)}")
-                if cur.verify_possible:
-                    detail.append("  该策略下证书名匹配真实域名 (具备开启上游证书校验的条件)")
-                else:
-                    detail.append("  掩护策略下证书名必然不匹配真实域名 —— 运行期必须关闭上游证书校验 "
-                                  "(伪 SNI 的固有代价, 由探测阶段的证书门槛补偿)")
-            if s.notes:
-                detail.append(f"  {s.notes}")
-            down = [r.strategy for r in s.results if not r.passed and r.strategy != s.strategy]
-            if down:
-                detail.append(f"  已淘汰: {'、'.join(down)}")
         self.lbl_level.setText("当前通路 —— " + " | ".join(levels))
-        self.lbl_detail.setText("\n".join(detail))
+        self.lbl_detail.setText("")
 
     def recheck(self):
         """后台跑一次强制回归 (网络探测不能放 UI 线程, 否则界面冻结)
@@ -1614,14 +1657,9 @@ class MainWindow(QMainWindow):
 
         # 页面标题与一键收拢/展开操作
         header_row = QHBoxLayout()
-        title_box = QVBoxLayout()
         title = QLabel("加速控制中心")
         title.setObjectName("PageTitle")
-        desc = QLabel("自动托管网络代理与 Hosts 规则，加速热门海外游戏、创作与开发服务")
-        desc.setObjectName("PageDesc")
-        title_box.addWidget(title)
-        title_box.addWidget(desc)
-        header_row.addLayout(title_box)
+        header_row.addWidget(title)
         header_row.addStretch()
 
         is_all_collapsed = (len(self.collapsed_sections) >= len(SERVICE_GROUPS) + 1)
@@ -1676,10 +1714,10 @@ class MainWindow(QMainWindow):
         for c_idx in range(4):
             stat_grid.setColumnStretch(c_idx, 1)
 
-        self.card_stat_nginx = self.create_stat_card("Nginx 数据平面", "检测中...", "反代引擎与磁盘缓存", "server")
-        self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "系统受信任证书库", "lock")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "专属规则块隔离", "file_text")
-        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "支持双击免密切换", "gamepad")
+        self.card_stat_nginx = self.create_stat_card("核心加速服务", "检测中...", "", "server")
+        self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "", "lock")
+        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "", "file_text")
+        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "", "gamepad")
 
         stat_grid.addWidget(self.card_stat_nginx, 0, 0)
         stat_grid.addWidget(self.card_stat_cert, 0, 1)
@@ -1702,16 +1740,12 @@ class MainWindow(QMainWindow):
         mc_layout.addWidget(self.lbl_main_icon)
 
         mc_info = QVBoxLayout()
-        mc_info.setSpacing(4)
+        mc_info.setSpacing(6)
         self.lbl_main_status = QLabel("加速服务已停止")
         self.lbl_main_status.setProperty("class", "MainStatusTitle")
-        self.lbl_main_sub = QLabel("点击右侧按钮开启本地代理与 Hosts 规则接管")
-        self.lbl_main_sub.setProperty("class", "MainStatusSub")
-        self.lbl_main_sub.setWordWrap(True)
         mc_info.addWidget(self.lbl_main_status)
-        mc_info.addWidget(self.lbl_main_sub)
 
-        self.chk_auto_proxy = QCheckBox("开启自动托管代理 (开机/启动自动加速与后台自动检查恢复)")
+        self.chk_auto_proxy = QCheckBox("开机自动启动加速")
         self.chk_auto_proxy.setChecked(load_config().get("auto_proxy", True))
         self.chk_auto_proxy.toggled.connect(self.on_auto_proxy_toggled)
         mc_info.addWidget(self.chk_auto_proxy)
@@ -1732,7 +1766,7 @@ class MainWindow(QMainWindow):
         search_box.setSpacing(10)
         self.txt_service_search = QLineEdit()
         self.txt_service_search.setProperty("class", "ServiceSearchInput")
-        self.txt_service_search.setPlaceholderText("快速搜索加速服务 (支持名称/描述/拼音首字母，如: GitHub / Pixiv / Steam / EA)...")
+        self.txt_service_search.setPlaceholderText("搜索服务 (名称 / 拼音首字母)...")
         if SvgIconFactory:
             self.txt_service_search.addAction(SvgIconFactory.get_icon("search", "#75879E" if is_dark else "#94A3B8", 16), QLineEdit.LeadingPosition)
         self.txt_service_search.setClearButtonEnabled(True)
@@ -1784,17 +1818,10 @@ class MainWindow(QMainWindow):
         self.group_icon_labels[grp_id] = (grp_icon_lbl, grp_info.get("icon", "zap"))
         grp_header.addWidget(grp_icon_lbl)
 
-        grp_title_box = QVBoxLayout()
-        grp_title_box.setSpacing(2)
         grp_title = QLabel(grp_info['name'])
         grp_title.setProperty("class", "CategoryTitle")
         grp_title.setWordWrap(True)
-        grp_desc = QLabel(grp_info["desc"])
-        grp_desc.setProperty("class", "CategoryDesc")
-        grp_desc.setWordWrap(True)
-        grp_title_box.addWidget(grp_title)
-        grp_title_box.addWidget(grp_desc)
-        grp_header.addLayout(grp_title_box)
+        grp_header.addWidget(grp_title)
 
         grp_header.addStretch()
 
@@ -2006,7 +2033,10 @@ class MainWindow(QMainWindow):
         lbl_hint.setWordWrap(True)
 
         l.addWidget(lbl_val)
-        l.addWidget(lbl_hint)
+        if hint:
+            l.addWidget(lbl_hint)
+        else:
+            lbl_hint.setVisible(False)
 
         card.lbl_val = lbl_val
         card.lbl_title = lbl_title
@@ -2566,7 +2596,7 @@ class MainWindow(QMainWindow):
                 my_nginx_pid = nginx_mgr.get_pid()
                 is_my_nginx = any(p.get("pid") == my_nginx_pid for p in procs) if my_nginx_pid > 0 else False
                 if is_my_nginx:
-                    lbl.setText(f"● 正常监听 (GameArt Toolkit 本地 Nginx, PID: {my_nginx_pid})")
+                    lbl.setText(f"● 正常监听 (核心加速服务, PID: {my_nginx_pid})")
                     lbl.setStyleSheet("color: #38BDF8; font-weight: 500;")
                     if btn:
                         btn.setVisible(False)
@@ -2930,19 +2960,58 @@ class MainWindow(QMainWindow):
             card.double_clicked.connect(self.switch_steam_account)
             self.accounts_container.addWidget(card)
 
+    def _set_steam_card_loading(self, target_steamid: str, loading: bool):
+        """控制 Steam 卡片按钮的加载中置灰与文案切换"""
+        if not hasattr(self, "accounts_container") or not self.accounts_container:
+            return
+        for i in range(self.accounts_container.count()):
+            item = self.accounts_container.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, SteamAccountCard):
+                if w.steamid == target_steamid and hasattr(w, "btn_switch") and w.btn_switch:
+                    if loading:
+                        w.btn_switch.setEnabled(False)
+                        w.btn_switch.setText("切换中...")
+                    else:
+                        w.btn_switch.setEnabled(True)
+                        w.btn_switch.setText("重连" if w.is_active else "免密切换")
+
     def switch_steam_account(self, steamid: str):
         if self.steam_worker and self.steam_worker.isRunning():
             show_toast(self, "正在切换中，请稍候...", toast_type="info", duration=1500)
             return
 
+        self._set_steam_card_loading(steamid, True)
         show_toast(self, "正在安全关闭 Steam 并切换活跃凭据...", toast_type="info", duration=2500)
         self.steam_worker = SteamSwitchWorker(steamid)
         self.steam_worker.finished.connect(self._on_steam_switch_finished)
         self.steam_worker.start()
 
+    def _update_steam_accounts_active_state(self, target_steamid: str) -> bool:
+        """原位轻量更新 Steam 卡片的活跃高亮，避免全量重建与界面闪烁"""
+        if not hasattr(self, "accounts_container") or not self.accounts_container:
+            return False
+        count = self.accounts_container.count()
+        if count == 0:
+            return False
+        cards = []
+        for i in range(count):
+            item = self.accounts_container.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, SteamAccountCard):
+                cards.append(w)
+        if not cards:
+            return False
+        for card in cards:
+            card.set_active_state(card.steamid == target_steamid)
+        return True
+
     def _on_steam_switch_finished(self, ok: bool, msg: str, steamid: str):
+        self._set_steam_card_loading(steamid, False)
         if ok:
             show_toast(self, f"Steam 切换成功: {msg}", toast_type="success", duration=3200)
+            if not self._update_steam_accounts_active_state(steamid):
+                self.load_steam_accounts_ui()
         else:
             show_toast(
                 self, f"切换失败: {msg}",
@@ -2950,7 +3019,7 @@ class MainWindow(QMainWindow):
                 action_text="重试",
                 on_action=lambda: self.switch_steam_account(steamid)
             )
-        self.load_steam_accounts_ui()
+            self.load_steam_accounts_ui()
 
     def launch_steam_app(self):
         ok, msg = steam_mgr.launch_steam()
@@ -2975,7 +3044,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("CDN 测速与动态 Upstream 优选")
         title.setObjectName("PageTitle")
-        desc = QLabel("多线程并发探测全量服务的候选 IP 延迟，自动生成延迟最低的 upstream 并热重载 Nginx")
+        desc = QLabel("并发探测各加速节点的网络延迟，自动应用延迟最低的最佳节点线路")
         desc.setObjectName("PageDesc")
         title_box.addWidget(title)
         title_box.addWidget(desc)
@@ -3325,7 +3394,14 @@ class MainWindow(QMainWindow):
             card_l.setSpacing(10)
 
             card_top = QHBoxLayout()
-            lbl_title = QLabel(f"{name} (共 {len(ip_list)} 个候选 IP)")
+            # ★ 无候选池 / 上游是本机腿的服务: 标题不说"共 N 个候选 IP" —— 那会让人以为
+            #   下面那串"超时"是节点坏了 (实测: googlevideo 候选池为空; ECH 类候选在
+            #   普通握手下一律 RST)。如实说"上游为本机代理端口"。
+            _why_card = single_test_unsupported_reason(sid)
+            if _why_card and not ip_list:
+                lbl_title = QLabel(f"{name} (上游为本机代理端口, 无候选 IP)")
+            else:
+                lbl_title = QLabel(f"{name} (共 {len(ip_list)} 个候选 IP)")
             lbl_title.setProperty("class", "CategoryTitle")
             lbl_title.setWordWrap(True)
             card_top.addWidget(lbl_title)
@@ -3334,9 +3410,15 @@ class MainWindow(QMainWindow):
             btn_single = QPushButton("独立测速")
             btn_single.setIcon(SvgIconFactory.get_icon("zap", primary_c, 12) if SvgIconFactory else QIcon())
             btn_single.setProperty("class", "MDBtnTiny")
-            btn_single.setCursor(Qt.PointingHandCursor)
-            btn_single.setToolTip(f"仅探测 {name} 的候选 IP 延迟并热重载生效")
-            btn_single.clicked.connect(lambda _, s=sid: self.start_single_cdn_ping(s))
+            if _why_card:
+                # 不可测: 保留按钮位避免布局错位, 但禁用并说明原因
+                # (与 _render_ech_service_card 同一形态 —— 那里早已这么做)
+                btn_single.setEnabled(False)
+                btn_single.setToolTip(_why_card)
+            else:
+                btn_single.setCursor(Qt.PointingHandCursor)
+                btn_single.setToolTip(f"仅探测 {name} 的候选 IP 延迟并热重载生效")
+                btn_single.clicked.connect(lambda _, s=sid: self.start_single_cdn_ping(s))
             self.cdn_single_buttons[sid] = btn_single
             card_top.addWidget(btn_single)
             card_l.addLayout(card_top)
@@ -3409,6 +3491,14 @@ class MainWindow(QMainWindow):
 
     def start_single_cdn_ping(self, sid: str):
         """单服务独立测速 (秒级并发探测 + 增量热重载)"""
+        # ★ 动作层护栏 (2026-10-04): 只把按钮置灰挡不住其它入口 (工具栏/快捷键/未来调用),
+        #   而且静默失败正是要根除的东西。这里**先拦**并如实说明原因。
+        _why = single_test_unsupported_reason(sid)
+        if _why:
+            show_toast(self, f"[{SERVICES_BY_ID.get(sid, {}).get('name', sid)}] {_why}",
+                       toast_type="info", duration=5000)
+            return
+
         if sid in self._single_cdn_workers and self._single_cdn_workers[sid].isRunning():
             show_toast(self, f"[{SERVICES_BY_ID.get(sid, {}).get('name', sid)}] 正在测速中...", toast_type="info", duration=1500)
             return
@@ -3431,7 +3521,10 @@ class MainWindow(QMainWindow):
             self._single_cdn_workers.pop(sid, None)
 
         if sid in self.cdn_single_buttons:
-            self.cdn_single_buttons[sid].setEnabled(True)
+            # 不可测的服务保持置灰 (否则一次异常回调就把它恢复成可点, 见
+            # single_test_unsupported_reason 的说明)
+            if not single_test_unsupported_reason(sid):
+                self.cdn_single_buttons[sid].setEnabled(True)
             self.cdn_single_buttons[sid].setText("独立测速")
 
         if not self.cached_cdn_results:
@@ -3599,35 +3692,48 @@ class MainWindow(QMainWindow):
     def apply_optimal_cdn(self):
         if not self.cached_cdn_results:
             return
-        ok, msg = cdn_opt.apply_optimal(self.cached_cdn_results)
-        if ok:
-            cfg = load_config()
-            cfg["last_optimal_time"] = int(time.time())
-            cfg["cached_cdn_full_results"] = self.cached_cdn_results
-            # 同步更新主控制台全部服务延迟微徽章与持久化
-            saved_lats = cfg.get("cached_latencies", {})
-            for sid, ip_list in self.cached_cdn_results.items():
-                if ip_list and sid in self.service_badges:
-                    best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
-                    is_proxy = (sid in cdn_opt.last_relay_services)
-                    if is_ech_service(sid):
-                        # ECH 服务: 节点全部"不可用"是预期结果, 展示隧道状态
-                        self._set_badge(sid, 0)
-                        saved_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
-                    elif best_lat != 9999:
-                        self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
-                        saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
 
-            cfg["cached_latencies"] = saved_lats
-            save_config(cfg)
+        if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
+            self.btn_apply_cdn.setEnabled(False)
+            self.btn_apply_cdn.setText("正在应用...")
 
-            if nginx_mgr.is_running():
-                nginx_mgr.reload()
-                show_toast(self, f"{msg} (已热重载生效)", toast_type="success", duration=3000)
+        def _restore_apply_btn():
+            if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
+                self.btn_apply_cdn.setEnabled(True)
+                self.btn_apply_cdn.setText("应用测速结果")
+
+        try:
+            ok, msg = cdn_opt.apply_optimal(self.cached_cdn_results)
+            if ok:
+                cfg = load_config()
+                cfg["last_optimal_time"] = int(time.time())
+                cfg["cached_cdn_full_results"] = self.cached_cdn_results
+                # 同步更新主控制台全部服务延迟微徽章与持久化
+                saved_lats = cfg.get("cached_latencies", {})
+                for sid, ip_list in self.cached_cdn_results.items():
+                    if ip_list and sid in self.service_badges:
+                        best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
+                        is_proxy = (sid in cdn_opt.last_relay_services)
+                        if is_ech_service(sid):
+                            # ECH 服务: 节点全部"不可用"是预期结果, 展示隧道状态
+                            self._set_badge(sid, 0)
+                            saved_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
+                        elif best_lat != 9999:
+                            self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
+                            saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+
+                cfg["cached_latencies"] = saved_lats
+                save_config(cfg)
+
+                if nginx_mgr.is_running():
+                    nginx_mgr.reload()
+                    show_toast(self, f"{msg} (已热重载生效)", toast_type="success", duration=3000)
+                else:
+                    show_toast(self, f"{msg} (将在下次启动代理时生效)", toast_type="info", duration=3000)
             else:
-                show_toast(self, f"{msg} (将在下次启动代理时生效)", toast_type="info", duration=3000)
-        else:
-            show_toast(self, f"应用失败: {msg}", toast_type="error", duration=4000)
+                show_toast(self, f"应用失败: {msg}", toast_type="error", duration=4000)
+        finally:
+            QTimer.singleShot(600, _restore_apply_btn)
 
     # ------------------ PAGE 4: 系统诊断与设置 ------------------
     def _build_settings_env_card(self, primary_icon_c: str) -> QFrame:
@@ -4025,6 +4131,7 @@ class MainWindow(QMainWindow):
         btn_diag_hosts = QPushButton("体检并修正 Hosts")
         btn_diag_hosts.setProperty("class", "MDBtnTonal")
         btn_diag_hosts.clicked.connect(self.diagnose_hosts_action)
+        self.btn_diag_hosts = btn_diag_hosts
 
         btn_restore_hosts = QPushButton("恢复系统官方纯净 Hosts")
         btn_restore_hosts.setProperty("class", "MDBtnOutlined")
@@ -4316,6 +4423,7 @@ class MainWindow(QMainWindow):
         btn_test_proxy = QPushButton("测试代理连通性")
         btn_test_proxy.setProperty("class", "MDBtnOutlined")
         btn_test_proxy.clicked.connect(self.test_proxy_action)
+        self.btn_test_proxy = btn_test_proxy
 
         row_pxy_fields.addWidget(lbl_phost)
         row_pxy_fields.addWidget(self.txt_proxy_host)
@@ -4728,9 +4836,12 @@ class MainWindow(QMainWindow):
         btn_inst_cert = QPushButton("静默安装证书")
         btn_inst_cert.setProperty("class", "MDBtnTonal")
         btn_inst_cert.clicked.connect(self.install_cert_action)
+        self.btn_inst_cert = btn_inst_cert
+
         btn_uninst_cert = QPushButton("卸载根证书")
         btn_uninst_cert.setProperty("class", "MDBtnOutlined")
         btn_uninst_cert.clicked.connect(self.uninstall_cert_action)
+        self.btn_uninst_cert = btn_uninst_cert
         cc_btn_box.addWidget(btn_inst_cert)
         cc_btn_box.addWidget(btn_uninst_cert)
         cc_btn_box.addStretch()
@@ -4966,21 +5077,31 @@ class MainWindow(QMainWindow):
         tip = "已设置为关闭主窗口时最小化到托盘" if action == "minimize_to_tray" else "已设置为关闭主窗口时完全退出程序"
         show_toast(self, tip, toast_type="info", duration=2000)
 
-    def _run_in_background(self, fn, on_done, busy_attr: str = ""):
+    def _run_in_background(self, fn, on_done, busy_attr: str = "", trigger_btn: Optional[QWidget] = None):
         """在后台线程执行重活, 完成后回 UI 线程回调
 
         :param on_done: 在主线程接收结果 (可能为 Exception 实例)
         :param busy_attr: 用于防重入的实例属性名 (同名 worker 运行期间忽略再次触发)
+        :param trigger_btn: 触发该任务的 UI 按钮 (执行期间自动禁用防重入，完成自动恢复)
         """
         if busy_attr:
             running = getattr(self, busy_attr, None)
             if running is not None and running.isRunning():
                 return
+        if trigger_btn is not None:
+            try:
+                trigger_btn.setEnabled(False)
+            except Exception:
+                pass
         worker = BackgroundTaskWorker(fn)
 
         def _deliver(result):
-            # 投递后立即断开: 否则 worker → lambda → 窗口 形成循环引用, 解释器收尾时
-            # Qt 对象析构顺序不确定 (实测表现为退出时的访问违例)
+            # 投递后立即断开并恢复触发按钮状态: 避免循环引用
+            if trigger_btn is not None:
+                try:
+                    trigger_btn.setEnabled(True)
+                except Exception:
+                    pass
             try:
                 worker.done.disconnect(_deliver)
             except Exception:
@@ -5010,7 +5131,8 @@ class MainWindow(QMainWindow):
             self._start_status_probe()
 
         self._run_in_background(lambda: hosts_mgr.diagnose_and_repair(auto_fix=True),
-                                _done, busy_attr="_hosts_diag_worker")
+                                _done, busy_attr="_hosts_diag_worker",
+                                trigger_btn=getattr(self, "btn_diag_hosts", None))
 
     def restore_hosts_action(self):
         ok, msg = hosts_mgr.restore_default_windows_hosts()
@@ -5036,7 +5158,8 @@ class MainWindow(QMainWindow):
 
         # check_proxy_alive 是带超时的真实连接 (实测约 1s), 放后台避免点击即卡
         self._run_in_background(lambda: check_proxy_alive(host, port), _done,
-                                busy_attr="_proxy_test_worker")
+                                busy_attr="_proxy_test_worker",
+                                trigger_btn=getattr(self, "btn_test_proxy", None))
 
     def on_proxy_config_changed(self):
         host = self.txt_proxy_host.text().strip() or "127.0.0.1" if hasattr(self, 'txt_proxy_host') else "127.0.0.1"
@@ -5060,7 +5183,8 @@ class MainWindow(QMainWindow):
             self._start_status_probe()
 
         self._run_in_background(lambda: cert_mgr.install_cert(), _done,
-                                busy_attr="_cert_install_worker")
+                                busy_attr="_cert_install_worker",
+                                trigger_btn=getattr(self, "btn_inst_cert", None))
 
     def uninstall_cert_action(self):
         def _done(result):
@@ -5072,7 +5196,8 @@ class MainWindow(QMainWindow):
             self._start_status_probe()
 
         self._run_in_background(lambda: cert_mgr.uninstall_cert(), _done,
-                                busy_attr="_cert_uninstall_worker")
+                                busy_attr="_cert_uninstall_worker",
+                                trigger_btn=getattr(self, "btn_uninst_cert", None))
 
     def _get_cache_size_str(self) -> str:
         try:
@@ -5269,15 +5394,9 @@ class MainWindow(QMainWindow):
         self.watchdog_timer.start(8000)
 
     def update_traffic_metrics(self):
-        is_acc = nginx_mgr.is_running() and self._is_redirect_active()
-        if is_acc:
-            # 维持加速链路活跃脉冲 (模拟平稳基线)
-            base_down = random.uniform(10.0, 85.0)
-            base_up = random.uniform(2.0, 15.0)
-            req_inc = 1 if random.random() < 0.4 else 0
-            self.traffic_chart.add_sample(base_down, base_up, req_inc, 1 if req_inc else 0)
-        else:
-            self.traffic_chart.add_sample(0.0, 0.0, 0, 0)
+        # 遵循项目不静默假可用原则: 严禁伪造 random 随机流量数据
+        # 未接入真实网卡抓包/Nginx 内部统计前保持平直基线，如实呈现就绪待命状态
+        self.traffic_chart.add_sample(0.0, 0.0, 0, 0)
 
     def _start_status_probe(self):
         if self._status_worker and self._status_worker.isRunning():
@@ -5599,6 +5718,14 @@ class MainWindow(QMainWindow):
                                local_dns_server, REDIRECT_STATE)
 
     def toggle_acceleration(self):
+        # 防重入保护: 若已有启停任务在后台执行，忽略狂点并提示，杜绝启停死锁竞态
+        start_worker = getattr(self, "_accel_start_worker", None)
+        stop_worker = getattr(self, "_accel_stop_worker", None)
+        if (start_worker is not None and start_worker.isRunning()) or \
+           (stop_worker is not None and stop_worker.isRunning()):
+            show_toast(self, "加速服务状态切换中，请稍候...", toast_type="info", duration=1500)
+            return
+
         is_acc = nginx_mgr.is_running() and self._is_redirect_active()
         if is_acc:
             self.stop_acceleration()
@@ -5626,6 +5753,11 @@ class MainWindow(QMainWindow):
             self._finish_start_acceleration(
                 self._start_acceleration_heavy(show_toast_on_fail), show_toast_on_fail)
             return
+
+        # UI 即时过渡态反馈: 立即置灰防狂点，给出明确文案
+        if hasattr(self, "btn_toggle_acc") and self.btn_toggle_acc:
+            self.btn_toggle_acc.setEnabled(False)
+            self.btn_toggle_acc.setText("正在启动加速...")
 
         self._run_in_background(
             lambda: self._start_acceleration_heavy(show_toast_on_fail),
@@ -5717,8 +5849,17 @@ class MainWindow(QMainWindow):
 
     def _finish_start_acceleration(self, result: Dict[str, Any], show_toast_on_fail: bool):
         """启动加速的界面收尾 (仅在 UI 线程执行)"""
+        def _restore_btn_failed():
+            if hasattr(self, "btn_toggle_acc") and self.btn_toggle_acc:
+                self.btn_toggle_acc.setEnabled(True)
+                self.btn_toggle_acc.setText("启动加速服务")
+                self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
+                self.btn_toggle_acc.style().unpolish(self.btn_toggle_acc)
+                self.btn_toggle_acc.style().polish(self.btn_toggle_acc)
+
         stage = (result or {}).get("stage", "error")
         if stage == "redirect_fail":
+            _restore_btn_failed()
             msg = result.get("msg", "")
             if not result.get("prompted"):
                 if show_toast_on_fail:
@@ -5734,14 +5875,24 @@ class MainWindow(QMainWindow):
                                on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup))
             return
         if stage == "nginx_fail":
+            _restore_btn_failed()
             if show_toast_on_fail:
-                show_toast(self, f"Nginx 启动失败: {result.get('msg', '')}", toast_type="error", duration=4000)
+                show_toast(self, f"核心加速服务启动失败: {result.get('msg', '')}", toast_type="error", duration=4000)
             else:
-                self.notify_tray("Nginx 启动提示", result.get("msg", ""), QSystemTrayIcon.Warning, 2500)
+                self.notify_tray("核心加速服务启动提示", result.get("msg", ""), QSystemTrayIcon.Warning, 2500)
             return
         if stage == "error":
+            _restore_btn_failed()
             show_toast(self, f"启动加速失败: {result.get('msg', '')}", toast_type="error", duration=4000)
             return
+
+        # 启动成功，更新按钮状态
+        if hasattr(self, "btn_toggle_acc") and self.btn_toggle_acc:
+            self.btn_toggle_acc.setEnabled(True)
+            self.btn_toggle_acc.setText("停止加速服务")
+            self.btn_toggle_acc.setProperty("class", "MDBtnStop")
+            self.btn_toggle_acc.style().unpolish(self.btn_toggle_acc)
+            self.btn_toggle_acc.style().polish(self.btn_toggle_acc)
 
         services = result.get("services") or []
         # 掩护 SNI 状态卡刷新 (方案 §10 第 6 条: 降级必须可见)。
@@ -5934,6 +6085,12 @@ class MainWindow(QMainWindow):
             self._stop_acceleration_heavy()
             self._finish_stop_acceleration()
             return
+
+        # UI 即时过渡态反馈: 立即置灰防狂点，给出明确文案
+        if hasattr(self, "btn_toggle_acc") and self.btn_toggle_acc:
+            self.btn_toggle_acc.setEnabled(False)
+            self.btn_toggle_acc.setText("正在停止加速...")
+
         self._run_in_background(self._stop_acceleration_heavy,
                                 lambda _r: self._finish_stop_acceleration(),
                                 busy_attr="_accel_stop_worker")
@@ -5954,6 +6111,14 @@ class MainWindow(QMainWindow):
 
     def _finish_stop_acceleration(self):
         """停止加速的界面收尾 (仅在 UI 线程执行)"""
+        # 恢复一键按钮状态
+        if hasattr(self, "btn_toggle_acc") and self.btn_toggle_acc:
+            self.btn_toggle_acc.setEnabled(True)
+            self.btn_toggle_acc.setText("启动加速服务")
+            self.btn_toggle_acc.setProperty("class", "MDBtnPrimary")
+            self.btn_toggle_acc.style().unpolish(self.btn_toggle_acc)
+            self.btn_toggle_acc.style().polish(self.btn_toggle_acc)
+
         backend = REDIRECT_STATE.get("backend")
         cleaned = "NRPT 与 Hosts 规则均已还原" if backend is None else "重定向规则已还原"
         show_toast(self, f"加速服务已停止，{cleaned}", toast_type="info", duration=2200)
@@ -6269,34 +6434,39 @@ class MainWindow(QMainWindow):
             show_toast(self, "CDN 持续健康巡检已关闭", toast_type="info", duration=2000)
 
     def optimize_git_config_action(self):
-        """一键优化 Windows Git 命令行网络与大文件传输配置"""
+        """一键优化 Windows Git 命令行网络与大文件传输配置 (异步后台执行，防冻结界面)"""
         import shutil
         git_exe = shutil.which("git")
         if not git_exe:
             show_toast(self, "未检测到系统安装的 Git 命令行工具", toast_type="warning", duration=3000)
             return
 
-        cmds = [
-            ["git", "config", "--global", "http.postBuffer", "524288000"],
-            ["git", "config", "--global", "http.lowSpeedLimit", "0"],
-            ["git", "config", "--global", "http.lowSpeedTime", "999999"],
-            ["git", "config", "--global", "http.version", "HTTP/1.1"],
-            ["git", "config", "--global", "core.compression", "0"],
-        ]
-        success_count = 0
-        for cmd in cmds:
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                                      timeout=3, **get_silent_startup_kwargs())
-                if proc.returncode == 0:
-                    success_count += 1
-            except Exception:
-                pass
+        def _do_optimize():
+            cmds = [
+                ["git", "config", "--global", "http.postBuffer", "524288000"],
+                ["git", "config", "--global", "http.lowSpeedLimit", "0"],
+                ["git", "config", "--global", "http.lowSpeedTime", "999999"],
+                ["git", "config", "--global", "http.version", "HTTP/1.1"],
+                ["git", "config", "--global", "core.compression", "0"],
+            ]
+            success_count = 0
+            for cmd in cmds:
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                          timeout=3, **get_silent_startup_kwargs())
+                    if proc.returncode == 0:
+                        success_count += 1
+                except Exception:
+                    pass
+            return success_count
 
-        if success_count >= 3:
-            show_toast(self, "Git 传输配置优化成功！(postBuffer=500MB, 低速超时已解除)", toast_type="success", duration=3500)
-        else:
-            show_toast(self, "Git 配置执行完成", toast_type="info", duration=2500)
+        def _on_done(count):
+            if isinstance(count, Exception) or count < 3:
+                show_toast(self, "Git 配置执行完成", toast_type="info", duration=2500)
+            else:
+                show_toast(self, "Git 传输配置优化成功！(postBuffer=500MB, 低速超时已解除)", toast_type="success", duration=3500)
+
+        self._run_in_background(_do_optimize, _on_done, busy_attr="_git_opt_worker")
 
 
 def show_already_running_message() -> None:
