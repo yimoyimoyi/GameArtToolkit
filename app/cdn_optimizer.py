@@ -613,6 +613,12 @@ def _probe_second_hop(ssock, domain: str, path: str, deadline: float) -> str:
       只比较一次 Location 抓不到 `A → B → A` —— 经 CF 时 `/` 可能先 301 到 `/post`
       （看着像正常规范化），而 `/post` 又 301 回 `/post`。只判一跳 ⇒ 把已坏的通道判成可用。
 
+    ⚠ 2026-10-04 复核: yande.re **已不在 Cloudflare 后面** (源站 `server: freenginx`,
+      A 记录即源站) —— 上述 `/post → /post` 死循环**当前不可复现**: 实测 `/` 301 →
+      `https://yande.re/post`, 而 `/post` 返回 **200 · 193,751B**。该缺陷是"CF 前置时期"
+      的形态, 本函数守的是**通用**的 `A → B → A` 判据 (不针对某站), 故保留;
+      但注释里的 yande.re 只应理解为**历史定案案例**, 不代表它现在会触发这条路径。
+
     ⚠ 这一跳是**尽力而为**、不得影响主判定:
       · 探测请求带 `Connection: close`，服务器可能已经关连接 ⇒ 读写失败一律返回空串；
       · 时限受主探测的 deadline 约束（只允许用剩余预算，最多再等 0.6s）；
@@ -882,6 +888,10 @@ def probe_ip_endpoint_v2(ip: str, domain: str = "", timeout: float = 2.0,
                             #   301 到 `/post` (看着像正常规范化), 而 `/post` 又 301 回 `/post`。
                             #   实测 yande.re 正是这种, 而旧判据 (只认 path=="/") 与两个验收工具
                             #   (干脆不看 Location) 都会把它判成可用 ⇒ 用户侧表现为无限跳转。
+                            # ⚠ 2026-10-04: yande.re 已迁离 Cloudflare (源站 freenginx),
+                            #   该死循环不可再复现 (实测 /post 现返回 200, apex 301 到 /post
+                            #   且 self_redirect 未置位)。此处 yande.re 系**历史定案案例**,
+                            #   下面这段判据本身是通用的, 不因该站迁走而失效。
                             _verdict = http_verdict.classify_redirect(loc, domain, "/")
                             if _verdict == http_verdict.SELF:
                                 out["self_redirect"] = True

@@ -1861,9 +1861,13 @@ class MainWindow(QMainWindow):
 
         grp_services = [s for s in SERVICES_LIST if s["group"] == grp_id]
 
-        # 空分组的如实说明 (2026-10-03): "adult" 受控分组目前还没有任何画像落地。
+        # 空分组的如实说明 (2026-10-03 引入; 2026-10-04 更正注释):
         # 不写这一句, 用户打开总闸后只会看到一张空卡片, 无从判断是"没接入"还是"坏了" ——
         # 本项目一贯要求"宁可说明白, 也不要静默"。
+        # ⚠ 原注释写的是"adult 受控分组目前还没有任何画像落地" —— 该组此后已按批次落地
+        #   15 个画像 (见 service_profile.py 的 adult 分组注释), 那句已过期。
+        #   判据本身是**按键是否为空**动态取的, 不依赖画像数量, 故逻辑无需改; 但写死的
+        #   举例会误导读者以为这里只为 adult 服务 —— 本分支对**任何**空分组都成立。
         if not grp_services:
             lbl_empty = QLabel("暂未接入任何服务（画像落地后会自动出现在这里）")
             lbl_empty.setProperty("class", "ItemDesc")

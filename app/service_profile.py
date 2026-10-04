@@ -148,7 +148,7 @@ class ServiceProfile:
     # (VENDOR_CERT_SUFFIXES 只登记了 google), 于是 `cdn_vendor=""` 的画像**完全没有证书门槛**,
     # 而候选池探测只能看到状态码 ⇒ 别家 vhost / 链路侧劫持页的 2xx 会被当成"可用"收进池
     # (实测假可用形态: 证书 CN=fallback.wgcz.net / flirtify.com, 见
-    #  docs/service-expansion-feasibility-2026-10-03.md §7.1)。
+    #  docs/archive/service-expansion-feasibility-2026-10-03.md §7.1)。
     #
     # 语义: 对端证书的 SAN 必须落在这些**域族**内 (判据 = cover_sni.cert_matches_family,
     # 域族 = SAN 末两段标签)。于是:
@@ -240,8 +240,13 @@ SERVICE_GROUPS = {
     #   · 需要一道**默认关闭**的总闸: 关闭时该分组在控制台不出现, 且其中任何服务
     #     都无法启用 (三层拦截: 界面 → 配置加载清洗 → 默认启用清单, 见 ip_pool.config_store)。
     #
-    # 本组目前**没有任何画像**(18 个候选画像仍待按批次落地), 因此界面会给出一句
-    # "暂未接入任何服务"的如实说明, 而不是静默显示一张空卡片。
+    # 本组已按批次落地画像 (2026-10-04 账目): 15 个 —— pawchive / pawchive_img /
+    #   pawchive_dl / ehentai / nhentai / furaffinity / dlsite / cara / artstation_cdn /
+    #   hitomi / pinimg / ehentai_img / nhentai_img / dlsite_play / sankaku。
+    #   ⚠ 这里原先写的是"本组目前**没有任何画像**(18 个候选画像仍待按批次落地)" ——
+    #     那是分批落地**之前**的说明, 早已过期且会造成错账目 (把"18 个候选"当成待办数)。
+    #   `pyside_app` 的"暂未接入任何服务"是**按键为空**动态判断的, 不依赖本注释, 故此
+    #   注释过期不会导致界面出错 —— 但它会误导下一个读者, 故一并更正。
     # --------------------------------------------------------------------------
     "adult": {
         "id": "adult",
@@ -502,6 +507,11 @@ PROFILES: List[ServiceProfile] = [
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_pixiv_img",
         ssl_sni_mode="empty",
+        # ★ 2026-10-04 补证书域族门槛 (空 SNI 下运行期 `proxy_ssl_verify off`, 证书是唯一防线)。
+        #   实测 9/9 候选在空 SNI 下均返回 SAN=`pximg.net`/`*.pximg.net` ⇒ **零误杀**,
+        #   同时挡掉"回别家 vhost 证书的假可用" (本项目实测过的形态:
+        #   fallback.wgcz.net / flirtify.com)。
+        cert_families=("pximg.net",),
         enable_cache=True,
         candidate_ips=["210.140.139.131", "210.140.139.132", "210.140.139.133", "210.140.139.134", "210.140.139.135", "210.140.139.136", "210.140.139.137", "210.140.139.149", "210.140.139.150"]
     ),
@@ -539,6 +549,13 @@ PROFILES: List[ServiceProfile] = [
         # 两者差别在于 CF 观察到的连接特征不同, ECH 路径可正常加载。
         ech_enabled=True,
         ssl_sni_mode="host",
+        # ⚠ 本画像的 cert_families 只在**探测阶段**生效, 运行期不受保护 —— 这是记录的缺口:
+        #   ECH 画像的 TLS 由本地隧道发起, nginx_generator 对它**完全不输出 proxy_ssl_***
+        #   (:389-394, 否则形成 TLS-in-TLS 使隧道无法注入 ECH 扩展), 而 ECH 隧道
+        #   (`ech_tunnel.py`) 也**不读** cert_families ⇒ 运行期没有任何证书校验。
+        #   添它的价值仍在于: 探测阶段可淘汰"回别家证书"的假候选 (实测 3/3 候选均
+        #   SAN=`booth.pm`/`*.booth.pm` ⇒ 零误杀), 避免污染候选池。
+        cert_families=("booth.pm",),
         # 保留 403 放行: 探测走的是普通握手(非 ECH), 仍会拿到 403 —— 放行避免全挂误报
         probe_ok_statuses=(403,),
         candidate_ips=["104.18.37.180", "172.64.150.76", "104.18.22.203"]
@@ -588,6 +605,66 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_pixivision",
         ssl_sni_mode="host",
         candidate_ips=["172.64.145.76", "104.18.22.203", "172.64.150.76", "104.16.1.34"]
+    ),
+    # Yande.re 图库 (2026-10-04 实测新增)
+    #
+    # ★ 本条纠正了一份**归档草案的过期前提**: 草案 (service-expansion-feasibility-2026-10-03 §8)
+    #   写"Yande.re 走 L7 或 DIRECT, **二者都必须绕开 Cloudflare**, 候选池只放源站
+    #   198.251.89.183, **显式排除 CF 边缘段**"。实测**该前提已不成立**:
+    #     · DoH (1.1.1.1 与 8.8.8.8) 对 yande.re / www / assets 三个名字**只回源站**
+    #       198.251.89.183, 对 files.yande.re 回 198.251.88.76 —— 四个答案用项目自己的
+    #       `ech_tunnel.is_cloudflare_ip` 判定**全部为 False** (同一次运行里
+    #       104.21.81.219 / 172.67.181.145 判 True, 即判据本身有效);
+    #     · 源站响应头 `server: freenginx` —— 它跑的是**自己的 nginx**, 根本不在 CF 后面。
+    #   ⇒ 既然池子里没有 CF 边缘, "排除 CF 段"就**没有对象**; 本项目也**不存在**按画像
+    #     排除 IP 段的机制 (`is_cloudflare_ip` 只在 ech_tunnel.build_ech_targets 里当
+    #     **白名单**用, 恰是反面)。故本条**不新增** excluded_networks 之类的字段 ——
+    #     不为一个不存在的威胁加机制。
+    #
+    # 通道选择: DIRECT + 真 SNI。
+    #   · 真 SNI 实测可用 (证书 `*.yande.re`), 故**不需要**空 SNI / 掩护 SNI;
+    #   · DIRECT 只把干净 IP 钉进解析层 (hosts/dns_server), 不经本机反代 —— 与 hitomi
+    #     同款; yande.re 的解析本身是干净的, 钉 IP 的价值在于防止**将来**被投毒。
+    ServiceProfile(
+        id="yande_re",
+        group="acg",
+        name="Yande.re 图库",
+        desc="Yande.re 动漫图库 (非 Cloudflare, 自有 freenginx 源站, 真 SNI 直连)",
+        # ⚠ hosts 不能表达通配符 (hosts_manager 会剥掉 `*.`), 故必须**逐个子域**登记。
+        #   实测 `/post` 页面里引用的子域计数: assets.yande.re ×366、files.yande.re ×160 ——
+        #   这两个就是全部内容域 (cdn./static./img./news. 均**未出现**, 故不登记)。
+        #   `www.yande.re` 同样登记并**已实测**: 项目探针对它也是 **rank 0** (301, 无
+        #   self_redirect), 与 apex 行为一致。
+        domains=["yande.re", "www.yande.re", "assets.yande.re", "files.yande.re"],
+        icon="image",
+        mode=ServiceMode.DIRECT,     # 走解析层直指该 IP, 不经 nginx (NGINX_BYPASS_MODES)
+        ssl_sni_mode="host",
+        # 证书 `*.yande.re` (SAN 含 `*.yande.re` + `yande.re`) ⇒ 空 SNI 通道的唯一防线那种
+        # 情形在这里不适用, 但**声明它仍有益**: 探测阶段即可淘汰"回别的域证书"的假候选。
+        cert_families=("yande.re",),
+        # ★ assets.yande.re 的根路径**返回 403** (无根文档, 与 steam_akamai 的 Akamai 403
+        #   同类), 而**真实资源路径一律 200** —— 实测 (带不带 Referer 都是 200, 即**不需要
+        #   Referer**, 不是防盗链):
+        #     /assets/stubs/explicit-caa9617c15b8566f041... -> 200 · 25,639B · image/png
+        #     /assets/application-c99e88fb51193c7d2860b6... -> 200 · 41,067B · text/css
+        #     /assets/application_classic-fad15cf8419f47... -> 200 · 281,607B · application/javascript
+        #   不放行 403 会把它判成可疑节点 (`_suspect_status`) 而丢掉**主图床** (引用 366 次)。
+        probe_ok_statuses=(403, 404),
+        # 探测这三个域: apex 给 301->/post (项目探针实测 rank0), files 给 200,
+        # assets 给 403 (由上面放行)。多域全过 => http_subdomains_ok=True。
+        probe_domains=("yande.re", "assets.yande.re", "files.yande.re"),
+        # 2026-10-04 实测 (项目探针 probe_ip_endpoint_v2 + _classify_result):
+        #   yande.re        @198.251.89.183  真SNI 301 (Location=https://yande.re/post) -> **rank 0**
+        #   files.yande.re  @198.251.88.76   真SNI 200                              -> **rank 0**
+        #   assets.yande.re @198.251.89.183  真SNI 403 (需 probe_ok_statuses 放行)
+        #   `/post` 200 · 193,751B (freenginx, text/html; charset=utf-8)
+        #   ⚠ 本条**不设 probe_path**: 根路径已能判别 (301/403 都是确定性响应, 非"0 字节"),
+        #     与 nhentai_img 那种"根路径判不了"的情形不同 —— 只在判不了时才设真实链接。
+        # ⚠ 单候选/双候选的容灾: apex 与 assets 同为 198.251.89.183, files 为 198.251.88.76,
+        #   即两个独立 IP。若源站更换地址, 本画像没有第三个可换节点 (与 hitomi 同类局限),
+        #   依赖健康巡检把失效候选剔除; 补足更多经复核的源站 IP 属后续工作。
+        candidate_ips=["198.251.89.183", "198.251.88.76"],
+        stable_ips=["198.251.89.183"],
     ),
 
     # --------------------------------------------------------------------------
@@ -689,6 +766,14 @@ PROFILES: List[ServiceProfile] = [
         # IPv6 路径同样被拦); 同段的 objects.githubusercontent.com 未被封锁, 用它作掩护 SNI 即可
         # 正常取回 raw 内容 (实测 HTTP 200 + 真实文件正文)。Host 仍由 nginx 保持真实域名。
         ssl_sni_mode="objects.githubusercontent.com",
+        # ★ 2026-10-04 补证书域族门槛。这一条的域族是**掩护域自己的 githubusercontent.com
+        #   而不是 raw.githubusercontent.com** —— 先实测再决定, 不是照抄画像的 domains:
+        #   该掩护通道拿到的证书 SAN=`*.github.com` / `*.github.io` / `*.githubusercontent.com`
+        #   / github.com / github.io (CN=`*.github.io`, 即 GitHub 自有证书),
+        #   与"域族 = 目标域"的常规情形不同 (compare imgur: 证书就是 *.imgur.com)。
+        #   实测 8/8 候选均命中 githubusercontent.com ⇒ **零误杀**。
+        #   ⚠ 若按画像 domains 里的 raw.githubusercontent.com 声明, 会把**整条池子**判死。
+        cert_families=("githubusercontent.com",),
         # ★ 2026-10-04 实测修正: 原 stable_ips 只列 109/108 两个 **IPv4**, 而排序键是
         #   `(rank, stable_penalty, ...)` —— **稳定性优先于延迟**, 于是这两个 v4 恒占主力位,
         #   把实测快 2.6 倍的 v6 压在后面。而本机对 raw 的实测 (交错采样, 每家族 20 样本):
@@ -1294,7 +1379,7 @@ PROFILES: List[ServiceProfile] = [
         #   ★ 2026-10-04 更正: 原文写"视频通路需另走 QUIC 上游腿, **未在本次范围内**" ——
         #     那是当时的范围声明, 早已落地 (见下方 googlevideo 画像 + app/h3_upstream.py)。
         #     留在这里会让读代码的人以为视频还没做。
-        #   替代通路已逐条实测关闭 (docs/googlevideo-node-availability.md §7.6.5):
+        #   替代通路已逐条实测关闭 (docs/archive/googlevideo-node-availability.md §7.6.5):
         #     QUIC 只在 UDP **443** 听 (8443/80/8853/8080 全部 Timeout)、
         #     TCP+ALPN=h3 与 h2 均被 RST、IPv4 侧整体不可达。
         #   ⇒ 本画像**刻意不登记** googlevideo 域: 登记它只会造出"页面能开但视频永远转圈"
@@ -1341,7 +1426,7 @@ PROFILES: List[ServiceProfile] = [
     #    由用户显式开启, 且描述里写清"播放尚未验证", 不做假可用。
     #
     #    ★ 2026-10-02 更新: **播放已实测成功** (player_state=PLAYING, currentTime=35s, 见
-    #    docs/googlevideo-sabr-analysis.md §13.3.6)。真因曾长期被掩盖 —— 不是通道问题, 而是
+    #    docs/archive/googlevideo-sabr-analysis.md §13.3.6)。真因曾长期被掩盖 —— 不是通道问题, 而是
     #    本模块的响应头白名单丢掉了 `access-control-*`: 播放器用 fetch() **跨源**取 SABR,
     #    CORS 头被静默丢弃后浏览器直接判失败, 现象上与"通道不通"无法区分。
     #    仍未解决的是**节点可用性** (实测 20 条 SABR POST 里 11 条 upstream_no_response),
@@ -1378,7 +1463,7 @@ PROFILES: List[ServiceProfile] = [
     #    (curl 宽容, Chrome 不宽容)。**该现象与 SABR 阻塞很可能共享根因。**
     #    E1 长流压测已通过: 静默 70s / 整周期 110s 不被任何一层掐断 (scripts/probe_sabr_carry.py)。
     #
-    # 复现与证据: docs/googlevideo-sabr-analysis.md (基础文档: 定因/缺陷清单/实施路径) +
+    # 复现与证据: docs/archive/googlevideo-sabr-analysis.md (基础文档: 定因/缺陷清单/实施路径) +
     #             docs/googlevideo-other-methods.md (方法 A/B 全链实测) +
     #             docs/googlevideo-quic-channel.md §5.6 (已更正的逐条排除表)
     # --------------------------------------------------------------------------
@@ -1488,7 +1573,7 @@ PROFILES: List[ServiceProfile] = [
     #     Host 仍为真实域名 —— 实测 imgur 302 / twitch 200 / myanimelist 200。
     #   QUIC 路线 (Cloudflare 等): QUIC_DIRECT 模式, 由本机 DNS 下发真实 IP 与
     #     HTTPS RR(alpn=h3), 浏览器自行走 HTTP/3 —— 实测 reddit/discord/stackoverflow 均 200。
-    #   证据与复现脚本见 docs/uplift-route-findings.md。
+    #   证据与复现脚本见 docs/archive/uplift-route-findings.md。
     # --------------------------------------------------------------------------
     ServiceProfile(
         id="imgur",
@@ -1507,6 +1592,10 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_imgur",
         cdn_vendor="fastly",
         ssl_sni_mode="www.fastly.com",   # Fastly 实测接受 SNI≠Host, 且原站 SNI 已被 RST
+        # 掩护 SNI 下运行期必然 `proxy_ssl_verify off` (nginx_generator:392) ⇒ 证书是
+        # **唯一防线**, 必须在探测阶段把关。实测该通道拿到的恒是目标自己的证书
+        # (3/3 三个候选 **全部** SAN=`*.imgur.com`/`imgur.com`) ⇒ 声明域族**零误杀**。
+        cert_families=("imgur.com",),
         enable_cache=True,
         candidate_ips=["146.75.92.193", "199.232.192.193", "199.232.196.193"]
     ),
@@ -1523,6 +1612,15 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_myanimelist",
         cdn_vendor="akamai",
         ssl_sni_mode="steambroadcast.akamaized.net",  # 与 steam_akamai 同款 Akamai 掩护域名
+        # ⚠ 本画像**不能**声明 cert_families —— 这是实测结论, 不是遗漏 (2026-10-04):
+        #   在 Akamai 掩护 SNI 下拿到的证书是 **`a248.e.akamai.net`**
+        #   (SAN = a248.e.akamai.net / *.akamaized.net / *.akamaihd.net …),
+        #   即**通道设计上就打不到 myanimelist.net 自己的证书**。若强行声明
+        #   cert_families=("myanimelist.net",) ⇒ `_cert_gate` 会把**全部候选**判死,
+        #   服务直接变不可用 (实测校验: 通过 0 / 淘汰 2)。
+        #   这类"共享 CDN 按 IP/边缘选证书、证书不属于目标客户"的通道, 其防线只能是
+        #   cdn_vendor (但 VENDOR_CERT_SUFFIXES 当前只登记 google ⇒ akamai 无厂商门槛)。
+        #   ⇒ 正确处置是**记录这个已知缺口**, 而不是加一道会误杀的门槛。
         # 图片/接口域对根路径返回 404/400 属确定性正常响应 (无根文档), 需放行否则被判"全挂"
         probe_ok_statuses=(400, 404),
         probe_domains=("myanimelist.net", "cdn.myanimelist.net"),
@@ -1569,6 +1667,11 @@ PROFILES: List[ServiceProfile] = [
         # (末次回归才 2/2 通过) —— 所以候选池不能按"整池全绿"判通过。
         # 因此这里声明通道, 由启动回归按"候选池顺序 + 四关实测"选出当时可用的那一个,
         # 全部失效时显式报 UNAVAILABLE (而不是继续写死这个常量假装正常)。
+        # ★ 2026-10-04 补证书域族门槛: 掩护 SNI 下运行期 `proxy_ssl_verify off`, 证书是
+        #   唯一防线。实测该通道拿到的恒是目标自己的证书 (2/2 候选均 SAN=`*.reddit.com`)
+        #   ⇒ 声明后**零误杀**, 同时挡掉"把 reddit 的 Host 打到别家 Fastly 边缘
+        #   拿回别家证书"的跨租户错配。
+        cert_families=("reddit.com",),
         cover_sni_channel="reddit",
         # 探测域必须与掩护通道的判据一致 (通道用 www.reddit.com 做四关):
         # 原先是空 -> 退化成 domains[0]="reddit.com" (apex), 与通道/图片域都不是同一个 vhost,
@@ -1596,6 +1699,15 @@ PROFILES: List[ServiceProfile] = [
         upstream_name="upstream_reddit_media",
         cdn_vendor="fastly",
         ssl_sni_mode="www.fastly.com",
+        # ⚠ 2026-10-04 **暂缓声明 cert_families** —— 这是待决策的状态, 不是遗漏:
+        #   本画像的候选池里 146.75.92.193 是 **imgur 边缘**, 在该掩护通道下拿到的是
+        #   `*.imgur.com` 证书 (实测), 而另两个候选 (199.232.161.140 / 199.232.113.140)
+        #   拿的是 `*.reddit.com`。于是声明 cert_families=("reddit.com",) 的确切后果是
+        #   **淘汰 146.75.92.193** (实测 通过 2 / 淘汰 1)。
+        #   该候选是**故意加的** (见下方 §2.5 依据: 三窗口下 6 个媒体域全部可用), 所以
+        #   "加门槛"与"保住这个独立边缘"二者不可兼得 —— 属需要取舍的决策, 故先留白。
+        #   实测参考: 三个候选对该画像 4 个媒体域**都**是 rank 0, 即去掉它不会立刻失能,
+        #   只是少一个独立边缘。
         # 与 reddit 画像**同一条掩护通道** (同一个掩护域、同一组节点、同一套四关):
         # 不新开通道 —— 通道的证书族判据 (reddit.com/redd.it/redditmedia.com/redditstatic.com)
         # 已经覆盖这些域, 而独立通道会让"同一个掩护域是否有效"被重复探测两次。
@@ -1604,7 +1716,7 @@ PROFILES: List[ServiceProfile] = [
         # 媒体域根路径本就 403/404 (无索引页/无权限), 必须放行, 否则全部候选被判"可疑"淘汰
         probe_ok_statuses=(403, 404),
         probe_domains=("i.redd.it", "b.thumbs.redditmedia.com"),
-        # ⚠ 与 reddit 画像的节点池**不同**, 依据是三窗口实测 (见 docs/reddit-cover-sni-channel.md §2.5):
+        # ⚠ 与 reddit 画像的节点池**不同**, 依据是三窗口实测 (见 docs/archive/reddit-cover-sni-channel.md §2.5):
         #   · 加 **146.75.92.193** (imgur 的边缘): 三窗口下 6 个媒体域**全部可用** (404/403) ——
         #     给媒体多一个独立边缘。它在 reddit 主域画像上会 421 (跨租户), 但 421 只出现在
         #     `old.reddit.com`, 媒体域 33 次采样里 0 次 421, 所以**只**加到这个画像。
@@ -1702,7 +1814,7 @@ PROFILES: List[ServiceProfile] = [
     # ==========================================================================
     # 成人内容生态 (受控分组 adult: 默认隐藏、默认不可启用, 需在设置页显式放开)
     #
-    # 2026-10-03 实测 (docs/pawchive-onboarding-2026-10-03.md) —— 本地通道判定:
+    # 2026-10-03 实测 (docs/archive/pawchive-onboarding-2026-10-03.md) —— 本地通道判定:
     #   · 系统解析**干净** (104.21.95.170 / 172.67.146.57 + CF v6), 但真 SNI 一律 RST;
     #   · 掩护 SNI 与空 SNI 都被 Cloudflare 拒 (4 候选 × 3 形态 = 12/12 全停 TLS 层)
     #   ⇒ 既不是"DNS 污染钉 IP"型, 也不是"能直连"型, 本地只剩 **ECH 隧道**一条路。
@@ -1770,7 +1882,7 @@ PROFILES: List[ServiceProfile] = [
     # ==========================================================================
     # 服务补充计划 · 批次 1（2026-10-04 落地）
     #
-    # 来源: docs/service-expansion-feasibility-2026-10-03.md 第四节 Profile 草案
+    # 来源: docs/archive/service-expansion-feasibility-2026-10-03.md 第四节 Profile 草案
     #      （该文档带 2026-10-03 的实测证据: 状态码 / 字节数 / 标题 / 3-3 次）
     # 复核: docs/service-expansion-review-2026-10-03.md（18 个草案里 4 个依赖不存在的
     #      机制、2 个分类错误；其要求的"批次 0 门槛"已在 §七 落地）
@@ -2076,6 +2188,68 @@ PROFILES: List[ServiceProfile] = [
         candidate_ips=["143.192.150.197", "143.192.150.194"],
         enable_cache=True,
     ),
+    # --------------------------------------------------------------------------
+    # hlib.cc (H图书馆) —— 2026-10-04 按用户指示接入, 走 ECH 隧道
+    #
+    # 通道判定 (本次实测, 详见注释内数据):
+    #   · 系统解析**干净** (104.21.53.75 / 172.67.210.98) 且等于 DoH 答案 ⇒ **不是**
+    #     "DNS 污染钉 IP"型 (对比 hitomi: 系统解析被投毒);
+    #   · 两个地址经 `ech_tunnel.is_cloudflare_ip` 判定**都在 CF 网段** ⇒ CF 托管;
+    #   · 真 SNI / 空 SNI / 两种掩护 SNI **四种形态全部停在 TLS 层** (WinError 10054
+    #     ConnectionReset 与 handshake_failure) ⇒ 本地没有可直连的形态;
+    #   · 该域**确实发布 ECH 配置**: DoH 的 HTTPS RR 返回
+    #     `ech=AEX+DQBB+AAgACD1pZvdD5sHHANMZyCYm0HK9WMgj+BzRP7oSbbFgbGsNQAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=`
+    #     (外层 SNI = cloudflare-ech.com), 且该外层 SNI 在本机**可正常握手**
+    #     ⇒ ECH 外层未被封, 走隧道是结构上唯一的路 (与 ehentai/nhentai/pawchive 同类)。
+    #   ⇒ 结论: 与 pawchive 完全同款 —— **ECH 隧道**是本地唯一通道。
+    #
+    # ⚠ 2026-10-04 实测结论 (推翻本条早先的一段判断, 如实记录):
+    #   ✅ **ECH 通道确认可用**。用项目自己的启动实现 (`scripts/test_ech_tunnel_live.py`,
+    #      内部走 EchTunnelManager.build_command + build_ech_targets) 实测:
+    #        [ech] 已更新 ECHConfig (71 字节, 来自 https://223.5.5.5/resolve)
+    #        hlib.cc/n -> HTTP/1.1 200 OK · 114,820B (server: cloudflare, 真实内容)
+    #      关键差异在于**生产用的是国内可达的 DoH** (223.5.5.5 / dns.alidns.com,
+    #      见 ech_tunnel.DEFAULT_DOH_ENDPOINTS)。我先前手敲隧道时用的是
+    #      1.1.1.1/8.8.8.8 —— 那两个在本机**被阻断**, 于是隧道拿不到 ECHConfig、
+    #      只能沿用兜底配置, 表现为 `tls: server rejected ECH` + 502。
+    #      同一条测试隧道对 e-hentai.org / nhentai.net (已知可用) 也报同样的错 ⇒
+    #      那次测量**无效**, 不能作为本域不可用的证据 (已撤回该结论)。
+    #   ⚠ **antibot 挑战**: `/n` 会被 `302 -> /antibot?token=...` 拦下, 且**每次新请求
+    #      都拦** (连续 8/8 次)。但它是**可解**的, 与 artstation 主站那种"CF 托管挑战
+    #      常态化即不可解"**不同类**:
+    #        · 挑战页 (200 · 7,228B, 标题「人机校验」) 内含 `<script>` 与 turnstile /
+    #          recaptcha 组件, 验证通过后由 JS 自行 `window.location.href = '/n'` 跳回;
+    #        · 文案明确 "只需刷新此页即可自动跳转"、"如果已于其他伊蕾娜页面完成验证,
+    #          则无需进行本页验证" ⇒ 它是**真人可过**的一次性校验, 不是死墙。
+    #      ⇒ 真实浏览器可自行通过; 代价只是**冷启动首访需过一次人机校验**。
+    #      ⚠ 但探测**不执行 JS**, 因此本画像的明文探测恒看到 302 (见下 probe_domains 说明)。
+    ServiceProfile(
+        id="hlib",
+        group="adult",
+        name="H图书馆 (hlib.cc)",
+        desc="中文 H 小说站 (Cloudflare 托管, 经本地 ECH 隧道; 首访需过一次人机校验)",
+        domains=["hlib.cc", "www.hlib.cc"],
+        icon="book",
+        mode=ServiceMode.L7_NGINX,
+        upstream_name="upstream_hlib",
+        cdn_vendor="cloudflare",
+        ech_enabled=True,
+        ssl_sni_mode="empty",      # 仅隧道不健康时的退化分支
+        experimental_default_off=True,
+        # 探测行为说明: 走默认 `/` (即 302 -> /n)。**探测不执行 JS**, 所以它看到的
+        # 一定是 302 而不是挑战后的 200 —— 这不是故障, 而是本画像的确定性形态:
+        #   · 302 属默认放行的 3xx, 故不会判"状态码可疑";
+        #   · Location 是同域不同路径 (/n), 不是 `A -> B -> A` 死循环, 不会被
+        #     self_redirect 误判;
+        #   · ECH 类画像的**运行时可用性本来就不由明文探测决定** (隧道负责 TLS),
+        #     探测只用于挑候选/防污染, 因此这里 302 是预期结果。
+        # 不设 probe_path: 根路径已给出确定性响应 (302), 与 nhentai_img 那种
+        # "根路径 0 字节、判不了"的情形不同。
+        probe_domains=("hlib.cc", "www.hlib.cc"),
+        # 2026-10-04 实测: DoH (1.1.1.1 与 8.8.8.8) 均返回这两个地址, 系统解析一致;
+        # 两者都在 CF 网段 (build_ech_targets 只收 CF 段内的候选, 故它们都能进隧道池)。
+        candidate_ips=["104.21.53.75", "172.67.210.98"],
+    ),
 ]
 
 # 索引字典与导出辅助
@@ -2287,7 +2461,7 @@ NAVIGATOR_SERVICES = [
         "tags": ["AI", "大模型", "Transformers", "机器学习", "HuggingFace"]
     },
 
-    # 2026-10-01 替代路线解锁的站点 (详见 docs/uplift-route-findings.md)
+    # 2026-10-01 替代路线解锁的站点 (详见 docs/archive/uplift-route-findings.md)
     {
         "id": "imgur_site",
         "group": "acg",

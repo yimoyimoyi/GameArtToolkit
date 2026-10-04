@@ -72,6 +72,35 @@ LEGACY_BLOCK_END = "# <<<<< PixivToolkit Rules End <<<<<"
 DEFAULT_MAX_BACKUPS = 5
 
 
+def _resolve_target_ip(profile, s_id: str, get_optimal_ips) -> str:
+    """由画像模式推导该服务域名应被钉到的目标 IP (单一判据, 两处调用共用)。
+
+    - DIRECT / QUIC_DIRECT: 钉**真实候选 IP** (不经本机反代)。优先用 QUIC 实测优选值,
+      静态候选池兜底 —— 静态值被封后没有自愈能力, 故实测值优先。
+    - 其余模式: 一律 127.0.0.1, 交给本机 Nginx / L4 Relay 数据平面。
+
+    ★ 为什么抽成函数 (2026-10-04): 原先**旧版粗粒度分组键**那条分支把组内所有域名
+      无条件写成 127.0.0.1, 完全无视各画像的 mode —— 于是启用 `"pixiv"`(=acg 整组)时,
+      acg 里的 DIRECT 画像 (yande_re / hitomi / pinimg…) 会被钉到本机反代,
+      而它们**在 nginx 侧根本没有 server 块** (DIRECT ∈ NGINX_BYPASS_MODES) ⇒
+      浏览器打到默认 server, 拿到不相干内容。同一次点击走单画像 (`"yande_re"`) 却是对的,
+      "组键与单键行为不一致"正是最难察觉的那类缺陷。现在两条路径共用本函数,
+      判据不再可能漂移。
+    """
+    if profile is not None and profile.mode in (ServiceMode.DIRECT, ServiceMode.QUIC_DIRECT):
+        target_ip = ""
+        if get_optimal_ips is not None:
+            try:
+                ips = get_optimal_ips(s_id)
+                target_ip = ips[0] if ips else ""
+            except Exception:
+                target_ip = ""
+        if not target_ip:
+            target_ip = profile.candidate_ips[0] if profile.candidate_ips else "127.0.0.1"
+        return target_ip
+    return "127.0.0.1"
+
+
 def build_domain_targets(enabled_services: List[str]) -> Dict[str, str]:
     """
     由启用服务列表推导"域名 -> 目标 IP"重定向映射 (全项目唯一推导入口)
@@ -80,7 +109,9 @@ def build_domain_targets(enabled_services: List[str]) -> Dict[str, str]:
     - QUIC 直连模式: 同样写真实 CDN IP —— 其目标 IP 只用于 DNS 解析层, 真正的可达性靠
       本机解析器额外下发 HTTPS RR(alpn=h3) 让浏览器走 QUIC (见 dns_server)
     - 其余模式:   写 127.0.0.1, 交由本机 Nginx / L4 Relay 数据平面接管
-    兼容旧版粗粒度服务组键名 ('pixiv' / 'steam' / 'github'), 统一映射到本地反代。
+    兼容旧版粗粒度服务组键名 ('pixiv' / 'steam' / 'github'): 展开为该组内全部画像,
+    ★ 且**逐个画像按自己的 mode 推导** (与单画像路径同判据) —— 组内的 DIRECT 画像
+      仍钉真实 IP, 不会被误写成 127.0.0.1 (2026-10-04 修, 详见 _resolve_target_ip)。
     """
     domain_ip_map: Dict[str, str] = {}
     # QUIC 实测优选结果优先于静态候选池 (静态值被封后无自愈能力)
@@ -94,18 +125,7 @@ def build_domain_targets(enabled_services: List[str]) -> Dict[str, str]:
         srv = SERVICES_BY_ID.get(s_id)
         if not srv:
             continue
-        if profile and profile.mode in (ServiceMode.DIRECT, ServiceMode.QUIC_DIRECT):
-            target_ip = ""
-            if get_optimal_ips is not None:
-                try:
-                    ips = get_optimal_ips(s_id)
-                    target_ip = ips[0] if ips else ""
-                except Exception:
-                    target_ip = ""
-            if not target_ip:
-                target_ip = profile.candidate_ips[0] if profile.candidate_ips else "127.0.0.1"
-        else:
-            target_ip = "127.0.0.1"
+        target_ip = _resolve_target_ip(profile, s_id, get_optimal_ips)
 
         for d in srv.get("domains", []):
             domain_ip_map[d] = target_ip
@@ -118,9 +138,15 @@ def build_domain_targets(enabled_services: List[str]) -> Dict[str, str]:
     for legacy_key, group in legacy_group_keys.items():
         if legacy_key in enabled_services:
             for s in SERVICES_LIST:
-                if s["group"] == group:
-                    for d in s["domains"]:
-                        domain_ip_map[d] = "127.0.0.1"
+                if s["group"] != group:
+                    continue
+                # ★ 必须与上面的单画像分支**同判据** (见 _resolve_target_ip):
+                #   组内若有 DIRECT 画像, 它的域名要钉真实 IP 而不是 127.0.0.1 ——
+                #   否则 "启用整组" 与 "只启用那一个画像" 会得到两种不同结果。
+                _gp = get_profile_by_id(s["id"])
+                _g_ip = _resolve_target_ip(_gp, s["id"], get_optimal_ips)
+                for d in s["domains"]:
+                    domain_ip_map[d] = _g_ip
 
     return domain_ip_map
 
