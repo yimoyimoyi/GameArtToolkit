@@ -22,12 +22,77 @@ NGINX_EXE = NGINX_DIR / "nginx.exe"
 CACHE_DIR = NGINX_DIR / "cache"
 PID_FILE = NGINX_DIR / "logs" / "nginx.pid"
 
+# nginx `stub_status` 端点端口 (2026-10-04 新增)。
+# ⚠ 单一真源: nginx.conf 里那个 `listen 127.0.0.1:<此端口>` 必须与本值一致。
+#   为什么单列一个端口而不是复用 80/443: 那两处已被 default_server 与全部 site-*.conf
+#   占用 (host 路由), 再塞一个状态 location 会与"未登记域名一律 444"的语义纠缠。
+#   该端口与既有段无冲突: relay 44311-44374 / ECH 44401 / h3 腿 44411 / PAC 44500-44501。
+NGINX_STATUS_PORT = 44421
+
+
+def parse_stub_status(text: str) -> Dict:
+    """解析 nginx `stub_status` 的回应体 (纯函数, 便于单测)
+
+    实测原始回应体形如 (2026-10-04, 本机临时 nginx 验证)::
+
+        Active connections: 1
+        server accepts handled requests
+         1 1 1
+        Reading: 0 Writing: 1 Waiting: 0
+
+    解析不出任何字段时返回 {} —— 表示"没拿到", 而不是"取到了 0"。
+    """
+    out: Dict = {}
+    if not text:
+        return out
+    m = re.search(r"Active connections:\s*(\d+)", text)
+    if m:
+        out["active"] = int(m.group(1))
+    m = re.search(r"server accepts handled requests\s*\n\s*(\d+)\s+(\d+)\s+(\d+)", text)
+    if m:
+        out["accepts"] = int(m.group(1))
+        out["handled"] = int(m.group(2))
+        out["requests"] = int(m.group(3))
+    m = re.search(r"Reading:\s*(\d+)\s+Writing:\s*(\d+)\s+Waiting:\s*(\d+)", text)
+    if m:
+        out["reading"] = int(m.group(1))
+        out["writing"] = int(m.group(2))
+        out["waiting"] = int(m.group(3))
+    return out
+
 class NginxManager:
     def __init__(self, nginx_dir: Path = NGINX_DIR):
         self.nginx_dir = nginx_dir
         self.nginx_exe = self.nginx_dir / "nginx.exe"
         self.cache_dir = self.nginx_dir / "cache"
         self.pid_file = self.nginx_dir / "logs" / "nginx.pid"
+
+    def fetch_status(self) -> Dict:
+        """读取 nginx `stub_status` 快照 (只读; 失败/未运行一律返回 {})
+
+        ## 为什么是 stub_status (2026-10-04)
+
+        控制台原有一个"实时网络流量监控"面板, 但它**从未接过数据源** —— 每秒被灌入
+        `0.0/0.0/0/0`, 因此永远是平线。要真字节数有两条路, 都被有意堵死:
+          · nginx access_log **被刻意全局关闭** (见 nginx.conf 的说明: 该文件实测
+            183.9 MB, 且记录解密后的完整请求行含 token ⇒ 占空间 + 留存凭据);
+          · 数据面在 127.0.0.1 上, 而 loopback 计数器**不计数** (实测 recv/sent 均为 0),
+            物理网卡则是整机流量且回源字节被算两次。
+        ⇒ 改用 stub_status: 零磁盘开销、无字节、不碰凭据, 给的是"有多少连接 / 服务了
+          多少请求"这个真实口径。端点由 nginx.conf 的 `listen 127.0.0.1:44421` 承载
+          (仅回环可达, 实测从网卡地址连接被拒)。
+
+        返回值键: active / accepts / handled / requests / reading / writing / waiting。
+        **不可用时不编造 0** —— 返回 {} 让调用方区分"nginx 没在跑"与"此刻没有连接"。
+        """
+        try:
+            import urllib.request
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{NGINX_STATUS_PORT}/nginx_status", timeout=2.0) as r:
+                text = r.read().decode("utf-8", "replace")
+        except Exception:
+            return {}
+        return parse_stub_status(text)
 
     def is_running(self) -> bool:
         """检查 Nginx 进程是否正在运行"""

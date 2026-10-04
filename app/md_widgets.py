@@ -1153,33 +1153,69 @@ class MDSwitch(QAbstractButton):
 # ==============================================================================
 # 5. 单调三次样条平滑网络波形图 (TrafficMonitorChart)
 # ==============================================================================
-class TrafficMonitorChart(QWidget):
+class NginxStatusChart(QWidget):
+    """nginx 状态监控图 (曲线) + 快照数字 (2026-10-04 由 TrafficMonitorChart 改写)
+
+    ## 为什么改口径 (这是本类存在的前提, 改回来之前请先读这段)
+
+    原 `TrafficMonitorChart` 画的是"实时网络流量": ↓下载 KB/s、↑上传 KB/s、已加速请求数。
+    它**从未接过真实数据** —— `pyside_app.update_traffic_metrics()` 每秒灌进
+    `add_sample(0.0, 0.0, 0, 0)`, 所以永远是一条平线。而那条注释
+    ("严禁伪造 random 随机流量数据...未接入真实网卡抓包/Nginx 内部统计前保持平直基线")
+    说明作者**有意**不造假, 只是数据源一直没做。
+
+    为什么不能"接上"真实字节数 (2026-10-04 实测, 三条路都被有意堵死):
+      · **nginx access_log 被刻意全局关闭** (nginx.conf:43-55): 已部署实例该文件实测
+        183.9 MB 且仍在增长, 且它记录**解密后的完整请求行**(含 API key / JWT / 会话 token)
+        ⇒ "既占空间又留存凭据"。要字节数就得重新开启, 与那条决策冲突。
+      · **loopback 不计数**: 数据面在 127.0.0.1 上, 实测 `Loopback Pseudo-Interface 1`
+        的 recv/sent **都是 0** ⇒ 无法只统计本工具流量。
+      · 物理网卡计数 (psutil) 是**整机**流量, 且本地反代的回源字节会被算两次
+        (nginx 发起 + 客户端接收)。
+
+    所以换成 **nginx `stub_status`**: 零磁盘开销、无字节、不碰凭据, 换来的是
+    "有多少连接 / 服务了多少请求"这个**真实且诚实**的口径。它回答的问题是
+    "加速服务此刻在不在干活", 而不是"跑了多少兆"。
+
+    ## 曲线画什么
+
+    只画**活跃连接数** (active) 一条曲线 —— 它是 stub_status 里最能反映"此刻有没有在干活"
+    的量, 且随时间变化有形状。requests / 请求速率 / reading / writing 用文字快照呈现
+    (它们的**累计**量画成曲线没有信息量, 而速率是次生量)。
+
+    为什么删掉原来的双曲线: 原来那对 (down/up KB/s) 正是没有数据源的两个量; 保留空曲线
+    等于继续展示恒零的假象, 而本项目最忌讳的就是"看起来有数据其实没有"。
     """
-    实时网络监控波形图
-    采用单调三次样条 (Monotone Spline) 平滑算法，消除折线突变与过冲
-    """
+
     def __init__(self, parent=None, max_points: int = 30):
         super().__init__(parent)
         self.max_points = max_points
-        self.down_speeds: List[float] = [0.0] * max_points
-        self.up_speeds: List[float] = [0.0] * max_points
-        self.total_requests = 0
-        self.cache_hits = 0
-        self._ema_max = 100.0
+        # 活跃连接曲线 (None 表示"该点无数据" —— 与"0 个连接"是**不同**的事:
+        # nginx 没在跑时不能画成 0, 那会让人以为"服务正常但没流量")
+        self.active: List[float] = [0.0] * max_points
+        self._ema_max = 8.0
+        self.available = False          # 是否已成功取到 stub_status
+        self.metrics: Dict = {}          # 最近一次快照
+        self._error = ""
 
         self.setFixedHeight(140)
         ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
         self.setMinimumWidth(320)
 
-    def add_sample(self, down_kb: float, up_kb: float, req_delta: int = 0, hit_delta: int = 0):
-        self.down_speeds.pop(0)
-        self.down_speeds.append(max(0.0, down_kb))
-
-        self.up_speeds.pop(0)
-        self.up_speeds.append(max(0.0, up_kb))
-
-        self.total_requests += req_delta
-        self.cache_hits += hit_delta
+    def set_metrics(self, metrics) -> None:
+        """喂入一次 nginx stub_status 快照; None / 失败时标记为不可用 (而不是画 0)"""
+        if not metrics:
+            self.available = False
+            self.metrics = {}
+            self._error = "未能连接 nginx 状态端点"
+            self.update()
+            return
+        self.available = True
+        self._error = ""
+        self.metrics = dict(metrics)
+        act = float(metrics.get("active", 0) or 0)
+        self.active.pop(0)
+        self.active.append(max(0.0, act))
         self.update()
 
     def _build_smooth_path(self, points: List[QPointF]) -> QPainterPath:
@@ -1204,34 +1240,32 @@ class TrafficMonitorChart(QWidget):
             dx = p1.x() - p0.x()
             cp1_x = p0.x() + dx / 3.0
             cp1_y = p0.y() + (p1.y() - p_prev.y()) / 6.0
-
-            cp2_x = p1.x() - dx / 3.0
+            cp2_x = p0.x() + 2.0 * dx / 3.0
             cp2_y = p1.y() - (p_next.y() - p0.y()) / 6.0
 
+            # 单调钳制: 控制点不得把曲线拉出 [p0.y, p1.y] 区间 (防过冲)
+            lo, hi = (p0.y(), p1.y()) if p0.y() <= p1.y() else (p1.y(), p0.y())
+            cp1_y = min(hi, max(lo, cp1_y))
+            cp2_y = min(hi, max(lo, cp2_y))
             path.cubicTo(QPointF(cp1_x, cp1_y), QPointF(cp2_x, cp2_y), p1)
-
         return path
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        tm = ThemeManager.get_instance()
+        palette = tm.get_palette()
+        is_dark = tm.is_dark
+        w, h = float(self.width()), float(self.height())
 
-        w = float(self.width())
-        h = float(self.height())
-
-        palette = ThemeManager.get_instance().get_palette()
-        is_dark = ThemeManager.get_instance().is_dark
-
-        # 1. 容器底色与圆角边框
-        bg_rect = QRectF(0, 0, w, h)
+        bg_rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
         bg_grad = QLinearGradient(0, 0, 0, h)
-        bg_grad.setColorAt(0.0, QColor(palette.get("chart_bg_start", "#182234")))
+        bg_grad.setColorAt(0.0, QColor(palette.get("chart_bg", "#161E2E")))
         bg_grad.setColorAt(1.0, QColor(palette.get("chart_bg_end", "#121927")))
         painter.setPen(QPen(QColor(palette.get("outline", "#223147")), 1.2))
         painter.setBrush(QBrush(bg_grad))
         painter.drawRoundedRect(bg_rect, 14, 14)
 
-        # 水平参考线与呼吸网格
         chart_top = 38.0
         chart_bottom = h - 14.0
         chart_h = chart_bottom - chart_top
@@ -1239,137 +1273,120 @@ class TrafficMonitorChart(QWidget):
         chart_right = w - 16.0
         chart_w = chart_right - chart_left
 
+        # 水平参考线
         painter.setPen(QPen(QColor(255, 255, 255, 12) if is_dark else QColor(0, 0, 0, 12), 1, Qt.DashLine))
         for i in range(1, 4):
             y = chart_top + chart_h * (i / 4.0)
             painter.drawLine(QPointF(chart_left, y), QPointF(chart_right, y))
 
-        # 2. 动态 Y 轴缩放
-        raw_max = max(max(self.down_speeds), max(self.up_speeds), 100.0)
+        curve_color = QColor(palette.get("chart_down", "#34D399"))
+
+        # 不可用: 明确画一条"无数据"的说明, **不要**画成 0 的平线
+        # (那会让人以为"服务正常但没有流量", 与"nginx 没在跑/状态取不到"是两回事)
+        if not self.available:
+            painter.setFont(QFont("Segoe UI", 10))
+            painter.setPen(QColor(palette.get("text_muted", "#75879E")))
+            painter.drawText(QRectF(chart_left, chart_top, chart_w, chart_h),
+                             Qt.AlignCenter | Qt.TextWordWrap,
+                             f"nginx 状态不可用\n{self._error or '等待首次采样…'}")
+            painter.end()
+            return
+
+        # 动态 Y 轴缩放 (以活跃连接数为量纲)
+        raw_max = max(max(self.active), 8.0)
         alpha = 0.15
         if raw_max > self._ema_max:
             self._ema_max = raw_max
         else:
             self._ema_max = self._ema_max * (1.0 - alpha) + raw_max * alpha
-        max_val = self._ema_max
+        max_val = max(1.0, self._ema_max)
 
-        # 3. 构造点序列
-        n = len(self.down_speeds)
+        n = len(self.active)
         dx = chart_w / float(n - 1) if n > 1 else chart_w
-
-        points_up = []
-        min_y_up = chart_bottom
-        for i, val in enumerate(self.up_speeds):
+        points = []
+        min_y = chart_bottom
+        for i, val in enumerate(self.active):
             x = chart_left + i * dx
             norm = min(1.0, val / max_val)
             y = chart_bottom - norm * chart_h
-            min_y_up = min(min_y_up, y)
-            points_up.append(QPointF(x, y))
+            min_y = min(min_y, y)
+            points.append(QPointF(x, y))
 
-        points_down = []
-        min_y_down = chart_bottom
-        for i, val in enumerate(self.down_speeds):
-            x = chart_left + i * dx
-            norm = min(1.0, val / max_val)
-            y = chart_bottom - norm * chart_h
-            min_y_down = min(min_y_down, y)
-            points_down.append(QPointF(x, y))
-
-        # 4. 绘制上传曲线与渐变填充
-        up_color = QColor(palette.get("chart_up", "#7EB9F5"))
-        if len(points_up) >= 2:
-            path_up = self._build_smooth_path(points_up)
-            fill_up = QPainterPath(path_up)
-            fill_up.lineTo(chart_right, chart_bottom)
-            fill_up.lineTo(chart_left, chart_bottom)
-            fill_up.closeSubpath()
-
-            grad_up = QLinearGradient(0, min_y_up - 2, 0, chart_bottom)
-            grad_up.setColorAt(0.0, QColor(up_color.red(), up_color.green(), up_color.blue(), 75 if is_dark else 65))
-            grad_up.setColorAt(0.4, QColor(up_color.red(), up_color.green(), up_color.blue(), 35 if is_dark else 25))
-            grad_up.setColorAt(1.0, QColor(up_color.red(), up_color.green(), up_color.blue(), 8 if is_dark else 5))
+        if len(points) >= 2:
+            path = self._build_smooth_path(points)
+            fill = QPainterPath(path)
+            fill.lineTo(chart_right, chart_bottom)
+            fill.lineTo(chart_left, chart_bottom)
+            fill.closeSubpath()
+            grad = QLinearGradient(0, min_y - 2, 0, chart_bottom)
+            grad.setColorAt(0.0, QColor(curve_color.red(), curve_color.green(), curve_color.blue(), 95 if is_dark else 85))
+            grad.setColorAt(0.3, QColor(curve_color.red(), curve_color.green(), curve_color.blue(), 50 if is_dark else 40))
+            grad.setColorAt(1.0, QColor(curve_color.red(), curve_color.green(), curve_color.blue(), 6 if is_dark else 4))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(grad_up))
-            painter.drawPath(fill_up)
-
-            painter.setPen(QPen(up_color, 1.8, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setBrush(QBrush(grad))
+            painter.drawPath(fill)
+            painter.setPen(QPen(curve_color, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.setBrush(Qt.NoBrush)
-            painter.drawPath(path_up)
+            painter.drawPath(path)
 
-        # 5. 绘制下载曲线与渐变填充
-        down_color = QColor(palette.get("chart_down", "#34D399"))
-        if len(points_down) >= 2:
-            path_down = self._build_smooth_path(points_down)
-            fill_down = QPainterPath(path_down)
-            fill_down.lineTo(chart_right, chart_bottom)
-            fill_down.lineTo(chart_left, chart_bottom)
-            fill_down.closeSubpath()
-
-            grad_down = QLinearGradient(0, min_y_down - 2, 0, chart_bottom)
-            grad_down.setColorAt(0.0, QColor(down_color.red(), down_color.green(), down_color.blue(), 95 if is_dark else 85))
-            grad_down.setColorAt(0.3, QColor(down_color.red(), down_color.green(), down_color.blue(), 50 if is_dark else 40))
-            grad_down.setColorAt(0.8, QColor(down_color.red(), down_color.green(), down_color.blue(), 20 if is_dark else 15))
-            grad_down.setColorAt(1.0, QColor(down_color.red(), down_color.green(), down_color.blue(), 6 if is_dark else 4))
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(grad_down))
-            painter.drawPath(fill_down)
-
-            painter.setPen(QPen(down_color, 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawPath(path_down)
-
-        # 6. 顶部指标排版 (自适应防重叠与字体测量)
-        curr_down = self.down_speeds[-1]
-        down_txt = f"↓ 下载: {curr_down:.1f} KB/s" if curr_down < 1024 else f"↓ 下载: {curr_down/1024.0:.2f} MB/s"
-        curr_up = self.up_speeds[-1]
-        up_txt = f"↑ 上传: {curr_up:.1f} KB/s"
-        req_txt = f"已加速请求: {self.total_requests} 次"
-
-        font_rate = QFont("Segoe UI", 10, QFont.Bold)
-        font_req = QFont("Segoe UI", 9)
-        fm_rate = QFontMetrics(font_rate)
-        fm_req = QFontMetrics(font_req)
-
-        down_w = fm_rate.horizontalAdvance(down_txt) + 8
-        up_w = fm_rate.horizontalAdvance(up_txt) + 8
-        req_w = fm_req.horizontalAdvance(req_txt) + 8
-
-        # 检查是否可以单行容纳全部 3 个指标
-        min_single_row_w = 18 + down_w + 14 + up_w + 16 + req_w + 18
-        if w >= min_single_row_w:
-            # 宽屏单行排布: 左侧下载、中间上传、右侧请求数
-            painter.setFont(font_rate)
-            painter.setPen(down_color)
-            painter.drawText(QRectF(18, 10, down_w, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
-
-            painter.setPen(up_color)
-            painter.drawText(QRectF(18 + down_w + 14, 10, up_w, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
-
-            painter.setFont(font_req)
-            painter.setPen(QColor(palette.get("text_muted", "#75879E")))
-            painter.drawText(QRectF(w - req_w - 18, 10, req_w, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
-        else:
-            # 窄屏/高缩放排布: 优先保证下载与上传速率清晰展示
-            painter.setFont(font_rate)
-            painter.setPen(down_color)
-            painter.drawText(QRectF(14, 10, down_w, 20), Qt.AlignLeft | Qt.AlignVCenter, down_txt)
-
-            avail_for_up = w - (14 + down_w + 10) - 14
-            if avail_for_up >= up_w:
-                painter.setPen(up_color)
-                painter.drawText(QRectF(14 + down_w + 10, 10, up_w, 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
-            else:
-                painter.setPen(up_color)
-                painter.drawText(QRectF(14 + down_w + 10, 10, max(20.0, avail_for_up), 20), Qt.AlignLeft | Qt.AlignVCenter, up_txt)
-
-            # 请求数仅在有充足间隙时绘制于右侧，避免覆盖上传速率
-            req_left = w - req_w - 14
-            if req_left > 14 + down_w + 10 + up_w + 12:
-                painter.setFont(font_req)
-                painter.setPen(QColor(palette.get("text_muted", "#75879E")))
-                painter.drawText(QRectF(req_left, 10, req_w, 20), Qt.AlignRight | Qt.AlignVCenter, req_txt)
-
+        self._paint_snapshot(painter, w, palette, curve_color)
         painter.end()
+
+    def _paint_snapshot(self, painter, w: float, palette, curve_color: QColor) -> None:
+        """顶部一行数字快照: 活跃连接 / 累计请求 / 请求速率 (+ reading/writing)"""
+        m = self.metrics or {}
+        active = int(m.get("active", 0) or 0)
+        total = int(m.get("requests", 0) or 0)
+        rps = m.get("requests_per_sec")
+        reading = int(m.get("reading", 0) or 0)
+        writing = int(m.get("writing", 0) or 0)
+        waiting = int(m.get("waiting", 0) or 0)
+
+        main_txt = f"● 活跃连接: {active}"
+        req_txt = f"累计请求: {total:,}"
+        if rps is not None:
+            req_txt += f"  ({rps:.1f}/s)"
+        extra_txt = f"reading {reading} · writing {writing} · waiting {waiting}"
+
+        font_main = QFont("Segoe UI", 10, QFont.Bold)
+        font_small = QFont("Segoe UI", 9)
+        fm_main = QFontMetrics(font_main)
+        fm_small = QFontMetrics(font_small)
+        main_w = fm_main.horizontalAdvance(main_txt) + 8
+        req_w = fm_small.horizontalAdvance(req_txt) + 8
+        extra_w = fm_small.horizontalAdvance(extra_txt) + 8
+
+        text_c = QColor(palette.get("text", "#E6EDF7"))
+        muted_c = QColor(palette.get("text_muted", "#75879E"))
+
+        # 宽屏: 左(活跃) 中(reading/writing/waiting) 右(累计+速率)
+        if w >= 18 + main_w + 14 + extra_w + 16 + req_w + 18:
+            painter.setFont(font_main)
+            painter.setPen(curve_color)
+            painter.drawText(QRectF(18, 10, main_w, 20), Qt.AlignLeft | Qt.AlignVCenter, main_txt)
+            painter.setFont(font_small)
+            painter.setPen(muted_c)
+            painter.drawText(QRectF(18 + main_w + 14, 10, extra_w, 20),
+                             Qt.AlignLeft | Qt.AlignVCenter, extra_txt)
+            painter.setPen(text_c)
+            painter.drawText(QRectF(w - req_w - 18, 10, req_w, 20),
+                             Qt.AlignRight | Qt.AlignVCenter, req_txt)
+            return
+
+        # 窄屏: 第一行 活跃 + 累计/速率; 放不下 extra 就省掉 (宁可少显示, 不重叠)
+        painter.setFont(font_main)
+        painter.setPen(curve_color)
+        painter.drawText(QRectF(16, 8, min(main_w, w - 32), 20),
+                         Qt.AlignLeft | Qt.AlignVCenter, main_txt)
+        painter.setFont(font_small)
+        painter.setPen(text_c)
+        painter.drawText(QRectF(16, 26, w - 32, 18),
+                         Qt.AlignLeft | Qt.AlignVCenter, req_txt)
+
+
+# 旧名保留为别名: 既有调用方/测试 import TrafficMonitorChart 不会因此断掉,
+# 但**语义已变** (流量 -> nginx 状态), 新代码请直接用 NginxStatusChart。
+TrafficMonitorChart = NginxStatusChart
 
 
 # ==============================================================================
