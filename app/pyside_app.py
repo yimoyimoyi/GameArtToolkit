@@ -162,7 +162,20 @@ def single_test_unsupported_reason(sid: str) -> str:
     if getattr(p, "ech_enabled", False):
         return "该服务经本机加密直连 (ECH) 出网, 不走候选节点, 按 IP 测速无意义"
     if getattr(p, "h3_upstream", False):
-        return "该服务经本机 HTTP/3 直连出网, 不走候选节点, 按 IP 测速无意义"
+        # h3 通道类: 除了"无法按 IP 测速", 还要**带上该通道此刻的可用性** ——
+        # 用户点这个按钮时真正想知道的就是"那它现在到底通不通"。
+        # (2026-10-04 用户要求: "把 http3 点击后改为可用性提示")
+        _base = "该服务经本机 HTTP/3 直连出网, 不走候选节点, 按 IP 测速无意义"
+        try:
+            from h3_upstream import h3_proxy
+            _st = h3_proxy.status()
+            if _st.get("running") and _st.get("listening"):
+                return (f"{_base}。当前通道**已就绪** (监听 127.0.0.1:{_st.get('port')}), "
+                        f"该服务可直接使用")
+            return (f"{_base}。当前通道**未就绪** —— 未在监听, 该服务的请求会返回 502, "
+                    f"请启动加速服务")
+        except Exception:
+            return _base
     if not (getattr(p, "candidate_ips", None) or CANDIDATE_IPS.get(sid)):
         return "该服务经本机代理端口出网, 没有候选 IP, 按 IP 测速无意义"
     return ""
@@ -3523,7 +3536,7 @@ class MainWindow(QMainWindow):
             degraded = healthy and not functional
             cfg_note = (st.get("ech_config") or {}).get("note") or ""
             port = st.get("port")
-            title_head = "加密直连通道 (ECH)"
+            title_head = "ECH 隧道"
             if not healthy:
                 status_txt = "通道未就绪 · 已回退常规直连"
             elif degraded:
@@ -3533,13 +3546,14 @@ class MainWindow(QMainWindow):
             note_txt = ("加密 SNI 直连 Cloudflare（ECH），不依赖候选节点探测 —— "
                         "因此这些服务在测速列表里不显示节点延迟，可用性只取决于上面这条通道。")
 
-        # 标题后缀: 不健康态直接说"该按哪个按钮", 而不是只丢一个状态词让用户自己想办法。
-        # 健康态保持陈述句 (无需动作)。
+        # 标题后缀: 只描述状态, 不写"请点哪个按钮" (用户明确要求 ECH 侧不要改文字)。
+        # ⚠ h3 侧保留一点动作提示是必要的: 该通道由启动流程拉起, 未就绪时用户唯一能做的
+        #   就是启动加速服务 —— 但文案只用陈述句, 不加动作口号。
         if not healthy:
-            suffix = ("未就绪 · 请启动加速服务" if kind == "h3"
-                      else "未就绪 · 请点「让 ECH 就绪」")
+            suffix = ("未就绪 (上游会 502, 请启动加速服务)" if kind == "h3"
+                      else "未就绪")
         elif degraded:
-            suffix = "配置可疑 · 请点「让 ECH 就绪」"
+            suffix = "在跑 · 配置可疑"
         else:
             suffix = "已就绪 · 直连中"
 
@@ -3722,10 +3736,19 @@ class MainWindow(QMainWindow):
             btn_single.setIcon(SvgIconFactory.get_icon("zap", primary_c, 12) if SvgIconFactory else QIcon())
             btn_single.setProperty("class", "MDBtnTiny")
             if _why_card:
-                # 不可测: 保留按钮位避免布局错位, 但禁用并说明原因
-                # (与 ECH 共用卡同一形态 —— "保留位置 + 禁用 + 说明原因", 不静默隐藏)
-                btn_single.setEnabled(False)
-                btn_single.setToolTip(_why_card)
+                # 不可测: 保留按钮位避免布局错位, 并说明原因 (不静默隐藏)。
+                # ⚠ 但 h3 通道类**保持可点** (2026-10-04 用户要求"把 http3 点击后改为可用性
+                #   提示"): 它的 `_why_card` 里带着**该通道此刻的可用性**, 点一下就把这句
+                #   如实说出来 —— 比一个死按钮有用 (用户点它的动机就是想知道"到底通不通")。
+                #   ECH 类则维持禁用: 那条通道有独立的「让 ECH 就绪」动作, 这里再给一个入口
+                #   会造成两个地方修同一件事。
+                if is_h3_service(sid):
+                    btn_single.setCursor(Qt.PointingHandCursor)
+                    btn_single.setToolTip(_why_card)
+                    btn_single.clicked.connect(lambda _, s=sid: self.start_single_cdn_ping(s))
+                else:
+                    btn_single.setEnabled(False)
+                    btn_single.setToolTip(_why_card)
             else:
                 btn_single.setCursor(Qt.PointingHandCursor)
                 btn_single.setToolTip(f"仅探测 {name} 的候选 IP 延迟并热重载生效")
@@ -6330,27 +6353,16 @@ class MainWindow(QMainWindow):
                        f"已跳过 {len(_blocked_note)} 个在当前后端下无法生效的服务: "
                        f"{'；'.join(f'{k}' for k in sorted(_blocked_note))}",
                        toast_type="warning", duration=8000)
+        # 通配缺口告警: 已**不再弹 toast** (用户要求"告警部分删掉只剩开始的概率就行")。
+        # 它仍在 `_wildcard_gap_note` 里, 由上面的状态区/控制台措辞呈现 —— 那里不打断操作,
+        # 而启动时弹一条 10 秒的警告会与"可用概率"那条挤在一起。
         _gap_note = getattr(self, "_wildcard_gap_note", None) or {}
-        # 2026-10-04 收敛: googlevideo 的通配缺口**不在这里再报一次** —— 它由下面那道
-        # h3 前置条件告警专门说明 (带 PAC 后端这个**可操作**的出路), 两条一起弹等于同一件
-        # 事说两遍, 而这条的文案 ("这些子域仍走真实解析") 对视频流来说也不够准确。
-        if "googlevideo" in _gap_note:
-            _gap_note = {k: v for k, v in _gap_note.items() if k != "googlevideo"}
         if _gap_note:
-            show_toast(self,
-                       f"⚠ 当前 Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域名: "
-                       f"{self._format_gap_note(_gap_note)} —— 这些子域仍走真实解析, "
-                       f"相关功能可能超时。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
-                       toast_type="warning", duration=10000)
+            print(f"[Redirect] Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域: "
+                  f"{self._format_gap_note(_gap_note)}")
 
-        # 软告警 3 (2026-10-03): HTTP/3 直连通道的**节点级**可用性 —— 与上面两道闸门同一形态
-        # (都是"已经开了, 但必须说出来")。数据来自节点成绩单, 不触发任何探测。
-        #
-        # ★ 2026-10-04 收敛 (用户要求"youtube 警告只剩下可用概率警报就行"): 原先这里
-        #   与启用边界那条 (on_service_toggled) 是**同一份 hint、同一件事**, 只是触发时机
-        #   不同 (开关时 / 启动时), 于是开一次加速能看到同一句告警两遍。启动收尾这条保留
-        #   (它覆盖"上次已启用、本次直接启动"这条最常见的路径), 启用边界那条保留 ——
-        #   两者不再重复文案, 而是分工: 开关时立刻反馈, 启动收尾兜底。
+        # 启动收尾唯一的一条 toast: YouTube 视频流的**可用概率** (用户明确要求只留这一条)。
+        # 数据来自节点成绩单, 不触发任何探测; 与该服务无关时 gvs_health_hint 返回空串。
         _h3_note = getattr(self, "_gvs_health_note", "") or ""
         if _h3_note:
             show_toast(self, f"YouTube 视频流可用概率偏低 —— {_h3_note}",

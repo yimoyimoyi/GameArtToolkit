@@ -2303,10 +2303,14 @@ PROFILES: List[ServiceProfile] = [
         desc="AI 绘画模型社区 (TCP 三路全灭, 经本机 HTTP/3 直连 Cloudflare)",
         # 内容域按方案清单登记; blobs-b2 是图片**真载体** (实测页面 43 次 200, 而
         # image.civitai.com 只做 301 中转), 漏了它就会"页面能开、图全挂"。
+        # ⚠ 2026-10-04 用户指出真实下载域是 **b2.civitai.com** —— 实测它解析到与
+        #   blobs-b2 相同的 CF 地址 (172.66.152.186 / 104.20.38.219), 故一并登记:
+        #   当前生效的图片链是 image → 301 → blobs-b2, 而 b2 是同一后端的另一入口,
+        #   漏登记它会让走 b2 的那部分资源仍落到被阻断的直连路径。
         # ⚠ 这些名字都**不是** CF 网段排除对象, 而是 h3 腿按 Host 解析的目标。
         domains=["civitai.com", "www.civitai.com", "auth.civitai.com",
                  "image.civitai.com", "imagecache.civitai.com",
-                 "blobs-b2.civitai.com", "faro.civitai.com"],
+                 "blobs-b2.civitai.com", "b2.civitai.com", "faro.civitai.com"],
         icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_civitai_web",

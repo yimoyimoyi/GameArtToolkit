@@ -1496,7 +1496,7 @@ class LatencyBadge(QWidget):
             border_color = QColor("#F59E0B") if is_dark else QColor("#FCD34D")
             text_color = QColor("#FCD34D") if is_dark else QColor("#B45309")
             dot_color = QColor("#F59E0B")
-            txt = "点「让 ECH 就绪」"
+            txt = "ECH 配置可疑"
             self.setToolTip(
                 "ECHConfig 疑似已失效 (隧道进程在跑, 但配置可能仍在吃内置兜底)。\n"
                 "请到 CDN 页点「让 ECH 就绪」强制重启隧道以重新获取配置。")
@@ -1511,12 +1511,12 @@ class LatencyBadge(QWidget):
             txt = "ECH 直连"
         elif self.ech:
             # 隧道未就绪: 服务实际已回退常规直连, 必须显式提示而非谎报为可用。
-            # 同中间态, 文案改为**动作式**: 这一态下用户唯一有效动作就是让它就绪。
+            # 文字保持 "ECH ..." 形态 (用户明确要求 ECH 侧只显示 ECH, 不改文字)。
             bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
             border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
             text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
             dot_color = QColor("#EF4444")
-            txt = "点「让 ECH 就绪」"
+            txt = "ECH 未就绪"
             self.setToolTip(
                 "ECH 隧道未就绪, 该服务已回退常规直连 (很可能不通)。\n"
                 "请到 CDN 页点「让 ECH 就绪」启动/重启隧道。")
