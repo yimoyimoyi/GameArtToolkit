@@ -11,7 +11,7 @@ GameArt Toolkit - HTTP/3 上游腿 (nginx 明文回环 → 本模块 → HTTP/3 
   而本项目的 nginx 构建**没有 --with-http_v3_module**, 它自己说不了 HTTP/3,
   所以这条上游腿必须由本模块承担。
 
-  ⚠ 2026-10-04 已逐条实测确认"没有平行替代"(docs/googlevideo-node-availability.md §7.6.5):
+  ⚠ 2026-10-04 已逐条实测确认"没有平行替代"(docs/archive/googlevideo-node-availability.md §7.6.5):
     · QUIC 只在 **UDP 443** 上听 —— 8443 / 80 / 8853 / 8080 全部 Timeout (12/12);
     · TCP + ALPN=h3 (HTTP/3 over TCP) 与 ALPN=h2 均在**握手中被 RST**;
     · IPv4 侧整体不可达 (8/8 ConnectionError)。
@@ -114,7 +114,7 @@ TAP_RING_MAX = 64                # 请求级诊断 tap 长度 (有界, 见 _Requ
 #   因此: 默认关闭, 并保留开关与 MAX_TOTAL_ATTEMPTS / RETRY_TIME_BUDGET 两道闸门,
 #   供将来在有**同刻交错对照**的条件下重新评估。
 #
-# ★ 2026-10-04 修正 (docs/googlevideo-node-availability.md §7.4~7.7):
+# ★ 2026-10-04 修正 (docs/archive/googlevideo-node-availability.md §7.4~7.7):
 #   ① "失败按 (节点, 地址) 粘滞"这个前提**不成立** —— 同一地址相隔 5~12 分钟, 成功率
 #      中位变化 **44%** / 最大 **88%**; 真正稳定的是"v4 池为空的节点恒为 0"。
 #      逐地址直打更显示: 被判"死"的地址在**秒级**尺度上就会返回 403 + gvs 1.0 (§7.6.2)。
@@ -1668,7 +1668,7 @@ class H3Forwarder:
         """重解析一次 (返回空列表表示拿不到新答案)
 
         ⚠ 2026-10-04 核实: **本方法在结构上拿不到新地址**, 调用点 (第二轮) 实际是死代码。
-          三重证据 (docs/googlevideo-node-availability.md §7):
+          三重证据 (docs/archive/googlevideo-node-availability.md §7):
             · 同一节点名的答案 = 一个 v6 + 一个 v4 的**固定组合**, 跨 5 分钟 / 12 分钟 /
               **隔一天** 真实重查均**逐字相同** (且解析器无任何 DoH 缓存);
             · 本方法返回的是 resolver 的**完整答案**, 而调用点用 `if ip not in tried` 过滤,
@@ -2346,7 +2346,7 @@ def gvs_health(scoreboard: Optional["_NodeScoreboard"] = None) -> Dict[str, Any]
     浏览器真实播放留下的节点成绩单 (跨会话持久化)。**刻意不做实时探测**:
       · 实时探测要几十秒 (整池 × 多轮), 挂在开关回调上会冻结界面;
       · 更重要的是, 合成探测本身读不出"能不能播" (受 `n=` 与 UMP 体限制, 见
-        docs/googlevideo-node-availability.md §5), 而成绩单是真实播放的直接统计。
+        docs/archive/googlevideo-node-availability.md §5), 而成绩单是真实播放的直接统计。
 
     返回 state 与阈值同 `app/gvs_h3_probe` (OK/FLAKY/UNSTABLE/NO_DATA), 便于两处结论互相对照。
     """
@@ -2380,10 +2380,21 @@ def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = Non
     """
     if services:
         try:
-            if "googlevideo" not in set(services):
-                return ""
+            _svcs = set(services)
         except TypeError:                       # 传入不可迭代对象 ⇒ 视为未声明
-            pass
+            _svcs = None
+        if _svcs is not None:
+            # ★★ 2026-10-04 修**提示误挂** (用户实测: 开启 civitai_web 时弹出了
+            #    "YouTube 视频流可用概率偏低"): 原判据是"清单里**含** googlevideo 就提示",
+            #    而这条提示的**数据源是 googlevideo 专属的节点成绩单** (全量口径, 不含服务
+            #    维度)。于是只要 googlevideo 也在启用清单里, 开启**任何** h3 服务 (civitai_web)
+            #    都会弹出 YouTube 的告警 —— 张冠李戴, 用户会以为 civitai 的视频有问题。
+            #    正确判据是"**本次要提示的对象就是 googlevideo**", 而不是"它在清单里"。
+            #    ⚠ 代价: `_start_h3_upstream` 那种"只报通道健康"的调用点将不再弹这条 ——
+            #      这是对的: 那条提示讲的是**视频可用率**, 不是通道健康度。通道自身的健康
+            #      已由 h3 徽章/共用卡呈现 (状态即为准, 不需要猜)。
+            if "googlevideo" not in _svcs:
+                return ""
     try:
         h = gvs_health(scoreboard)
     except Exception:
@@ -2396,7 +2407,7 @@ def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = Non
     rate = h.get("rate")
     pct = f"{round(float(rate) * 100)}%" if rate is not None else "-"
     tail = ("视频可能卡顿/降码率或需要反复重试; 这是**节点级**的分钟级时变问题 "
-            "(各节点只有一个可用地址, 详见 docs/googlevideo-node-availability.md)。")
+            "(各节点只有一个可用地址, 详见 docs/archive/googlevideo-node-availability.md)。")
     if state == "UNSTABLE":
         return f"最近 {total} 次视频请求里节点可用率仅 {pct} ({ok}/{total}) —— {tail}"
     return (f"最近 {total} 次视频请求里节点可用率偏低 {pct} ({ok}/{total}) —— {tail}")
