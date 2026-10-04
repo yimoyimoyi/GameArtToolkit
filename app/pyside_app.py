@@ -2343,16 +2343,26 @@ class MainWindow(QMainWindow):
         #   ② 必须用切换**后**的清单 —— 打开 googlevideo 时它已在 new_list 里, 告警才出得来;
         #   ③ 原先传 [service_id] 而函数不读该参数 ⇒ 开关任何服务都弹 googlevideo 的告警,
         #      文案还会张冠李戴 (如 "[Gemini] 已开启 … 最近 N 次**视频**请求…")。
+        # 软告警 2 (2026-10-03; 判据两次修正 2026-10-04): 走 HTTP/3 直连通道的服务 ——
+        # 它的可用性是**节点级、分钟级时变**的, 既拦不住也修不好, 只能如实告知且不阻断。
+        # 数据源 = 节点成绩单 (浏览器真实播放的跨会话统计), **离线读取**, 不做实时探测。
+        #
+        # ★ 判据现在看 **`subject`=本次要开的那个服务**, 而不是"启用清单里有没有 googlevideo":
+        #   后者会让**开启 civitai_web** 时弹出 YouTube 的告警 (实测, 见截图) —— 因为
+        #   civitai_web 也走 h3 通道、也在这个清单里, 而成绩单是 googlevideo 专属的。
         if checked:
             try:
                 from h3_upstream import gvs_health_hint
-                _hint = gvs_health_hint(new_list)
+                # subject=本次操作的服务: 只有它**就是** googlevideo 时该提示才成立。
+                # 传 subject 后不再需要 new_list (判据已由对象本身确定), 但保留传参无害。
+                _hint = gvs_health_hint(new_list, subject=service_id)
             except Exception:
                 _hint = ""
             if _hint:
                 _name2 = (_profile or {}).get("name", service_id)
-                show_toast(self, f"[{_name2}] 已开启, 但当前并不稳定 —— {_hint}",
-                           toast_type="warning", duration=10000)
+                # 文案按用户要求收敛: "xxx可能不稳定, 节点可用性 xx%"
+                show_toast(self, f"{_name2}可能不稳定, {_hint}",
+                           toast_type="warning", duration=8000)
 
         srv_info = SERVICES_BY_ID.get(service_id)
 
@@ -6361,12 +6371,13 @@ class MainWindow(QMainWindow):
             print(f"[Redirect] Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域: "
                   f"{self._format_gap_note(_gap_note)}")
 
-        # 启动收尾唯一的一条 toast: YouTube 视频流的**可用概率** (用户明确要求只留这一条)。
-        # 数据来自节点成绩单, 不触发任何探测; 与该服务无关时 gvs_health_hint 返回空串。
+        # 启动收尾唯一的一条 toast: **可用概率** (用户明确要求只留这一条, 且文案收短)。
+        # 数据来自节点成绩单 (全部样本都是 googlevideo 的视频请求), 不触发任何探测。
+        # 措辞必须是"节点可用性", 不能说成"该服务的可用性" —— 成绩单没有服务维度。
         _h3_note = getattr(self, "_gvs_health_note", "") or ""
         if _h3_note:
-            show_toast(self, f"YouTube 视频流可用概率偏低 —— {_h3_note}",
-                       toast_type="warning", duration=11000)
+            show_toast(self, f"YouTube 视频流可能不稳定, {_h3_note}",
+                       toast_type="warning", duration=9000)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
@@ -6430,6 +6441,9 @@ class MainWindow(QMainWindow):
         # `check_preconditions` 那一道"不阻断但如实告知"的告警。
         try:
             from h3_upstream import gvs_health_hint
+            # 启动收尾用**全量语境** (subject=None) ⇒ 判据退回"清单里是否含 googlevideo"。
+            # 那条提示专讲视频可用率, 与 civitai 等其它 h3 服务无关; 只有在 googlevideo
+            # 确实被启用时才提示 (否则 googlevideo 关着也会弹)。
             self._gvs_health_note = gvs_health_hint(_enabled)
         except Exception:
             self._gvs_health_note = ""

@@ -2307,10 +2307,27 @@ PROFILES: List[ServiceProfile] = [
         #   blobs-b2 相同的 CF 地址 (172.66.152.186 / 104.20.38.219), 故一并登记:
         #   当前生效的图片链是 image → 301 → blobs-b2, 而 b2 是同一后端的另一入口,
         #   漏登记它会让走 b2 的那部分资源仍落到被阻断的直连路径。
+        # ⚠ 2026-10-04 补登一批**承重子域** —— 它们是从 civitai 自己的 32 个 JS chunk
+        #   里提取出来的 (不是猜的), 未登记时请求不会被 PAC 送到本机, 只能走被阻断的直连:
+        #     · orchestration.civitai.com —— **主页/API 数据源** (实测未登记时经本机代理
+        #       返回 0 字节/444, 即落到 nginx default_server) ⇒ 直接解释"civitai.com 加载
+        #       存在问题";
+        #     · search-new / signals-new —— 搜索与推荐流 (同一次提取得到);
+        #     · imagecache / link / training / moderator / chopped / advertising /
+        #       developer / status / education —— 站点自身引用的其余子域, 一并登记避免
+        #       "某些功能偶发不可用"这类零散故障 (每个都只在 JS 里出现 1 次, 属共享常量表)。
+        #   ⚠ 登记它们只影响"是否经本机转发", 不改变任何通道行为; 代价是这些域的流量也走
+        #     h3 腿 (当前该腿单请求 3~8 秒, 见下), 故不是"越多越好" —— 只登记实测被引用的。
         # ⚠ 这些名字都**不是** CF 网段排除对象, 而是 h3 腿按 Host 解析的目标。
         domains=["civitai.com", "www.civitai.com", "auth.civitai.com",
                  "image.civitai.com", "imagecache.civitai.com",
-                 "blobs-b2.civitai.com", "b2.civitai.com", "faro.civitai.com"],
+                 "blobs-b2.civitai.com", "b2.civitai.com", "faro.civitai.com",
+                 "orchestration.civitai.com", "search-new.civitai.com",
+                 "signals-new.civitai.com", "link.civitai.com",
+                 "training.civitai.com", "moderator.civitai.com",
+                 "chopped.civitai.com", "advertising.civitai.com",
+                 "developer.civitai.com", "status.civitai.com",
+                 "education.civitai.com"],
         icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_civitai_web",

@@ -2360,41 +2360,30 @@ def gvs_health(scoreboard: Optional["_NodeScoreboard"] = None) -> Dict[str, Any]
                 "enough_samples": False, "state": "NO_DATA", "error": str(e)[:120]}
 
 
-def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = None) -> str:
-    """给 UI 的一句话告警 (稳定/样本不足/与该服务无关时返回空串 —— 不打扰)
+def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = None,
+                    subject: Optional[str] = None) -> str:
+    """给 UI 的一句话告警 (稳定/样本不足/与**本次对象**无关时返回空串 —— 不打扰)
 
-    口径: 只在**确实不稳定**且**该告警与调用方相关**时提示, 与既有的软告警
-    (blocked/gaps) 同一形态。scoreboard 可注入 (单测用); 省略时读已落盘的成绩单。
+    口径: 只在**确实不稳定**且**该告警与调用方要提示的对象一致**时提示。
 
-    ★ L3 (2026-10-04): `services` 此前**收了参数却从不使用** —— 于是:
-      · 启用边界 (`on_service_toggled`) 传了 `[service_id]`, 却仍无条件弹 googlevideo
-        的告警 ⇒ 开关 Gemini / netflix / pixiv 都会看到"YouTube 视频流当前不稳定";
-      · 启动路径 (`_start_h3_upstream`) 索性**不传参数** ⇒ googlevideo 明明关着也弹。
-      成绩单是**全量**口径 (不含服务维度), 所以"关掉它"与"这个服务不涉及它"是两件事,
-      判据只能是**调用方声明的启用清单**:
-        · services 含 "googlevideo"          → 告警与它相关, 照常提示;
-        · services 是非空清单但不含它        → 与本次操作无关, 静默 (修 L3 的核心);
-        · services 为 None / 空              → **调用方未声明**, 保守仍提示 ——
-          宁可多提示一次, 也不要因为"没传"而把真实信号静默掉。
-      注: "未声明"与"声明了空清单"无法区分, 故两者同待遇; 调用方应传真实启用集合。
+    ★ 2026-10-04 二次修正 —— 判据必须看**本次对象**, 不能看"清单里有没有它":
+      上一版把判据写成"`services` 里含 googlevideo 就提示", 结果实测: 用户**开启
+      civitai_web** 时弹出了"YouTube 视频流可用概率偏低 —— 最近 80 次视频请求…各节点只有
+      一个可用地址"。原因: 该提示的数据源是 **googlevideo 专属的节点成绩单** (全量口径,
+      不含服务维度), 而 civitai_web 也在 h3 通道上、也被算进了 `services` 里。
+      ⇒ 现在传 `subject` = **本次要提示的那个服务 id**, 只有它**就是** googlevideo 时才提示。
+      `subject=None` 时退回"清单里是否含 googlevideo"(启动收尾那种全量语境用)。
     """
-    if services:
+    if subject is not None:
+        if str(subject) != "googlevideo":
+            return ""
+    elif services:
         try:
             _svcs = set(services)
         except TypeError:                       # 传入不可迭代对象 ⇒ 视为未声明
             _svcs = None
-        if _svcs is not None:
-            # ★★ 2026-10-04 修**提示误挂** (用户实测: 开启 civitai_web 时弹出了
-            #    "YouTube 视频流可用概率偏低"): 原判据是"清单里**含** googlevideo 就提示",
-            #    而这条提示的**数据源是 googlevideo 专属的节点成绩单** (全量口径, 不含服务
-            #    维度)。于是只要 googlevideo 也在启用清单里, 开启**任何** h3 服务 (civitai_web)
-            #    都会弹出 YouTube 的告警 —— 张冠李戴, 用户会以为 civitai 的视频有问题。
-            #    正确判据是"**本次要提示的对象就是 googlevideo**", 而不是"它在清单里"。
-            #    ⚠ 代价: `_start_h3_upstream` 那种"只报通道健康"的调用点将不再弹这条 ——
-            #      这是对的: 那条提示讲的是**视频可用率**, 不是通道健康度。通道自身的健康
-            #      已由 h3 徽章/共用卡呈现 (状态即为准, 不需要猜)。
-            if "googlevideo" not in _svcs:
-                return ""
+        if _svcs is not None and "googlevideo" not in _svcs:
+            return ""
     try:
         h = gvs_health(scoreboard)
     except Exception:
@@ -2406,11 +2395,12 @@ def gvs_health_hint(services=None, scoreboard: Optional["_NodeScoreboard"] = Non
     ok = int(h.get("ok") or 0)
     rate = h.get("rate")
     pct = f"{round(float(rate) * 100)}%" if rate is not None else "-"
-    tail = ("视频可能卡顿/降码率或需要反复重试; 这是**节点级**的分钟级时变问题 "
-            "(各节点只有一个可用地址, 详见 docs/archive/googlevideo-node-availability.md)。")
-    if state == "UNSTABLE":
-        return f"最近 {total} 次视频请求里节点可用率仅 {pct} ({ok}/{total}) —— {tail}"
-    return (f"最近 {total} 次视频请求里节点可用率偏低 {pct} ({ok}/{total}) —— {tail}")
+    # ★ 文案收敛为一句 (2026-10-04 用户要求: "途中类似文本改成, xxx可能不稳定, 节点可用性xx%"):
+    #   原先的长句 (视频可能卡顿/降码率…各节点只有一个可用地址…docs 链接) 对用户是噪音,
+    #   而且**对非视频服务还会误导** (它讲的是视频请求)。现在只留"对象 + 概率"。
+    #   ⚠ 这条提示的样本**全部来自 googlevideo 的视频请求**, 所以措辞必须限定为
+    #     "节点可用性", 不能说成"该服务的可用性" —— 成绩单没有服务维度。
+    return f"节点可用性 {pct} ({ok}/{total})"
 
 
 def check_preconditions(redirect_mode: str) -> List[str]:
