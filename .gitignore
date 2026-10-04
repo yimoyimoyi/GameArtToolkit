@@ -180,6 +180,10 @@ scripts/probe_*.py
 #     · verify_image_fetch_via_proxy.py / verify_gallery_images_via_proxy.py
 #                                     — 经服务后**图片能否真正取到** (不是只看状态码)
 #     · verify_xbox_github_paths.py   — xbox / GitHub 家族的直连 vs 代理可达性
+#     · audit_pool_availability.py    — **全量候选池**剥离项目的可用性审计
+#       (为什么它最该入库: 池子会漂 —— 本轮实测抓到两处过期结论:
+#        注释说 109.202.100.218 "已失效" ⇒ 实测 3/3 可用; 而最快的 77.247.178.1
+#        一直在 DoH 答案里却从未登记。没有这个审计器, 这类漂移无人发现。)
 !scripts/diag_probe_false_negatives.py
 !scripts/diag_tcp_vs_quic.py
 !scripts/diag_direct_vs_proxy.py
@@ -187,6 +191,9 @@ scripts/probe_*.py
 !scripts/verify_gallery_images_via_proxy.py
 !scripts/verify_xbox_github_paths.py
 scripts/audit_*.py
+# ⚠ 否定项必须排在 `scripts/audit_*.py` **之后** —— git 是后者优先, 先写等于没写
+#   (实测踩到: 放在上面时 check-ignore 仍命中 audit_*.py)。
+!scripts/audit_pool_availability.py
 scripts/test_*.py
 scripts/benchmark_*.py
 # 一次性排障 / 紧急清理助手 (与 probe_* 同类: 只在本机排查时用, 不上传)

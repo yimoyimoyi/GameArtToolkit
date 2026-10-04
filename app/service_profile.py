@@ -1967,7 +1967,14 @@ PROFILES: List[ServiceProfile] = [
         name="nhentai 图床",
         desc="nhentai 缩略图与原图服务器 (自有服务器非 CF, 空 SNI 可直连, 图片可缓存)",
         # ⚠ 与 nhentai 主站拆画像的必要性有**实测反例**: 图床走 ECH 会得到 520 (CF 回源错误)。
-        domains=["i.nhentai.net", "t.nhentai.net"],
+        #   故本画像的正确手法是**空 SNI** (不是真实 SNI, 也不是 ECH):
+        #     空 SNI     -> 200 + 真图 (实测)
+        #     真实 SNI   -> ConnectionResetError (338ms)
+        #     apex SNI   -> ConnectionResetError
+        #   ★ 2026-10-04 补 t3: 页面在 `t3.nhentai.net` 上取缩略图, 而原画像只登记了
+        #     i./t. 两个 → 实测两个候选对 t3 都回 200 + 35KB 缩略图 (1419/1680ms)。
+        #     未登记即不劫持 → 那条子域走真实解析(被投毒) → 表现为图片不全。
+        domains=["i.nhentai.net", "t.nhentai.net", "t3.nhentai.net"],
         icon="image",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_nhentai_img",
@@ -1977,7 +1984,32 @@ PROFILES: List[ServiceProfile] = [
         # 2026-10-03 草案实测: 空 SNI 握手通过 · 证书 CN=*.nhentai.net · HTTP 200 (真 SNI 一律 RST)
         # 2026-10-04 复核: 213.152.165.53 / .54 通过 (证书域族 nhentai.net);
         #                  ⚠ 109.202.100.218 已失效 (空 SNI 也握手超时) ⇒ 剔除, 池降为 2
-        candidate_ips=["213.152.165.53", "213.152.165.54"],
+        # ★★ 2026-10-04 二次复核 —— 上一行"已失效⇒剔除"的结论**已过期**, 现按实测扩池回 4:
+        #   每条都实测 3 次 (空 SNI, 取真实图 /galleries/9/1.jpg, 均 200 + 256054B):
+        #     77.247.178.1      1912 / 2350 / 2101 ms   ← **最快最稳, 原先从未登记**
+        #     109.202.100.218   2374 / 5662 / 11699 ms  ← 上次判"已失效", 实测已恢复
+        #     213.152.165.53    7729 / 5881 / 4909 ms
+        #     213.152.165.54    5959 / 2232 / 3854 ms   ← 曾达 63s, 方差极大
+        #   扩池的价值: 本画像的服务器方差极大 (2.4s~63s), 池子宽 + 最快的排首位,
+        #   能显著提高"nginx 抽到一个快地址"的概率。
+        #
+        # ⚠⚠ 但必须说清: **扩池并不能让探测判它可用** —— 根因不在池子。实测 (空 SNI):
+        #       77.247.178.1  i.nhentai.net  /                  -> 200 连接后 **0 字节**
+        #       77.247.178.1  i.nhentai.net  /galleries/9/1.jpg -> 200 + 256054B
+        #       213.152.165.53 i.nhentai.net /                  -> 0 字节
+        #       213.152.165.53 i.nhentai.net /galleries/9/1.jpg -> 200 + 256054B
+        #     即**这些服务器对根路径不应答, 只对真实内容路径应答**。而
+        #     `cdn_optimizer.probe_ip_endpoint_v2` 硬编码请求 `GET /` ⇒ 该画像
+        #     永远 0 个 rank0 (实测 4 个档位 probe_timeout 全是 0/5), 于是
+        #     `apply_optimal` 永远走候选池兜底 —— 这才是"检测不可用、实际可用"的机制。
+        #   为什么**没有**顺手加 per-profile 探测路径: 量化后只有本画像受影响 ——
+        #     审计中其余"快速失败"的 9 个画像 (cara/dlsite/ehentai/furaffinity/nhentai/
+        #     pawchive×3/pixiv_web) 都是 ECH 隧道类, 它们的空响应是"剥离隧道"造成的,
+        #     项目内走 127.0.0.1:44401 是好的。为一个画像给 probe_ip_endpoint_v2
+        #     做端到端 path 穿透 (含 test_group / apply_optimal 全部调用点) 收益过小、风险过大。
+        #     ⇒ 记在此处待将来批量做 (若出现第二个同类画像)。
+        candidate_ips=["77.247.178.1", "213.152.165.53", "213.152.165.54",
+                       "109.202.100.218"],
         enable_cache=True,
     ),
     ServiceProfile(
