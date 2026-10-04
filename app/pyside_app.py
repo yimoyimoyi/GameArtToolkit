@@ -3406,6 +3406,31 @@ class MainWindow(QMainWindow):
         self.render_cdn_results(results)
         show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
 
+    def _refresh_channel_state(self):
+        """重刷 ECH / h3 两条本机通道的**徽章与共用卡** (UI 线程调用)
+
+        为什么需要它 (2026-10-04, 用户反馈): 这两条通道都是**启动流程里才被拉起**的
+        (ECH 隧道由 `_start_ech_tunnel` 起, h3 腿由 `_start_h3_upstream` 起), 而徽章与
+        通道卡可能在那之前就已经渲染过 —— 那时读到的自然是"未就绪"。若不在启动完成后
+        重刷一次, 用户会看到"点了启动加速, 通道却还写着未就绪", 状态与事实不符。
+
+        实现方式: 重跑一次 `render_cdn_results`(用缓存的结果)。它会重新读两条通道的实时
+        状态并重设全部徽章 —— 不另写一套"只更新通道部分"的逻辑, 避免两处判据漂移
+        (这正是本项目反复吃亏的地方)。没有缓存结果时就只重设通道类服务的徽章。
+        """
+        try:
+            cached = getattr(self, "cached_cdn_results", None) or {}
+            if cached and hasattr(self, "cdn_results_layout"):
+                self.render_cdn_results(cached)
+                return
+            # 没有测速结果可渲染: 至少把通道类服务的徽章刷成当前状态
+            for srv in SERVICES_LIST:
+                sid = srv["id"]
+                if is_ech_service(sid) or is_h3_service(sid):
+                    self._set_badge(sid, 0)
+        except Exception as e:
+            print(f"[Channel] 通道状态刷新失败: {e}")
+
     def _set_badge(self, sid: str, latency: int, is_star: bool = False, via_proxy: bool = False):
         """统一更新主控制台延迟徽章
 
@@ -6254,6 +6279,14 @@ class MainWindow(QMainWindow):
             self.btn_toggle_acc.style().unpolish(self.btn_toggle_acc)
             self.btn_toggle_acc.style().polish(self.btn_toggle_acc)
 
+        # ★ 通道状态必须在这里刷新一次 (2026-10-04, 用户反馈"缺少启动服务后 http3 通道的
+        #   状态改变问题"): ECH 隧道 / h3 直连腿都是**在启动流程里才被拉起**的, 而徽章与
+        #   通道卡片可能在启动之前就已经渲染过 (那时腿还没起 ⇒ 显示"未就绪")。
+        #   不在这里重刷, 用户就会看到"已经点了启动加速, 但通道仍写着未就绪"—— 状态与实际
+        #   不符, 正是本项目一直在修的那类问题。
+        #   放在 UI 收尾路径 (而非 worker 里): 这些绘制必须发生在主线程。
+        self._refresh_channel_state()
+
         services = result.get("services") or []
         # 掩护 SNI 状态卡刷新 (方案 §10 第 6 条: 降级必须可见)。
         # 不可用时不仅更新卡片, 还额外弹一条错误提示 —— 方案 §8 末行要求"显式标记失败",
@@ -6298,6 +6331,11 @@ class MainWindow(QMainWindow):
                        f"{'；'.join(f'{k}' for k in sorted(_blocked_note))}",
                        toast_type="warning", duration=8000)
         _gap_note = getattr(self, "_wildcard_gap_note", None) or {}
+        # 2026-10-04 收敛: googlevideo 的通配缺口**不在这里再报一次** —— 它由下面那道
+        # h3 前置条件告警专门说明 (带 PAC 后端这个**可操作**的出路), 两条一起弹等于同一件
+        # 事说两遍, 而这条的文案 ("这些子域仍走真实解析") 对视频流来说也不够准确。
+        if "googlevideo" in _gap_note:
+            _gap_note = {k: v for k, v in _gap_note.items() if k != "googlevideo"}
         if _gap_note:
             show_toast(self,
                        f"⚠ 当前 Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域名: "
@@ -6305,11 +6343,17 @@ class MainWindow(QMainWindow):
                        f"相关功能可能超时。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
                        toast_type="warning", duration=10000)
 
-        # 软告警 3 (2026-10-03): HTTP/3 上游腿的**节点级**可用性 —— 与上面两道闸门同一形态
+        # 软告警 3 (2026-10-03): HTTP/3 直连通道的**节点级**可用性 —— 与上面两道闸门同一形态
         # (都是"已经开了, 但必须说出来")。数据来自节点成绩单, 不触发任何探测。
+        #
+        # ★ 2026-10-04 收敛 (用户要求"youtube 警告只剩下可用概率警报就行"): 原先这里
+        #   与启用边界那条 (on_service_toggled) 是**同一份 hint、同一件事**, 只是触发时机
+        #   不同 (开关时 / 启动时), 于是开一次加速能看到同一句告警两遍。启动收尾这条保留
+        #   (它覆盖"上次已启用、本次直接启动"这条最常见的路径), 启用边界那条保留 ——
+        #   两者不再重复文案, 而是分工: 开关时立刻反馈, 启动收尾兜底。
         _h3_note = getattr(self, "_gvs_health_note", "") or ""
         if _h3_note:
-            show_toast(self, f"⚠ YouTube 视频流(googlevideo) 当前不稳定 —— {_h3_note}",
+            show_toast(self, f"YouTube 视频流可用概率偏低 —— {_h3_note}",
                        toast_type="warning", duration=11000)
 
         self._start_status_probe()
