@@ -1403,23 +1403,36 @@ class LatencyBadge(QWidget):
         self.ech_ok = True
         # 第三态: 隧道在跑但 ECHConfig 可疑 (见 set_latency docstring 的三态说明)
         self.ech_degraded = False
+        # h3 直连通道 (2026-10-04): 与 ECH 同款"特殊显示" —— 该链路也不按候选节点出网,
+        # 因此同样不能显示成"某节点的延迟 ms"(那会与 ECH 类服务一样造成假可用/假失败)。
+        self.h3 = False
+        self.h3_ok = True
         self.setFixedHeight(24)
         self.setMinimumWidth(72)
         ThemeManager.get_instance().theme_changed.connect(safe_theme_refresh(self))
 
     def set_latency(self, ms: int, is_star: bool = False, via_proxy: bool = False,
-                    ech: bool = False, ech_ok: bool = True, ech_degraded: bool = False):
-        """ech=True 时展示 ECH 隧道状态: 该链路走加密 SNI 直连, 不依赖候选节点探测。
+                    ech: bool = False, ech_ok: bool = True, ech_degraded: bool = False,
+                    h3: bool = False, h3_ok: bool = True):
+        """ech=True / h3=True 时展示**通道状态**而非节点延迟。
 
-        三态是刻意的, 不能压成两态 (2026-10-04, 缺陷 W2):
-          · ech_ok=True,  ech_degraded=False -> "ECH 直连"      (隧道在, 配置新鲜)
-          · ech_ok=True,  ech_degraded=True  -> "ECH 配置可疑"  (进程/端口都在, 但
+        这两类画像的共同点: 上游是**本机的一条通道**(ECH 隧道 / HTTP/3 直连), 与候选池里的
+        边缘地址无关 ⇒ 探测层复现不了该路径, 显示"某个 IP 的 ms"或"超时"都是错的。
+
+        ECH 三态 (2026-10-04, 缺陷 W2):
+          · ech_ok=True,  ech_degraded=False -> "加密直连"      (隧道在, 配置新鲜)
+          · ech_ok=True,  ech_degraded=True  -> "点「让 ECH 就绪」"(进程/端口都在, 但
                                                     ECHConfig 疑似仍在吃内置兜底)
-          · ech_ok=False                     -> "ECH 未就绪"    (已回退常规直连)
+          · ech_ok=False                     -> "点「让 ECH 就绪」"(已回退常规直连)
 
         中间那一态为什么必须有: "DoH 被阻断 + 内置兜底过期"时隧道**进程健康、端口在听**,
         却每个请求都失败。把它显示成绿色的"ECH 直连"就是本项目最忌讳的假可用;
         而显示成红色的"未就绪"也不对 —— 它确实在跑, 只是大概率不可用。
+
+        h3 两态 (2026-10-04, 用户要求"上游腿部分改成类似 ECH 的特殊显示, 点击无效"):
+          · h3_ok=True  -> "HTTP/3 直连"   (腿在跑, 该链路本就不按候选节点出网)
+          · h3_ok=False -> "HTTP/3 未就绪" (腿没起, 上游指向 44411 会 502)
+        徽章本身**不处理点击**(全类无 mousePressEvent) —— "点击无效"由这一点直接成立。
         """
         self.latency_ms = ms
         self.is_star = is_star
@@ -1427,9 +1440,12 @@ class LatencyBadge(QWidget):
         self.ech = ech
         self.ech_ok = ech_ok
         self.ech_degraded = bool(ech_degraded) and bool(ech_ok)
-        if ech:
-            self.setMinimumWidth(96)
-            self.setMaximumWidth(112)
+        self.h3 = bool(h3)
+        self.h3_ok = bool(h3_ok)
+        if ech or h3:
+            # 通道类徽章文案更长 ("HTTP/3 直连" / "点「让 ECH 就绪」"), 需要更宽的位
+            self.setMinimumWidth(112)
+            self.setMaximumWidth(136)
         elif is_star or via_proxy:
             self.setMinimumWidth(98)
             self.setMaximumWidth(115)
@@ -1447,15 +1463,43 @@ class LatencyBadge(QWidget):
 
         palette = ThemeManager.get_instance().get_palette()
         is_dark = ThemeManager.get_instance().is_dark
-        if self.ech and self.ech_ok and self.ech_degraded:
+        if self.h3:
+            # h3 直连通道: 与 ECH 同一套"特殊显示"思路 —— 它不按候选节点出网, 所以
+            # 既不显示 ms 也不显示"超时", 只报通道自身的就绪状态。
+            # 用**青色**与 ECH 的靛蓝区分开: 两者是不同通道, 颜色混了会让人以为是一回事。
+            if self.h3_ok:
+                bg_color = QColor("rgba(20, 184, 166, 0.16)") if is_dark else QColor("#F0FDFA")
+                border_color = QColor("#14B8A6") if is_dark else QColor("#5EEAD4")
+                text_color = QColor("#99F6E4") if is_dark else QColor("#0F766E")
+                dot_color = QColor("#2DD4BF")
+                txt = "HTTP/3 直连"
+                self.setToolTip("该服务经本机 HTTP/3 直连通道出网, 不按候选节点出网, 无法按 IP 测速。")
+            else:
+                bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
+                border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
+                text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
+                dot_color = QColor("#EF4444")
+                txt = "HTTP/3 未就绪"
+                self.setToolTip("HTTP/3 直连通道未在运行 —— 该服务的上游会指向未监听的本地端口 (502)。\n"
+                                "请启动加速服务以拉起该通道。")
+        elif self.ech and self.ech_ok and self.ech_degraded:
             # 中间态: 隧道在跑, 但 ECHConfig 疑似仍在吃内置兜底(DoH 全线失败 + 从未刷新)。
             # 用琥珀色而不是红色: 红色代表"未就绪/已回退", 会让用户去重启一个其实在跑的
-            # 进程; 真正该做的是查 DoH 可达性。文案必须点明"可能不可用"。
+            # 进程; 真正该做的是查 DoH 可达性。
+            #
+            # 2026-10-04 文案改为**动作式** (用户反馈"把 ECH 在控制台改为让 ECH 就绪方式"):
+            #   原先这里只报状态 ("ECH 配置可疑"), 用户看到一个**问题陈述**却不知道下一步该
+            #   做什么 —— 就算控制台那头有「让 ECH 就绪」按钮, 也得自己去把它和这个徽章联系起来。
+            #   现在徽章直接说该按哪个按钮, 状态与动作在同一个位置 (颜色仍编码严重程度:
+            #   琥珀=可能不可用 / 红=已回退)。
             bg_color = QColor("rgba(245, 158, 11, 0.16)") if is_dark else QColor("#FFFBEB")
             border_color = QColor("#F59E0B") if is_dark else QColor("#FCD34D")
             text_color = QColor("#FCD34D") if is_dark else QColor("#B45309")
             dot_color = QColor("#F59E0B")
-            txt = "ECH 配置可疑"
+            txt = "点「让 ECH 就绪」"
+            self.setToolTip(
+                "ECHConfig 疑似已失效 (隧道进程在跑, 但配置可能仍在吃内置兜底)。\n"
+                "请到 CDN 页点「让 ECH 就绪」强制重启隧道以重新获取配置。")
         elif self.ech and self.ech_ok:
             # ECH 隧道: 走的是加密 SNI 的直连通道, 与"某节点的延迟"不是同一维度,
             # 且探测层复现不了该路径。用独立的靛蓝色系与"ECH 直连"文案,
@@ -1466,12 +1510,16 @@ class LatencyBadge(QWidget):
             dot_color = QColor("#818CF8")
             txt = "ECH 直连"
         elif self.ech:
-            # 隧道未就绪: 服务实际已回退常规直连, 必须显式提示而非谎报为可用
+            # 隧道未就绪: 服务实际已回退常规直连, 必须显式提示而非谎报为可用。
+            # 同中间态, 文案改为**动作式**: 这一态下用户唯一有效动作就是让它就绪。
             bg_color = QColor("rgba(239, 68, 68, 0.15)") if is_dark else QColor("#FEF2F2")
             border_color = QColor("#EF4444") if is_dark else QColor("#F87171")
             text_color = QColor("#F87171") if is_dark else QColor("#DC2626")
             dot_color = QColor("#EF4444")
-            txt = "ECH 未就绪"
+            txt = "点「让 ECH 就绪」"
+            self.setToolTip(
+                "ECH 隧道未就绪, 该服务已回退常规直连 (很可能不通)。\n"
+                "请到 CDN 页点「让 ECH 就绪」启动/重启隧道。")
         elif self.latency_ms < 0:
             bg_color = QColor(palette.get("container", "#182032"))
             border_color = QColor(palette.get("outline", "#273752"))

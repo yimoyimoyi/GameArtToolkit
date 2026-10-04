@@ -1492,8 +1492,8 @@ PROFILES: List[ServiceProfile] = [
     ServiceProfile(
         id="googlevideo",
         group="dev",
-        name="YouTube 视频流 (HTTP/3 上游腿)",
-        desc="经本机 HTTP/3 上游腿直连真实视频节点 (通道已实测, 浏览器实测可播放; 默认不启用)",
+        name="YouTube 视频流 (HTTP/3 直连)",
+        desc="经本机 HTTP/3 直连真实视频节点 (通道已实测, 浏览器实测可播放; 默认不启用)",
         # ⚠ 域名集合为什么**不能只写 *.googlevideo.com** (2026-10-02 NRPT 实测):
         #   1) 播放器除了 googlevideo 主域, 还会请求**别名域家族**。实测失败主机名是
         #      `rr1---sn-p5qs7nd7.c.youtube.com` (16 次 ERR_CERT_COMMON_NAME_INVALID):
@@ -2300,7 +2300,7 @@ PROFILES: List[ServiceProfile] = [
         id="civitai_web",
         group="acg",
         name="Civitai 模型站",
-        desc="AI 绘画模型社区 (TCP 三路全灭, 经本地 HTTP/3 上游腿直连 Cloudflare)",
+        desc="AI 绘画模型社区 (TCP 三路全灭, 经本机 HTTP/3 直连 Cloudflare)",
         # 内容域按方案清单登记; blobs-b2 是图片**真载体** (实测页面 43 次 200, 而
         # image.civitai.com 只做 301 中转), 漏了它就会"页面能开、图全挂"。
         # ⚠ 这些名字都**不是** CF 网段排除对象, 而是 h3 腿按 Host 解析的目标。

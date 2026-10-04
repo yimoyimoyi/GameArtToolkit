@@ -117,6 +117,20 @@ def is_ech_service(sid: str) -> bool:
     return bool(profile and getattr(profile, "ech_enabled", False))
 
 
+def is_h3_service(sid: str) -> bool:
+    """该服务的直连是否由**本机 HTTP/3 通道**承担 (画像的 `h3_upstream` 标记)
+
+    与 `is_ech_service` 同理, 做成模块级纯函数 (render_cdn_results 会被轻量替身调用)。
+    为什么需要它 (2026-10-04, 用户要求"上游腿部分改成类似 ECH 的特殊显示"): 这类服务的
+    上游是本机 44411, **不按候选节点出网** ⇒ 显示成"某 IP 的 ms"或"超时"都是错的,
+    必须与 ECH 一样改成**通道状态**徽章。
+    """
+    from service_profile import PROFILES_BY_ID
+
+    profile = PROFILES_BY_ID.get(sid)
+    return bool(profile and getattr(profile, "h3_upstream", False))
+
+
 def single_test_unsupported_reason(sid: str) -> str:
     """该服务**是否不该做按候选 IP 的测速**; 返回原因 (空串 = 可以测)
 
@@ -146,11 +160,11 @@ def single_test_unsupported_reason(sid: str) -> str:
     if p is None:
         return ""
     if getattr(p, "ech_enabled", False):
-        return "该服务经 ECH 隧道出网, 候选 IP 在普通握手下一律失败, 按 IP 测速无意义"
+        return "该服务经本机加密直连 (ECH) 出网, 不走候选节点, 按 IP 测速无意义"
     if getattr(p, "h3_upstream", False):
-        return "该服务经本地 HTTP/3 上游腿出网 (无候选 IP 池), 按 IP 测速无意义"
+        return "该服务经本机 HTTP/3 直连出网, 不走候选节点, 按 IP 测速无意义"
     if not (getattr(p, "candidate_ips", None) or CANDIDATE_IPS.get(sid)):
-        return "该服务没有候选 IP 池 (上游是本机代理端口), 按 IP 测速无意义"
+        return "该服务经本机代理端口出网, 没有候选 IP, 按 IP 测速无意义"
     return ""
 
 
@@ -1245,7 +1259,8 @@ def _watchdog_budget_allow(owner, key: str, now: float) -> bool:
     b = _WATCHDOG_BUDGETS.get(id(owner))
     if b is None:
         def _exhausted(k: str, used: int) -> None:
-            names = {"ech": "ECH 隧道", "h3": "h3 上游腿", "nrpt": "本机 DNS 解析器"}
+            names = {"ech": "加密直连通道 (ECH)", "h3": "HTTP/3 直连通道",
+                     "nrpt": "本机 DNS 解析器"}
             label = names.get(k, k)
             print(f"[Watchdog] {label} 在 {WATCHDOG_REPAIR_WINDOW_SEC:.0f}s 内已修复 "
                   f"{used} 次仍未稳定, 停止自愈 (这不是自愈能解决的问题)")
@@ -3160,7 +3175,7 @@ class MainWindow(QMainWindow):
         self.btn_ech_ready.setCursor(Qt.PointingHandCursor)
         self.btn_ech_ready.setToolTip(
             "强制重启 ECH 隧道以重新获取 ECHConfig。\n"
-            "适用情形: 界面显示「ECH 隧道在跑 · 配置可疑」时 —— 那表示隧道进程正常，\n"
+            "适用情形: 界面显示「配置可疑 · 请点让 ECH 就绪」时 —— 那表示通道进程正常，\n"
             "但它可能仍在用内置兜底配置，导致所有走 ECH 的服务请求失败。")
         self.btn_ech_ready.clicked.connect(self.make_ech_ready)
         header.addWidget(self.btn_ech_ready)
@@ -3392,17 +3407,21 @@ class MainWindow(QMainWindow):
         show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
 
     def _set_badge(self, sid: str, latency: int, is_star: bool = False, via_proxy: bool = False):
-        """统一更新主控制台延迟徽章; ECH 服务渲染隧道状态(含其健康度, 不谎报可用)"""
+        """统一更新主控制台延迟徽章
+
+        ECH / h3 两类服务渲染的是**通道状态**而非节点延迟 —— 它们的上游是本机通道,
+        显示"某 IP 的 ms / 超时"都是错的 (探测层复现不了该路径)。
+        """
         if sid not in self.service_badges:
             return
         if is_ech_service(sid):
             from ech_tunnel import ech_tunnel
 
             # 用功能健康度而不是 is_healthy 来解码三态 (缺陷 W2, 2026-10-04):
-            #   ok=True                     -> "ECH 直连"     (隧道在, 配置新鲜)
-            #   ok=False 但 is_healthy=True -> "ECH 配置可疑" (进程/端口都在, 但
+            #   ok=True                     -> "加密直连"     (隧道在, 配置新鲜)
+            #   ok=False 但 is_healthy=True -> "点让ECH就绪"  (进程/端口都在, 但
             #                                  ECHConfig 疑似仍在吃内置兜底 ⇒ 请求会失败)
-            #   ok=False 且 is_healthy=False-> "ECH 未就绪"   (已回退常规直连)
+            #   ok=False 且 is_healthy=False-> "点让ECH就绪"  (已回退常规直连)
             # 只读一次 status(): is_functionally_healthy() 内部已经算过 config_freshness(),
             # 重复调用会重复读日志文件。
             st = ech_tunnel.status()
@@ -3410,28 +3429,94 @@ class MainWindow(QMainWindow):
             self.service_badges[sid].set_latency(
                 0, ech=True, ech_ok=ok,
                 ech_degraded=not ok and bool(st.get("healthy")))
+        elif is_h3_service(sid):
+            # h3 通道: 与 ECH 同款特殊显示 (用户要求), 只报通道自身是否在跑。
+            # 判据用 h3_proxy.is_healthy() —— 腿未起时上游 44411 没人听, 请求必然 502,
+            # 那种状态下把它显示成"直连正常"就是假可用。
+            from h3_upstream import h3_proxy
+
+            try:
+                h3_ok = bool(h3_proxy.is_healthy())
+            except Exception:
+                h3_ok = False
+            self.service_badges[sid].set_latency(0, h3=True, h3_ok=h3_ok)
         else:
             self.service_badges[sid].set_latency(latency, is_star=is_star, via_proxy=via_proxy)
 
     def _render_ech_shared_card(self, entries):
-        """渲染**一张共用**的 ECH 隧道状态卡 (2026-10-04 由"每个 ECH 服务一张"合并而来)
+        """兼容包装: 等价于 `_render_channel_shared_card(entries, "ech")`
 
-        为什么合并: ECH 是所有 ECH 画像共用的**同一条隧道、同一个端口、同一份 ECHConfig**,
-        所以原先每服务一张卡片会把**完全相同**的一段隧道状态重复 N 遍 (实测 13 个 ECH
-        画像就是 13 份), 既占屏又掩盖了"这其实是一个全局组件"这个事实 —— 用户会以为
-        每个服务各自有一条隧道, 于是隧道出问题时不知道该修哪里。
-
-        `entries`: [(sid, name), ...] —— 只用来列名与各自候选池大小。
+        保留旧名是因为既有测试与调用点用这个名字 (见 tests/test_theme_and_layout.py 的
+        DummyWindow 替身); 语义未变, 只是实现搬到了通道通用版里。
         """
-        from ech_tunnel import ech_tunnel
+        return self._render_channel_shared_card(entries, kind="ech")
 
+    def _render_channel_shared_card(self, entries, kind: str = "ech"):
+        """渲染**一张共用**的"本机通道"状态卡 —— `kind` 为 `"ech"` 或 `"h3"`
+
+        为什么合并成共用卡: 同一条通道被 N 个画像共用 (同一个端口、同一份健康状态),
+        原先每服务一张卡会把**完全相同**的一段状态重复 N 遍, 既占屏又掩盖了"这其实是一个
+        全局组件"这个事实 —— 用户会以为每个服务各自有一条通道, 于是通道出问题时不知道该
+        修哪里。
+
+        为什么 h3 也走这里 (2026-10-04 用户要求"上游腿改成类似 ECH 的特殊显示"):
+        两者都是"上游 = 本机某端口"的形态, 都不按候选节点出网 ⇒ 都不该显示节点延迟/
+        超时。区别只在**状态来源与文案**, 因此共用渲染器、按 kind 取状态。
+
+        两条通道的差别 (刻意不混):
+          · ECH: 判据是"进程+端口在跑 **且** ECHConfig 新鲜"(`functionally_healthy`),
+                 三态; 失败后果 = 回退常规直连 (可能不通)。
+          · h3 : 判据是"腿在监听"(`h3_proxy.is_healthy()`), 两态;
+                 失败后果 = 上游指向未监听端口, 请求 **502**。
+        """
         is_dark = ThemeManager.get_instance().is_dark
-        st = ech_tunnel.status()
-        healthy = st["healthy"]
-        # 三态 (缺陷 W2, 2026-10-04): "进程/端口都在"不等于"能工作"。
-        functional = bool(st.get("functionally_healthy"))
-        degraded = healthy and not functional
-        cfg_note = (st.get("ech_config") or {}).get("note") or ""
+
+        if kind == "h3":
+            from h3_upstream import h3_proxy
+            try:
+                st = h3_proxy.status()
+            except Exception:
+                st = {}
+            healthy = bool(st.get("running")) and bool(st.get("listening"))
+            degraded = False          # h3 腿没有"配置过期"这一态 (它不依赖 ECHConfig)
+            cfg_note = ""
+            port = st.get("port", 44411)
+            title_head = "HTTP/3 直连通道"
+            btn = None                # h3 腿无需"就绪"按钮: 它随启动流程自动拉起
+            if not healthy:
+                status_txt = "通道未就绪 · 该通道的上游会返回 502, 请启动加速服务"
+            else:
+                status_txt = f"通道就绪 · 监听 127.0.0.1:{port}"
+            note_txt = ("经本机 HTTP/3 (QUIC/UDP 443) 直连目标, 不依赖候选节点探测 —— "
+                        "因此这些服务在测速列表里不显示节点延迟, 可用性只取决于上面这条通道。")
+        else:
+            from ech_tunnel import ech_tunnel
+            st = ech_tunnel.status()
+            healthy = st["healthy"]
+            # 三态 (缺陷 W2, 2026-10-04): "进程/端口都在"不等于"能工作"。
+            functional = bool(st.get("functionally_healthy"))
+            degraded = healthy and not functional
+            cfg_note = (st.get("ech_config") or {}).get("note") or ""
+            port = st.get("port")
+            title_head = "加密直连通道 (ECH)"
+            if not healthy:
+                status_txt = "通道未就绪 · 已回退常规直连"
+            elif degraded:
+                status_txt = "通道进程在跑, 但 ECHConfig 可能已失效"
+            else:
+                status_txt = f"通道就绪 · 监听 127.0.0.1:{port}"
+            note_txt = ("加密 SNI 直连 Cloudflare（ECH），不依赖候选节点探测 —— "
+                        "因此这些服务在测速列表里不显示节点延迟，可用性只取决于上面这条通道。")
+
+        # 标题后缀: 不健康态直接说"该按哪个按钮", 而不是只丢一个状态词让用户自己想办法。
+        # 健康态保持陈述句 (无需动作)。
+        if not healthy:
+            suffix = ("未就绪 · 请启动加速服务" if kind == "h3"
+                      else "未就绪 · 请点「让 ECH 就绪」")
+        elif degraded:
+            suffix = "配置可疑 · 请点「让 ECH 就绪」"
+        else:
+            suffix = "已就绪 · 直连中"
 
         card = QFrame()
         card.setProperty("class", "MDCard")
@@ -3441,36 +3526,27 @@ class MainWindow(QMainWindow):
         card_l.setSpacing(10)
 
         card_top = QHBoxLayout()
-        # 标题跟随实际状态: 三态各有各的话, 不能压成"就绪/未就绪"两态。
-        # 中间态最要紧 —— 它以前会显示成绿色的"经 ECH 直连"。
-        if not healthy:
-            suffix = "ECH 隧道未就绪"
-        elif degraded:
-            suffix = "ECH 隧道在跑 · 配置可疑"
-        else:
-            suffix = "经 ECH 隧道直连"
-        lbl_title = QLabel(f"ECH 隧道（{len(entries)} 个服务共用）· {suffix}")
+        lbl_title = QLabel(f"{title_head}（{len(entries)} 个服务共用）· {suffix}")
         lbl_title.setProperty("class", "CategoryTitle")
         lbl_title.setWordWrap(True)
         card_top.addWidget(lbl_title)
         card_top.addStretch()
 
-        # 就绪按钮就地再放一个: 用户看到"配置可疑"时, 修它的动作就在同一条卡上
-        btn_fix = QPushButton("让 ECH 就绪")
-        btn_fix.setProperty("class", "MDBtnTonal")
-        btn_fix.setCursor(Qt.PointingHandCursor)
-        btn_fix.clicked.connect(self.make_ech_ready)
-        card_top.addWidget(btn_fix)
+        # 就绪按钮只在 ECH 侧提供: h3 腿随启动流程自动拉起, 没有"用户手动促成"这个动作,
+        # 放一个无效按钮反而会让人以为点了有用 (用户明确要求"点击无效即可"针对的是**显示**,
+        # 而不是新增一个摆设按钮)。
+        if kind == "ech":
+            btn_fix = QPushButton("让 ECH 就绪")
+            btn_fix.setProperty("class", "MDBtnTonal")
+            btn_fix.setCursor(Qt.PointingHandCursor)
+            btn_fix.clicked.connect(self.make_ech_ready)
+            card_top.addWidget(btn_fix)
         card_l.addLayout(card_top)
 
         dot, text_c = self._ech_status_colors(is_dark, healthy, degraded)
-        if not healthy:
-            status_txt = "隧道未就绪 · 已回退常规直连"
-        elif degraded:
-            status_txt = "隧道进程在跑, 但 ECHConfig 可能已失效"
-        else:
-            status_txt = f"隧道就绪 · 监听 127.0.0.1:{st.get('port')}"
-
+        if kind == "h3" and healthy:
+            # h3 用青色与 ECH 的绿/琥珀/红体系区分开 (徽章同款色)
+            dot, text_c = ("#2DD4BF" if is_dark else "#0F766E"), ("#99F6E4" if is_dark else "#0F766E")
         row = QHBoxLayout()
         row.setSpacing(8)
         dot_lbl = QLabel()
@@ -3478,6 +3554,7 @@ class MainWindow(QMainWindow):
         dot_lbl.setStyleSheet(f"background-color: {dot}; border-radius: 4px;")
         row.addWidget(dot_lbl)
         lbl_status = QLabel(status_txt)
+        lbl_status.setWordWrap(True)
         lbl_status.setStyleSheet(
             f"font-family: monospace; font-size: 12px; font-weight: bold; color: {text_c};")
         row.addWidget(lbl_status)
@@ -3493,17 +3570,14 @@ class MainWindow(QMainWindow):
             lbl_cfg.setStyleSheet(f"color: {text_c}; font-size: 11px;")
             card_l.addWidget(lbl_cfg)
 
-        # 列出共用这条隧道的服务 (仅名字 —— 状态是共用的, 逐服务重复没有信息量)
+        # 列出共用这条通道的服务 (仅名字 —— 状态是共用的, 逐服务重复没有信息量)
         names = "、".join(n for _, n in entries)
         lbl_who = QLabel(f"共用服务: {names}")
         lbl_who.setProperty("class", "ItemDesc")
         lbl_who.setWordWrap(True)
         card_l.addWidget(lbl_who)
 
-        lbl_note = QLabel(
-            "加密 SNI 直连 Cloudflare（ECH），不依赖候选节点探测 —— "
-            "因此这些服务在测速列表里不显示节点延迟，可用性只取决于上面这条隧道。"
-        )
+        lbl_note = QLabel(note_txt)
         lbl_note.setWordWrap(True)
         note_c = "#75879E" if is_dark else "#64748B"
         lbl_note.setStyleSheet(f"font-size: 11px; color: {note_c};")
@@ -3538,6 +3612,10 @@ class MainWindow(QMainWindow):
         # ECH 服务收集起来**最后只画一张共用卡** (见 _render_ech_shared_card):
         # 它们共用同一条隧道/端口/ECHConfig, 逐服务画卡会把同一段状态重复 N 遍。
         _ech_entries = []
+        # h3 通道类服务同理 —— 它们与 ECH 共用同一张"通道状态卡"的呈现方式 (用户要求),
+        # 但**分开收集**: 两条通道是不同的东西 (不同端口、不同健康判据、不同失败后果),
+        # 混在一张卡里会说不清"到底是哪条通道不可用"。
+        _h3_entries = []
 
         # 遍历全量服务列表，确保即使未单独测速的服务也展示测速目标
         for srv in SERVICES_LIST:
@@ -3549,11 +3627,16 @@ class MainWindow(QMainWindow):
             # Cloudflare 拒绝, 明文 SNI 会被按关键字阻断, 因此节点必然全部
             # "不可用"。按常规渲染会满屏"超时", 与服务实际可用的事实相反。
             # 这里只登记徽章与条目, 卡片在循环后统一画一张 (2026-10-04 合并)。
-            if is_ech_service(sid):
+            # ★ 2026-10-04: h3 通道类服务**一并走这张共用卡** —— 它们的上游同样是本机通道
+            #   (127.0.0.1:44411), 与候选节点无关, 逐服务画卡会把同一段通道状态重复 N 遍,
+            #   且会把"候选 IP 延迟"这个不存在的维度画出来。用户要求"上游腿改成类似 ECH
+            #   的特殊显示", 把它并入共用卡正是这个要求的实现。
+            if is_ech_service(sid) or is_h3_service(sid):
                 has_any_available = True
                 self._set_badge(sid, 0)
-                new_cached_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
-                _ech_entries.append((sid, name))
+                new_cached_lats[sid] = {"latency": 0, "via_proxy": False,
+                                        "h3" if is_h3_service(sid) else "ech": True}
+                (_h3_entries if is_h3_service(sid) else _ech_entries).append((sid, name))
                 continue
 
             if not ip_list:
@@ -3585,12 +3668,24 @@ class MainWindow(QMainWindow):
             card_l.setSpacing(10)
 
             card_top = QHBoxLayout()
-            # ★ 无候选池 / 上游是本机腿的服务: 标题不说"共 N 个候选 IP" —— 那会让人以为
+            # ★ 不按候选 IP 出网的服务: 标题**不许**说"共 N 个候选 IP" —— 那会让人以为
             #   下面那串"超时"是节点坏了 (实测: googlevideo 候选池为空; ECH 类候选在
-            #   普通握手下一律 RST)。如实说"上游为本机代理端口"。
+            #   普通握手下一律 RST)。
+            # ⚠ 2026-10-04 修判据: 原先写的是 `if _why_card and not ip_list`, 那个
+            #   `not ip_list` 是**多余且有害**的 —— 缓存里的"待测速"占位项会让 ip_list
+            #   非空, 于是这类服务照样显示"共 N 个候选 IP"。实测反馈正是这个:
+            #   civitai_web 的卡片写着"有节点", 而它其实走本机 h3 腿、**根本没有候选 IP
+            #   可测** (按钮已按 _why_card 置灰, 标题却与按钮自相矛盾)。
+            #   判据应当只看"这个服务是否按候选 IP 出网", 与当前有没有拿到列表无关。
             _why_card = single_test_unsupported_reason(sid)
-            if _why_card and not ip_list:
-                lbl_title = QLabel(f"{name} (上游为本机代理端口, 无候选 IP)")
+            if _why_card:
+                if getattr(PROFILES_BY_ID.get(sid), "h3_upstream", False):
+                    _up_txt = "经本机 HTTP/3 直连, 不使用候选节点"
+                elif getattr(PROFILES_BY_ID.get(sid), "ech_enabled", False):
+                    _up_txt = "经本机加密直连 (ECH), 不使用候选节点"
+                else:
+                    _up_txt = "经本机代理端口出网, 无候选 IP"
+                lbl_title = QLabel(f"{name} ({_up_txt})")
             else:
                 lbl_title = QLabel(f"{name} (共 {len(ip_list)} 个候选 IP)")
             lbl_title.setProperty("class", "CategoryTitle")
@@ -3662,11 +3757,22 @@ class MainWindow(QMainWindow):
             card_l.addLayout(grid)
             self.cdn_results_layout.addWidget(card)
 
-        # ★ ECH 共用卡放在**最后追加**, 但用 `insertWidget(0, ...)` 顶到列表最前面 ——
-        #   它是所有 ECH 画像共用的统一入口, 悬在那一堆每服务卡片中间会让人以为
+        # ★ 通道共用卡放在**最后追加**, 但用 `insertWidget(0, ...)` 顶到列表最前面 ——
+        #   它们是所有走该通道的画像共用的, 悬在那一堆每服务卡片中间会让人以为
         #   "它也只是其中之一"。放在开头也顺带回答了"为什么这些服务没有节点延迟"。
+        #
+        # ⚠ 顺序是刻意的: **先插 h3 卡, 再插 ECH 卡**, 于是最终顺序是
+        #   [h3 卡, ECH 卡, 各服务卡...] —— 两次 insertWidget(0) 会让后插的排更前,
+        #   所以这里"先 h3 后 ECH"得到的正是"h3 在前"。改成反过来会静默调换两者位置。
+        if _h3_entries:
+            self._render_channel_shared_card(_h3_entries, kind="h3")
+            _n = self.cdn_results_layout.count()
+            if _n > 1:
+                _item = self.cdn_results_layout.takeAt(_n - 1)
+                if _item and _item.widget():
+                    self.cdn_results_layout.insertWidget(0, _item.widget())
         if _ech_entries:
-            self._render_ech_shared_card(_ech_entries)
+            self._render_channel_shared_card(_ech_entries, kind="ech")
             _n = self.cdn_results_layout.count()
             if _n > 1:
                 _item = self.cdn_results_layout.takeAt(_n - 1)
@@ -6258,7 +6364,7 @@ class MainWindow(QMainWindow):
         h3_services = [p for p in PROFILES
                        if getattr(p, "h3_upstream", False) and p.id in _enabled]
         if not h3_services:
-            return True, "无已启用的服务使用 HTTP/3 上游腿"
+            return True, "无已启用的服务使用 HTTP/3 直连通道"
         ok, msg = h3_proxy.start()
         # 节点成绩单的健康提示 (离线读取, 不阻塞): 与启用边界的软告警同一口径,
         # 在启动收尾处再提示一次 —— 用户往往是在"已经开始加速"之后才发现视频卡。
