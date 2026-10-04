@@ -391,6 +391,80 @@ class EnvDiagnosticsWorker(QThread):
         self.ready.emit(diag)
 
 
+class ECHReadyWorker(QThread):
+    """强制重启 ECH 隧道以重新自举 ECHConfig (「让 ECH 就绪」按钮的后台实现)
+
+    为什么必须放后台: 重启要停进程 + 重新监听 (实测秒级), 在按钮回调里同步做会卡住 UI。
+    为什么用"重启"而不是"等它自己刷新": 隧道每 `-ech-refresh`(默认 30 分钟) 才刷新一次,
+    而 ECHConfig 一旦过期, 所有 ECH 画像都会逐请求失败 —— 让用户干等 30 分钟不可接受;
+    重启会走 Go 侧 `ECHConfigManager` 启动时的自举路径 (`refreshNow`), 立刻重新拉取。
+    为什么不能只调 `start()`: 参数(白名单/池)未变化时它**故意复用**已在跑的进程
+    (见 EchTunnelManager._domains_unchanged), 那样配置根本不会重新自举 —— 必须强制重启。
+    """
+
+    finished = Signal(dict)
+
+    def __init__(self, domains, ip_pool=None, host_ip_pool=None):
+        super().__init__()
+        self._domains = list(domains or [])
+        self._ip_pool = list(ip_pool or [])
+        self._host_ip_pool = dict(host_ip_pool or {})
+
+    def run(self):
+        out = {"ok": False, "msg": "", "fresh": False, "note": "",
+               "needed": bool(self._domains), "restarted": False}
+        try:
+            if not self._domains:
+                out["msg"] = "没有启用任何 ECH 服务，无需就绪"
+                out["ok"] = True
+                self.finished.emit(out)
+                return
+
+            # ★ 已经是"进程在 + 配置新鲜"就直接复用 —— 这条路径会被**全量测速/启动流程**
+            #   调用, 若无条件 restart, 用户每点一次测速都会把隧道重启一遍, 反而把在跑的
+            #   连接打断。只有"没在跑"或"配置可疑"这两个真问题才动手。
+            if ech_tunnel.is_functionally_healthy():
+                out["ok"] = True
+                out["fresh"] = True
+                out["msg"] = "ECH 隧道已就绪 (复用现有进程)"
+                self.finished.emit(out)
+                return
+
+            out["restarted"] = True
+            ok, msg = ech_tunnel.restart(self._domains, self._ip_pool, self._host_ip_pool)
+            out["msg"] = msg
+            out["ok"] = bool(ok)
+            # 重启后**以判断新鲜度的同一份逻辑**复核, 不靠"启动返回 True"就宣称就绪:
+            # 启动成功只说明进程在听, 而 ECHConfig 可能是内置兜底 (那才是真正要修的态)。
+            f = ech_tunnel.config_freshness()
+            out["fresh"] = not bool(f.get("using_builtin_guess", True))
+            out["note"] = f.get("note", "")
+        except Exception as e:
+            out["msg"] = f"ECH 就绪失败: {e}"
+        self.finished.emit(out)
+
+
+class NginxStatusWorker(QThread):
+    """每秒取一次 nginx `stub_status` 快照 (放后台, 避免任何情况下卡住 UI)
+
+    为什么不能直接在定时器回调里同步取: 那是一次真实 HTTP 请求, 正常时 <5ms, 但
+    nginx 卡死/半死时最长要等到 timeout —— 在 UI 线程里等 2 秒就是一次卡顿。
+    本项目对"阻塞 UI"一贯放后台 (见 CDNTestWorker/StatusProbeWorker 等)。
+    """
+
+    sampled = Signal(dict)
+
+    def __init__(self, nginx_mgr):
+        super().__init__()
+        self._mgr = nginx_mgr
+
+    def run(self):
+        try:
+            self.sampled.emit(self._mgr.fetch_status() or {})
+        except Exception:
+            self.sampled.emit({})
+
+
 class CDNTestWorker(QThread):
     finished = Signal(dict)
 
@@ -1670,7 +1744,12 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.btn_toggle_all_collapse)
         layout.addLayout(header_row)
 
-        # 1. 实时网络流量监控波形图 (带独立收拢折叠控制)
+        # 1. nginx 状态面板 (曲线 + 快照数字; 带独立收拢折叠控制)
+        #
+        # ⚠ 2026-10-04 换口径: 原为"实时网络流量监控"(↓/↑ KB/s), 但那个数据源从来没接上,
+        #   每秒被灌 0.0 —— 恒零的图会让人以为"没流量", 而实际可能在满速下载, 本身就是误导。
+        #   现改为 nginx `stub_status` (连接数/请求数): 零磁盘开销、无字节、不碰凭据。
+        #   详见 md_widgets.NginxStatusChart 与 nginx_manager.fetch_status 的注释。
         is_dark = ThemeManager.get_instance().is_dark
         primary_c = "#7EB9F5" if is_dark else "#0284C7"
         chart_card = QFrame()
@@ -1686,7 +1765,8 @@ class MainWindow(QMainWindow):
             lbl_chart_icon.setPixmap(SvgIconFactory.get_pixmap("activity", primary_c, 18))
         chart_head.addWidget(lbl_chart_icon)
 
-        lbl_chart_title = QLabel("实时网络流量监控")
+        # 标题如实说明**口径**: 这是"加速服务此刻在不在干活", 不是带宽统计
+        lbl_chart_title = QLabel("nginx 状态（活跃连接与请求）")
         lbl_chart_title.setProperty("class", "CategoryTitle")
         chart_head.addWidget(lbl_chart_title)
         chart_head.addStretch()
@@ -3068,6 +3148,23 @@ class MainWindow(QMainWindow):
         self.btn_apply_cdn.clicked.connect(self.apply_optimal_cdn)
         header.addWidget(self.btn_apply_cdn)
 
+        # ★ ECH 就绪按钮 (2026-10-04): ECH 是**所有 ECH 画像共用的统一入口** (同一条隧道、
+        #   同一个端口、同一份 ECHConfig), 所以它的就绪是一个**全局**动作 —— 放在本页
+        #   (CDN 测速与动态 Upstream 优选) 这个统一入口处, 而不是每个服务卡片里各放一个。
+        #   为什么需要它: `is_healthy()` 只是"进程在 + 端口在听", 而隧道**一启动端口就在听**,
+        #   哪怕 ECHConfig 仍是 2026-09-23 的内置兜底 (Go 侧全线失败时继续沿用旧配置)。
+        #   那种状态下所有 ECH 画像都会逐请求失败, 用户却看到"隧道在跑" —— 本按钮用于
+        #   一键强制重启以重新自举配置, 并按**与状态判定同一份逻辑**复核结果。
+        self.btn_ech_ready = QPushButton("让 ECH 就绪")
+        self.btn_ech_ready.setProperty("class", "MDBtnTonal")
+        self.btn_ech_ready.setCursor(Qt.PointingHandCursor)
+        self.btn_ech_ready.setToolTip(
+            "强制重启 ECH 隧道以重新获取 ECHConfig。\n"
+            "适用情形: 界面显示「ECH 隧道在跑 · 配置可疑」时 —— 那表示隧道进程正常，\n"
+            "但它可能仍在用内置兜底配置，导致所有走 ECH 的服务请求失败。")
+        self.btn_ech_ready.clicked.connect(self.make_ech_ready)
+        header.addWidget(self.btn_ech_ready)
+
         layout.addLayout(header)
 
         # 测速状态概览横幅
@@ -3160,6 +3257,73 @@ class MainWindow(QMainWindow):
         self.cached_cdn_results = results
         return results
 
+    def make_ech_ready(self, quiet: bool = False):
+        """「让 ECH 就绪」: 确认 ECH 隧道可用; 必要时强制重启以重新自举 ECHConfig
+
+        ECH 是所有 ECH 画像的统一入口 (同一条隧道/端口/配置), 因此这是一个全局动作。
+        它与「开始全量测速」的分工: 测速选的是**候选节点**, 而 ECH 画像的可用性根本不取
+        决于候选节点 (上游是本地隧道端口), 只取决于隧道与它的 ECHConfig —— 所以 ECH
+        出问题时按"重新测速"是无效动作, 必须有这个单独的入口。
+
+        `quiet=True`: 供**全量测速/启动流程**自动调用 —— 那里只需保证 ECH 不是坏着跑,
+        不该为一次成功复用弹提示 (否则每点一次测速都弹一次)。
+        """
+        if getattr(self, "ech_ready_worker", None) and self.ech_ready_worker.isRunning():
+            if not quiet:
+                show_toast(self, "正在让 ECH 就绪，请稍候...", toast_type="info", duration=1500)
+            return
+
+        from service_profile import PROFILES
+
+        # 与启动路径**同一份聚合逻辑** (含受控分组闸门), 避免两处判据漂移
+        domains, ip_pool, host_ip_pool = build_ech_targets(
+            PROFILES, allow_fn=lambda p: gated_group_enabled(p.group))
+        if not domains:
+            if not quiet:
+                show_toast(self, "没有启用任何 ECH 服务，无需就绪",
+                           toast_type="info", duration=2000)
+            return
+
+        self._ech_ready_quiet = bool(quiet)
+        self.btn_ech_ready.setEnabled(False)
+        self.btn_ech_ready.setText("正在就绪...")
+        self.ech_ready_worker = ECHReadyWorker(domains, ip_pool, host_ip_pool)
+        self.ech_ready_worker.finished.connect(self._on_ech_ready_finished)
+        self.ech_ready_worker.start()
+
+    def _on_ech_ready_finished(self, res: Dict):
+        quiet = bool(getattr(self, "_ech_ready_quiet", False))
+        self._ech_ready_quiet = False
+        self.btn_ech_ready.setEnabled(True)
+        self.btn_ech_ready.setText("让 ECH 就绪")
+        ok = bool(res.get("ok"))
+        fresh = bool(res.get("fresh"))
+        note = res.get("note") or ""
+        restarted = bool(res.get("restarted"))
+        if not ok:
+            show_toast(self, f"ECH 就绪失败: {res.get('msg') or '未知原因'}",
+                       toast_type="warning", duration=5000)
+        elif fresh and not restarted:
+            # 复用了已就绪的隧道: 自动路径下保持安静 (没出问题就不打扰)
+            if not quiet:
+                show_toast(self, "ECH 已就绪（复用现有隧道）",
+                           toast_type="success", duration=2500)
+        elif fresh:
+            show_toast(self, "ECH 已就绪（ECHConfig 已重新刷新）",
+                       toast_type="success", duration=3000)
+        else:
+            # 进程起来了但配置仍可疑 —— 如实说, 不谎报就绪 (本项目红线)。
+            # 这一条**即使是自动路径也要提示** —— 它意味着走 ECH 的服务接下来会全挂。
+            show_toast(self, f"ECH 隧道已重启，但配置仍可疑：{note}",
+                       toast_type="warning", duration=6000)
+        # 刷新界面上的隧道状态。`render_cdn_results` 内部就会重设各服务徽章
+        # (`_set_badge`), 而 ECH 徽章与 ECH 卡片都读 config_freshness ⇒ 调它即可,
+        # 不需要 (也不存在) 单独的 refresh_cdn_badges。
+        try:
+            self.render_cdn_results(self.cached_cdn_results or {})
+        except Exception as e:
+            print(f"[ECHR] 就绪后刷新界面失败: {e}")
+
     def start_cdn_ping(self):
         if self.cdn_worker and self.cdn_worker.isRunning():
             show_toast(self, "测速正在进行中，请稍候...", toast_type="info", duration=1500)
@@ -3191,6 +3355,13 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, lambda: self._probe_internet_async(load_config().get(
             "network_probe_target", "www.baidu.com")))
+
+        # ★ 统一入口 (2026-10-04): 全量测速**不覆盖 ECH 画像的可用性** —— 它们的上游是本地
+        #   隧道端口, 明文探测必然失败 (空 SNI 被 CF 拒 / 明文 SNI 被阻断), 所以测速结果里
+        #   ECH 服务只呈现隧道状态。既然如此, 就必须在这里顺手确认隧道**真的可用**:
+        #   隧道进程在跑但 ECHConfig 已退回内置兜底时, 那些服务会全挂, 而测速结果看不出
+        #   区别 (它本来就不测 ECH 路径)。quiet=True: 复用成功不弹提示, 只有"仍可疑"才提示。
+        self.make_ech_ready(quiet=True)
 
     def _probe_internet_async(self, probe_target: str):
         """后台探活 (不阻塞 UI), 仅在不可达时给一条提示"""
@@ -3242,11 +3413,15 @@ class MainWindow(QMainWindow):
         else:
             self.service_badges[sid].set_latency(latency, is_star=is_star, via_proxy=via_proxy)
 
-    def _render_ech_service_card(self, sid: str, name: str):
-        """渲染 ECH 隧道服务的状态卡片
+    def _render_ech_shared_card(self, entries):
+        """渲染**一张共用**的 ECH 隧道状态卡 (2026-10-04 由"每个 ECH 服务一张"合并而来)
 
-        ECH 服务的上游是本地隧道端口, 与候选节点延迟不是同一维度; 逐个 IP
-        展示"超时"既无信息量又误导。这里改为呈现隧道本身的状态。
+        为什么合并: ECH 是所有 ECH 画像共用的**同一条隧道、同一个端口、同一份 ECHConfig**,
+        所以原先每服务一张卡片会把**完全相同**的一段隧道状态重复 N 遍 (实测 13 个 ECH
+        画像就是 13 份), 既占屏又掩盖了"这其实是一个全局组件"这个事实 —— 用户会以为
+        每个服务各自有一条隧道, 于是隧道出问题时不知道该修哪里。
+
+        `entries`: [(sid, name), ...] —— 只用来列名与各自候选池大小。
         """
         from ech_tunnel import ech_tunnel
 
@@ -3254,14 +3429,13 @@ class MainWindow(QMainWindow):
         st = ech_tunnel.status()
         healthy = st["healthy"]
         # 三态 (缺陷 W2, 2026-10-04): "进程/端口都在"不等于"能工作"。
-        # 已识别但未接线的那个状态就在这里接上 —— config_freshness() 早就写好了。
         functional = bool(st.get("functionally_healthy"))
         degraded = healthy and not functional
         cfg_note = (st.get("ech_config") or {}).get("note") or ""
 
         card = QFrame()
         card.setProperty("class", "MDCard")
-        self.cdn_card_widgets[sid] = card
+        # 共用卡不对应单个 sid, 故不写进 cdn_card_widgets (那是"每服务"的索引)
         card_l = QVBoxLayout(card)
         card_l.setContentsMargins(16, 14, 16, 14)
         card_l.setSpacing(10)
@@ -3275,34 +3449,27 @@ class MainWindow(QMainWindow):
             suffix = "ECH 隧道在跑 · 配置可疑"
         else:
             suffix = "经 ECH 隧道直连"
-        lbl_title = QLabel(f"{name} ({suffix})")
+        lbl_title = QLabel(f"ECH 隧道（{len(entries)} 个服务共用）· {suffix}")
         lbl_title.setProperty("class", "CategoryTitle")
         lbl_title.setWordWrap(True)
         card_top.addWidget(lbl_title)
         card_top.addStretch()
 
-        # 独立测速对 ECH 服务无意义: 探测发的是普通握手, 必然失败。
-        # 保留按钮位避免布局错位, 但禁用并说明原因。
-        btn_single = QPushButton("独立测速")
-        btn_single.setProperty("class", "MDBtnTiny")
-        btn_single.setEnabled(False)
-        btn_single.setToolTip("该服务走 ECH 隧道, 探测层无法复现其链路, 无需单独测速")
-        self.cdn_single_buttons[sid] = btn_single
-        card_top.addWidget(btn_single)
+        # 就绪按钮就地再放一个: 用户看到"配置可疑"时, 修它的动作就在同一条卡上
+        btn_fix = QPushButton("让 ECH 就绪")
+        btn_fix.setProperty("class", "MDBtnTonal")
+        btn_fix.setCursor(Qt.PointingHandCursor)
+        btn_fix.clicked.connect(self.make_ech_ready)
+        card_top.addWidget(btn_fix)
         card_l.addLayout(card_top)
 
-        # 状态行: 隧道健康度 (三态)
-        if healthy and not degraded:
-            dot, text_c = ("#10B981" if is_dark else "#059669"), ("#34D399" if is_dark else "#059669")
-            status_txt = f"隧道运行中 · 127.0.0.1:{st['port']}"
+        dot, text_c = self._ech_status_colors(is_dark, healthy, degraded)
+        if not healthy:
+            status_txt = "隧道未就绪 · 已回退常规直连"
         elif degraded:
-            # 进程与端口都在, 但 ECHConfig 疑似仍在吃内置兜底 ⇒ 请求大概率失败。
-            # 用琥珀色并说明原因, 而不是让用户看到一条绿色的"运行中"。
-            dot, text_c = ("#F59E0B" if is_dark else "#B45309"), ("#FCD34D" if is_dark else "#B45309")
             status_txt = "隧道进程在跑, 但 ECHConfig 可能已失效"
         else:
-            dot, text_c = ("#EF4444" if is_dark else "#DC2626"), ("#F87171" if is_dark else "#DC2626")
-            status_txt = "隧道未就绪 · 已回退常规直连"
+            status_txt = f"隧道就绪 · 监听 127.0.0.1:{st.get('port')}"
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -3311,14 +3478,14 @@ class MainWindow(QMainWindow):
         dot_lbl.setStyleSheet(f"background-color: {dot}; border-radius: 4px;")
         row.addWidget(dot_lbl)
         lbl_status = QLabel(status_txt)
-        lbl_status.setStyleSheet(f"font-family: monospace; font-size: 12px; font-weight: bold; color: {text_c};")
+        lbl_status.setStyleSheet(
+            f"font-family: monospace; font-size: 12px; font-weight: bold; color: {text_c};")
         row.addWidget(lbl_status)
         row.addStretch()
         card_l.addLayout(row)
 
         # 可疑态的成因行: 把 config_freshness() 的结论如实呈现 —— 只说"可疑"而不说
-        # 为什么可疑, 用户唯一能做的就是重启一个其实在跑的进程。这里的 note 直接
-        # 告诉他是"自启动以来未见成功刷新"(即 DoH 拿不到配置、在用 2026-09-23 的内置兜底)。
+        # 为什么可疑, 用户唯一能做的就是重启一个其实在跑的进程。
         if degraded and cfg_note:
             lbl_cfg = QLabel(f"↳ {cfg_note}")
             lbl_cfg.setProperty("class", "ItemDesc")
@@ -3326,11 +3493,16 @@ class MainWindow(QMainWindow):
             lbl_cfg.setStyleSheet(f"color: {text_c}; font-size: 11px;")
             card_l.addWidget(lbl_cfg)
 
-        # 说明行: 解释为何不列节点延迟
-        cand_n = len(CANDIDATE_IPS.get(sid, []))
+        # 列出共用这条隧道的服务 (仅名字 —— 状态是共用的, 逐服务重复没有信息量)
+        names = "、".join(n for _, n in entries)
+        lbl_who = QLabel(f"共用服务: {names}")
+        lbl_who.setProperty("class", "ItemDesc")
+        lbl_who.setWordWrap(True)
+        card_l.addWidget(lbl_who)
+
         lbl_note = QLabel(
-            f"加密 SNI 直连 Cloudflare, 不依赖候选节点探测"
-            f"（候选 IP 池 {cand_n} 个, 由隧道内部解析使用）"
+            "加密 SNI 直连 Cloudflare（ECH），不依赖候选节点探测 —— "
+            "因此这些服务在测速列表里不显示节点延迟，可用性只取决于上面这条隧道。"
         )
         lbl_note.setWordWrap(True)
         note_c = "#75879E" if is_dark else "#64748B"
@@ -3338,6 +3510,18 @@ class MainWindow(QMainWindow):
         card_l.addWidget(lbl_note)
 
         self.cdn_results_layout.addWidget(card)
+
+    @staticmethod
+    def _ech_status_colors(is_dark: bool, healthy: bool, degraded: bool):
+        """ECH 三态配色 (共用卡与旧单卡共用一份, 避免两处色值漂移)"""
+        if healthy and not degraded:
+            return ("#10B981" if is_dark else "#059669"), \
+                   ("#34D399" if is_dark else "#059669")
+        if healthy and degraded:
+            return ("#F59E0B" if is_dark else "#B45309"), \
+                   ("#FCD34D" if is_dark else "#B45309")
+        return ("#EF4444" if is_dark else "#DC2626"), \
+               ("#F87171" if is_dark else "#DC2626")
 
     def render_cdn_results(self, results: Dict):
         """根据当前主题渲染涵盖全量测速目标与候选 IP 节点的列表"""
@@ -3351,6 +3535,9 @@ class MainWindow(QMainWindow):
         star_color = "#FBBF24" if is_dark else "#D97706"
         new_cached_lats = {}
         has_any_available = False
+        # ECH 服务收集起来**最后只画一张共用卡** (见 _render_ech_shared_card):
+        # 它们共用同一条隧道/端口/ECHConfig, 逐服务画卡会把同一段状态重复 N 遍。
+        _ech_entries = []
 
         # 遍历全量服务列表，确保即使未单独测速的服务也展示测速目标
         for srv in SERVICES_LIST:
@@ -3361,12 +3548,12 @@ class MainWindow(QMainWindow):
             # ECH 服务: 探测发的是普通握手, 复现不了 ECH 路径 —— 空 SNI 会被
             # Cloudflare 拒绝, 明文 SNI 会被按关键字阻断, 因此节点必然全部
             # "不可用"。按常规渲染会满屏"超时", 与服务实际可用的事实相反。
-            # 这里改呈现隧道状态。
+            # 这里只登记徽章与条目, 卡片在循环后统一画一张 (2026-10-04 合并)。
             if is_ech_service(sid):
                 has_any_available = True
                 self._set_badge(sid, 0)
                 new_cached_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
-                self._render_ech_service_card(sid, name)
+                _ech_entries.append((sid, name))
                 continue
 
             if not ip_list:
@@ -3416,7 +3603,7 @@ class MainWindow(QMainWindow):
             btn_single.setProperty("class", "MDBtnTiny")
             if _why_card:
                 # 不可测: 保留按钮位避免布局错位, 但禁用并说明原因
-                # (与 _render_ech_service_card 同一形态 —— 那里早已这么做)
+                # (与 ECH 共用卡同一形态 —— "保留位置 + 禁用 + 说明原因", 不静默隐藏)
                 btn_single.setEnabled(False)
                 btn_single.setToolTip(_why_card)
             else:
@@ -3474,6 +3661,17 @@ class MainWindow(QMainWindow):
 
             card_l.addLayout(grid)
             self.cdn_results_layout.addWidget(card)
+
+        # ★ ECH 共用卡放在**最后追加**, 但用 `insertWidget(0, ...)` 顶到列表最前面 ——
+        #   它是所有 ECH 画像共用的统一入口, 悬在那一堆每服务卡片中间会让人以为
+        #   "它也只是其中之一"。放在开头也顺带回答了"为什么这些服务没有节点延迟"。
+        if _ech_entries:
+            self._render_ech_shared_card(_ech_entries)
+            _n = self.cdn_results_layout.count()
+            if _n > 1:
+                _item = self.cdn_results_layout.takeAt(_n - 1)
+                if _item and _item.widget():
+                    self.cdn_results_layout.insertWidget(0, _item.widget())
 
         if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
             self.btn_apply_cdn.setEnabled(has_any_available)
@@ -5387,7 +5585,9 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self._start_status_probe)
         self.status_timer.start(2500)
 
-        # 实时流量监控模拟采样 (每秒一次)
+        # nginx 状态采样 (每秒一次) —— 数据源是 nginx 的 stub_status 端点
+        # (2026-10-04 由"模拟采样"改为真实采集; 端点见 nginx.conf 的
+        #  `listen 127.0.0.1:44421` 与 nginx_manager.NGINX_STATUS_PORT)
         self.traffic_timer = QTimer(self)
         self.traffic_timer.timeout.connect(self.update_traffic_metrics)
         self.traffic_timer.start(1000)
@@ -5398,9 +5598,43 @@ class MainWindow(QMainWindow):
         self.watchdog_timer.start(8000)
 
     def update_traffic_metrics(self):
-        # 遵循项目不静默假可用原则: 严禁伪造 random 随机流量数据
-        # 未接入真实网卡抓包/Nginx 内部统计前保持平直基线，如实呈现就绪待命状态
-        self.traffic_chart.add_sample(0.0, 0.0, 0, 0)
+        """每秒采集一次 nginx 状态并刷新面板 (后台线程取数, 不阻塞 UI)
+
+        ⚠ 2026-10-04 换口径前的旧实现是 `add_sample(0.0, 0.0, 0, 0)` —— 每秒灌零,
+        于是那张"实时网络流量监控"永远是一条平线。现在采集的是 nginx `stub_status`
+        的真实计数; 取不到时**不画成 0**, 而是让面板显示"状态不可用"
+        (二者语义不同: "nginx 没在跑" ≠ "nginx 正常但此刻没有连接")。
+        """
+        if getattr(self, "_nginx_status_worker", None) and self._nginx_status_worker.isRunning():
+            return  # 上一次还没回来就跳过这一次 (不排队堆积)
+        try:
+            self._nginx_status_worker = NginxStatusWorker(nginx_mgr)
+            self._nginx_status_worker.sampled.connect(self._on_nginx_status_sampled)
+            self._nginx_status_worker.start()
+        except Exception:
+            pass
+
+    def _on_nginx_status_sampled(self, metrics: Dict):
+        """把一次快照喂给面板, 并附上由两次采样差算出的请求速率"""
+        chart = getattr(self, "traffic_chart", None)
+        if chart is None:
+            return
+        try:
+            if metrics:
+                now = time.time()
+                total = int(metrics.get("requests", 0) or 0)
+                prev = getattr(self, "_nginx_status_prev", None)
+                if prev:
+                    dt = now - prev[0]
+                    if dt > 0.2:
+                        # 计数器理论上单调增; 若 nginx 重启会归零 ⇒ 取 max(0, ...) 避免负数
+                        metrics["requests_per_sec"] = max(0.0, (total - prev[1]) / dt)
+                self._nginx_status_prev = (now, total)
+            # 灯 (标题栏四合一里的 nginx 状态) 已由 StatusProbeWorker 负责, 这里不重复改,
+            # 避免两个来源对同一指示灯给出不一致结论。
+            chart.set_metrics(metrics)
+        except Exception as e:
+            print(f"[NginxStatus] 刷新失败: {e}")
 
     def _start_status_probe(self):
         if self._status_worker and self._status_worker.isRunning():
@@ -5797,6 +6031,22 @@ class MainWindow(QMainWindow):
             # 是否让 ech_enabled 服务走隧道, 隧道未起会退回常规分支
             ech_ok, ech_msg = self._start_ech_tunnel()
             result["ech_ok"], result["ech_msg"] = ech_ok, ech_msg
+
+            # ★ 统一入口 (2026-10-04): `_start_ech_tunnel()` 成功**只说明进程在听**, 而
+            #   ECHConfig 可能仍是内置兜底 (Go 侧全线失败时继续沿用旧配置) —— 那种状态下
+            #   所有 ECH 画像会逐请求失败, 而启动流程却报"ECH 已就绪"。这里补一次功能性复核,
+            #   结果只用于**如实提示**, 不阻断启动 (隧道不可用时 nginx 会回退常规分支,
+            #   ECH 服务本身就是"有则更好"的通道)。
+            if ech_ok:
+                try:
+                    _f = ech_tunnel.config_freshness()
+                    if bool(_f.get("using_builtin_guess", False)):
+                        result["ech_stale"] = True
+                        result["ech_stale_note"] = _f.get("note", "")
+                        print(f"[启动] ECH 隧道进程在跑, 但 ECHConfig 可疑: "
+                              f"{_f.get('note', '')}")
+                except Exception:
+                    pass
 
             # h3 上游腿同样必须先于 nginx 就绪: 它的 upstream (127.0.0.1:44411) 会被写进
             # upstream-dynamic.conf, 代理没起时到达该 server 块的请求一律 502

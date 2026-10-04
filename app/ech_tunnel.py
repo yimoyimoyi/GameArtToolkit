@@ -116,6 +116,9 @@ class EchTunnelManager:
     # (那份的来源日期是 2026-09-23, 见 echconfig.go:22-26)。
     LOG_MARK_UPDATED = "已更新 ECHConfig"
     LOG_MARK_DOH_ALL_FAILED = "全部 DoH 端点查询失败"
+    # 进程边界标记 (Go 侧 main.go:"[boot] ECH 隧道启动"). 新鲜度**必须**以最后一次
+    # 进程启动为水位线, 否则会把"上一个进程"的成功刷新算到当前进程头上 —— 见下面注释。
+    LOG_MARK_BOOT = "[boot]"
 
     def config_freshness(self, tail_lines: int = 500) -> Dict:
         """从隧道日志派生 ECHConfig 新鲜度 (只读; 日志缺失/不可读时如实返回 unknown)
@@ -124,9 +127,20 @@ class EchTunnelManager:
         而这个函数会被 UI 渲染与状态刷新反复调用。整读一个无限增长的日志, 代价
         会随运行时长线性上升 —— 属于"越跑越慢"的缺陷形态。按字节从尾部取一段
         再切行, 代价就有界了。
+
+        ★★ 2026-10-04 修**假健康**: 原先在整段尾部里找 `已更新 ECHConfig`, 于是
+        "**当前**进程启动时 DoH 全失败、只能吃内置兜底", 却因为**上一个**进程留下过
+        一条成功刷新 (实测同一份日志里有 39 次启动、45 次刷新) 而被判为"配置新鲜" ——
+        隧道明明在用 2026-09-23 的内置兜底逐请求失败, 界面却报健康。这正是本项目
+        反复吃亏的"真因被表象掩盖"。
+        现在先把日志**切到最后一个 `[boot]` 之后**, 只在**当前进程**的日志段内判定:
+          · 段内出现"已更新"            -> 新鲜 (using_builtin_guess=False)
+          · 段内只有"全部 DoH 失败"      -> 正在吃内置兜底 (True, 且报出 DoH 失败时间)
+          · 段内两者都没有              -> 尚不确定 (True + 明确说明, 宁可warning不谎报健康)
         """
         out: Dict = {"known": False, "last_update": None, "last_doh_failure": None,
-                     "using_builtin_guess": None, "note": ""}
+                     "using_builtin_guess": None, "run_started": None,
+                     "scoped_to_current_run": False, "note": ""}
         try:
             if not LOG_FILE.exists():
                 out["note"] = f"日志不存在: {LOG_FILE}"
@@ -149,7 +163,29 @@ class EchTunnelManager:
             return out
 
         stamp = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
-        for ln in lines:
+        # ── 切到最后一次进程启动之后 (水位线) ──────────────────────────────
+        boot_idx = -1
+        for i, ln in enumerate(lines):
+            if self.LOG_MARK_BOOT in ln:
+                boot_idx = i
+        # ⚠ 尾部窗口内**没有** [boot] 时有两种可能: ① 本进程启动得很早, 启动行已被
+        #   窗口挤出; ② 进程根本没起过。此时若直接把 boot_idx 当 0, 就会把窗口里
+        #   任何一条历史成功刷新当成本次 —— 正是要修的假健康。故保守：不裁剪,
+        #   但把结论降级为"不确定" (宁可告警, 不谎报健康)。
+        if boot_idx >= 0:
+            scoped = lines[boot_idx:]
+            out["scoped_to_current_run"] = True
+        else:
+            scoped = lines
+        if scoped and stamp.match(scoped[0]):
+            out["run_started"] = stamp.match(scoped[0]).group(1)
+        # 若启动行本身就是第一行, run_started 取它的时间戳更准
+        if boot_idx >= 0 and boot_idx < len(lines):
+            m0 = stamp.match(lines[boot_idx])
+            if m0:
+                out["run_started"] = m0.group(1)
+
+        for ln in scoped:
             if self.LOG_MARK_UPDATED in ln:
                 m = stamp.match(ln)
                 out["last_update"] = m.group(1) if m else "(有更新, 无时间戳)"
@@ -157,10 +193,21 @@ class EchTunnelManager:
                 m = stamp.match(ln)
                 out["last_doh_failure"] = m.group(1) if m else "(有失败, 无时间戳)"
         out["known"] = True
-        # 从未刷新成功 = 大概率还在用内置兜底
+
+        # ⚠ 关键: 窗口内**看不到进程启动标记**时, 绝不能按"段内有没有成功刷新"下结论 ——
+        #   那正是假健康的来源 (上一条成功刷新可能属于上一个已死的进程)。这里显式
+        #   **保守判不可信**, 并且**不采信** last_update (否则又会把它当成本次的新鲜证据)。
+        if not out["scoped_to_current_run"]:
+            out["using_builtin_guess"] = True
+            out["last_update"] = None
+            out["note"] = ("日志尾部窗口内未见进程启动标记, 无法确认配置是否属于本次运行"
+                           " —— 保守判为配置不可信 (可重启隧道以重新自举 ECHConfig)")
+            return out
+
+        # 本次进程内从未刷新成功 = 大概率还在用内置兜底
         out["using_builtin_guess"] = out["last_update"] is None
         if out["using_builtin_guess"]:
-            out["note"] = ("自启动以来未见成功刷新, 大概率仍在使用**内置兜底配置**"
+            out["note"] = ("本次启动以来未见成功刷新, 大概率仍在使用**内置兜底配置**"
                            + ("; 且出现过 DoH 全线失败" if out["last_doh_failure"] else ""))
         elif out["last_doh_failure"] and (out["last_update"] or "") < (out["last_doh_failure"] or ""):
             out["note"] = "最近一次 DoH 全线失败发生在最近一次成功刷新之后"

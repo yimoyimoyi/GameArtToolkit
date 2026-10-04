@@ -2158,7 +2158,11 @@ PROFILES: List[ServiceProfile] = [
         desc="DLsite 作品播放器 (AWS 源站忽略 SNI, 用无害 SNI 掩护绕过域名级阻断)",
         # ⚠ 与 dlsite 商店拆画像: 商店是 CF 托管走 ECH, 播放器是 AWS 源站走掩护 SNI。
         domains=["play.dlsite.com"],
-        icon="play",
+        # ⚠ 原为 icon="play" —— 该名字**不在 SVG_TEMPLATES 里**, 而 SvgIconFactory 对未知名字
+        #   是**静默返回一张全透明 QPixmap** ⇒ 界面渲染成空白图标且没有任何报错 (2026-10-04
+        #   由 tests/test_theme_and_layout.py::test_every_profile_icon_has_svg_template 抓到)。
+        #   改用已登记的 "video" (语义相符: 播放器)。
+        icon="video",
         mode=ServiceMode.L7_NGINX,
         upstream_name="upstream_dlsite_play",
         cdn_vendor="fastly",
