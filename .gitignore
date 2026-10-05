@@ -162,38 +162,24 @@ nginx/conf/*.bak_*
 tests/
 # 本地探测 / 审计 / 验证脚本 (历次实测的复现工具)
 scripts/probe_*.py
-# ★ 例外 (2026-10-04): 下面两个探测脚本**入库**。
-#   理由: 它们不是"一次性排障", 而是多条已归档结论的**判据载体** —— 文档写在被忽略的
-#   docs/ 里、测试写在被忽略的 tests/ 里, 若复现工具也不入库, 那么
-#   docs/googlevideo-node-availability.md §7 的每条结论对新克隆都**无法复现**。
-#   具体承载:
-#     · probe_gvs_nodes.py     — 同刻交错 A/B 的通用轴 (--ab-var addr_health|retries)
-#                                与腿参数注入 (--leg-first-byte/--leg-retries) ⇒ §7.7
-#     · probe_gvs_alt_paths.py — 替代通路 (端口 / 传输) 的判据 ⇒ §7.6.5
-!scripts/probe_gvs_nodes.py
-!scripts/probe_gvs_alt_paths.py
-# ★ 例外 (2026-10-04, 同一理由): "探测报不可用而实际可用" 的判据载体 ——
-#   diag_* 诊断、verify_* 端到端验证。它们承载的结论同样写在被忽略的 docs/ 里:
-#     · diag_probe_false_negatives.py — 生产判据 vs 原始状态码 (哪些被判可疑)
-#     · diag_tcp_vs_quic.py           — 同 IP 只换传输 (TCP 挂 / QUIC 通)
-#     · diag_direct_vs_proxy.py       — 直连 vs 经代理 (区分"服务不可用"与"本机路径不通")
-#     · verify_image_fetch_via_proxy.py / verify_gallery_images_via_proxy.py
-#                                     — 经服务后**图片能否真正取到** (不是只看状态码)
-#     · verify_xbox_github_paths.py   — xbox / GitHub 家族的直连 vs 代理可达性
-#     · audit_pool_availability.py    — **全量候选池**剥离项目的可用性审计
-#       (为什么它最该入库: 池子会漂 —— 本轮实测抓到两处过期结论:
-#        注释说 109.202.100.218 "已失效" ⇒ 实测 3/3 可用; 而最快的 77.247.178.1
-#        一直在 DoH 答案里却从未登记。没有这个审计器, 这类漂移无人发现。)
-!scripts/diag_probe_false_negatives.py
-!scripts/diag_tcp_vs_quic.py
-!scripts/diag_direct_vs_proxy.py
+# ★ 2026-10-05 变更 (用户要求): 上面这些探测/诊断脚本**不再入库**, 连同原有的
+#   `!` 例外一并删除 —— 例外当初的理由是"承载已归档结论的判据", 但那些结论写在
+#   被忽略的 docs/ 与 tests/ 里, 复现工具留在本机即可; 入库只让每次实测都变成提交噪音。
+scripts/probe_*.py
+scripts/diag_*.py
+scripts/audit_*.py
+scripts/measure_*.py
+scripts/browser_*.py
+scripts/ab_*.py
+# verify_* 仍入库: 它们承载"报不可用而实际可用"的端到端验收, 不是一次性排查。
+scripts/verify_*.py
 !scripts/verify_image_fetch_via_proxy.py
 !scripts/verify_gallery_images_via_proxy.py
 !scripts/verify_xbox_github_paths.py
-scripts/audit_*.py
-# ⚠ 否定项必须排在 `scripts/audit_*.py` **之后** —— git 是后者优先, 先写等于没写
-#   (实测踩到: 放在上面时 check-ignore 仍命中 audit_*.py)。
-!scripts/audit_pool_availability.py
+!scripts/verify_cert_gate.py
+!scripts/verify_nginx_stub_status.py
+!scripts/verify_site_candidate.py
+!scripts/verify_civitai_images_h3.py
 scripts/test_*.py
 scripts/benchmark_*.py
 # 一次性排障 / 紧急清理助手 (与 probe_* 同类: 只在本机排查时用, 不上传)
