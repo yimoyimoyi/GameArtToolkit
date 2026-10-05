@@ -131,6 +131,33 @@ TAP_RING_MAX = 64                # 请求级诊断 tap 长度 (有界, 见 _Requ
 #   ④ 仍未验证: 低可用窗口 (p≈0.2) 下的重试边际价值理论上更大, 但同样受 ③ 限制;
 #      以及放大 RETRY_TIME_BUDGET 后的形态 (需单独一轮 A/B, 且与"快速失败"取向冲突)。
 DEFAULT_RETRY_SAME_NODE = 0
+# ★ 2026-10-05: 上面的常量**降级为默认值**, 真正的取值由配置项
+#   `gvs_same_node_retries` 决定 (见 config_store.DEFAULT_CONFIG 里该键上方的完整依据:
+#   腿级同刻 A/B + 互换对照 + 串行对照, 串行下单地址重试使成功率 42% → 58%)。
+#   ⚠ 默认仍是 0 ⇒ 不配置时行为与引入前**逐字一致**; 且它作用于全部 h3 请求
+#   (含 SABR 的 /videoplayback), 开启前请读配置注释里的风险段。
+GVS_RETRIES_CONFIG_KEY = "gvs_same_node_retries"
+# 取值上限: 再大也只是把注定失败的请求拖长 (受 RETRY_TIME_BUDGET 墙钟约束, 见其注释)
+GVS_RETRIES_MAX = 3
+
+
+def configured_retries() -> int:
+    """从配置读同地址重试次数 (任何异常/缺键都回落到 DEFAULT_RETRY_SAME_NODE)
+
+    做成模块级**纯读函数**而不是在 `H3UpstreamManager.start` 里内联:
+    单测可以直接钉住 clamp 与回落行为, 不必起腿。
+    """
+    try:
+        from config_store import load_config
+        raw = (load_config() or {}).get(GVS_RETRIES_CONFIG_KEY,
+                                        DEFAULT_RETRY_SAME_NODE)
+        val = int(raw)
+    except Exception:
+        return DEFAULT_RETRY_SAME_NODE
+    if val < 0:
+        return 0
+    return min(val, GVS_RETRIES_MAX)
+
 # 单次请求允许的总尝试次数上限 —— 防止"重试 × 候选 × 两轮"叠加出不可控的长尾
 MAX_TOTAL_ATTEMPTS = 6
 # 额外尝试的**墙钟预算** (秒)。超过即不再重试, 直接 502。
@@ -2213,7 +2240,9 @@ class H3UpstreamManager:
             if self._proxy is None and self.is_listening():
                 return False, (f"端口 {self.port} 已被占用 (非本模块的实例), "
                                f"无法启动 h3 上游腿")
-            proxy = H3UpstreamProxy(port=self.port)
+            # ★ 同地址重试次数从配置读 (默认 0 ⇒ 不配置时行为与引入前逐字一致)。
+            #   为何可配置、依据与风险见 config_store 里 `gvs_same_node_retries` 的注释。
+            proxy = H3UpstreamProxy(port=self.port, retries=configured_retries())
             ok, why = proxy.start()
             if not ok:
                 return False, f"h3 上游腿启动失败: {why}"
