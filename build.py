@@ -39,7 +39,7 @@ def get_app_version() -> str:
                             return parts[1].strip().strip("'\"")
         except Exception:
             pass
-    return "1.1.0"
+    return "2.0.0"
 
 def build_ech_tunnel() -> bool:
     """构建 ECH 隧道可执行文件 (需要 Go 工具链)

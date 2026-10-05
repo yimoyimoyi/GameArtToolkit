@@ -24,6 +24,20 @@ GameArt Toolkit - HTTP/3 上游腿 (nginx 明文回环 → 本模块 → HTTP/3 
   它与播放器自带的重试重复, 且会把本可快速失败、让播放器换节点的请求拖住。
   本模块的取向应是"要么成功, 要么尽快失败", 而不是在网关里盲等。
 
+  ⚠ 2026-10-05 实测补记 —— **不要用"自动调 play()"的脚本去判本模块的可用性**:
+    浏览器在环测试时, 若脚本在观测循环里反复 `video.play()` (本意是对抗"静音自动播放被
+    YouTube 置为 paused"), 会**取消在飞的媒体请求**, 把真实失败伪装成 `net::ERR_ABORTED`。
+    同配置两轮对照, 唯一差别就是有没有那个 play 循环:
+        有 play 循环: 媒体成功 10 / 失败 20; videoplayback 累计 **7,395 字节**;
+                      currentTime 190 秒停在 0.0, ready=0 ⇒ **看起来像"播一段后卡死无后续"**
+        零干预      : 媒体成功 28 / 失败 19; videoplayback 累计 **37,777,613 字节**;
+                      currentTime 一路推进到 **237.8s**, ready 全程 4 ⇒ **正常播放**
+    ⇒ **UI 自动化本身会制造出与本模块无关的"卡死"。** YouTube 进入播放页即自动播放,
+      脚本**不需要**去点播放; 观测必须用零干预模式
+      (见 scripts/browser_stall_forensics.py 的 `--no-touch`)。
+    另: 两轮里 `videoplayback` 的 **HTTP 502 都是 7 条**, 与干预无关 —— 那是本模块的真实
+      偶发失败, 由播放器重试吸收, **对播放无可见影响** (与上面"50% 失败仍顺畅播完"一致)。
+
 与现有 ECH 隧道的架构关系 (刻意的同构):
   discord/pixiv 现在是  nginx --明文回环--> Go ECH 隧道 --TCP+TLS+ECH--> Cloudflare
   本模块则是            nginx --明文回环--> 本模块(python/aioquic) --HTTP/3--> 真实节点
