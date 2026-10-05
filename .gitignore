@@ -222,6 +222,24 @@ scripts/regen_pools.py
 # nginx.conf 里那四条显式 include 不会因此失效。
 nginx/conf/site-*.conf
 
+# 动态 upstream 优选配置: **同样是生成物**, 不入库 (2026-10-04 补)
+#
+# 为什么它该和 site-*.conf 同待遇 (用户提出, 并已实测确认):
+#   · **同一个生成器家族的产物** —— 由双通道测速引擎按本机实测结果写出; 上面的 site-*.conf
+#     已因"生成物不入库"被忽略, 单独留它入库是判据不一致。
+#   · **内容是机器/时间专属的**: 文件头写着"生成时间", 正文是本机测出来的 Akamai/Cloudflare
+#     候选 IP 与优先级 (实测一次重生成里 28 行改动**全部**是时间戳 + IP 换序, 无逻辑变化)。
+#     入库等于把某台机器的网络测量结果当成项目真理, 对别人无意义。
+#   · **会无休止地 dirty, 且掩盖真实改动**: `git log` 显示它已被改过 **37 次**, 其中多次是
+#     纯 `chore: 更新/重新生成动态 upstream 优选配置`。每轮 `git status` 都带噪音, 而噪音的
+#     代价是"分不清哪些是真实代码改动" —— 本项目已多次为此付账。
+#   · **自愈已验证**: 删掉它再调 NginxManager.test_config(), 返回 True 并重新写出该文件
+#     (与 site-*.conf 的"全删后仍 True"同款证据), 故全新 clone 首次启动不会因缺它而失败。
+#
+# ⚠ 只对 git 生效: 文件仍在磁盘上, nginx.conf 的 include 照常工作。取消跟踪用的是
+#   `git rm --cached` (不是 `git rm`) —— 后者会删掉磁盘文件并让 include 失败。
+nginx/conf/upstream-dynamic.conf
+
 # ── 编译产物 (2026-10-03) ──────────────────────────────────────────────
 # ECH 隧道的源码在 tools/ech_tunnel/ (echconfig.go / main.go / resolver.go),
 # 由 build.ps1 编译。二进制不入库 —— 但**源码必须留**。

@@ -2479,7 +2479,22 @@ _DNS_POISON_PREFIX = ("157.240.", "31.13.", "2a03:2880", "162.125.", "65.49.",
                       #  `2a03:2880` `59.24.` `65.49.` `185.60.216.` `69.171.235.`) 给到
                       # cdn_optimizer —— 其中 4 个实测投毒值此前能**连过两道闸门**进入
                       # 候选池 (见 scripts/gvs_gate_benefit_check.py 的 B1/B2)。
-                      "69.171.", "69.63.")
+                      "69.171.", "69.63.",
+                      # —— 2026-10-04 补: **Meta 自有段整组拉黑** (用户实测"同一图片链
+                      #    时好时坏"的真根因) ——
+                      # 现场: `_doh('image.civitai.com','A')` **DoH 服务器自己**返回了
+                      #   `66.220.146.94`, 而 `is_poisoned` 判 False ⇒ 腿拿一个死地址去连
+                      #   ⇒ 4~8s 超时 ⇒ 502。同一个域名连测 4 次: 3 次拿到该投毒地址、
+                      #   1 次拿到空 —— **"同链接时好时坏"就是这个**。
+                      # 为什么整组补: 投毒取值会在 Meta 各段之间轮换 (本项目已有先例 ——
+                      #   表内注释记着"按 /24 精确拉黑等于每轮换一次就漏一次")。实测把
+                      #   Meta 公开段逐个送进 is_poisoned(), **8 个段全部漏检**:
+                      #     66.220.0.0/16 · 173.252.64.0/18 · 204.15.20.0/22 · 179.60.192.0/22
+                      #     45.64.40.0/22 · 102.132.96.0/20 · 129.134.0.0/17 · 163.70.128.0/17
+                      # 安全性: `is_poisoned` **只用于过滤解析答案** (查询侧), 不参与"要不要
+                      #   服务某站点"的判定 —— 且正常站点不会托管在 Meta 自有段上。
+                      "66.220.", "173.252.", "204.15.20.", "179.60.192.",
+                      "45.64.40.", "102.132.96.", "129.134.", "163.70.")
 
 # 投毒前缀的**单一真源** (2026-10-04, 原缺陷: 同一语义在两张表里各写一份)
 #   · 查询侧: 本模块 `is_poisoned()` / `default_resolver()` 用它过滤解析答案;
@@ -2607,7 +2622,19 @@ def _doh(name: str, qtype: str, timeout: float = 4.0) -> List[str]:
     import urllib.request
 
     want = 28 if qtype.upper() == "AAAA" else 1
-    for url in ("https://dns.alidns.com/resolve", "https://doh.pub/dns-query"):
+    # ★★ 顺序是**实测决定**的, 不是偏好 (2026-10-04 用户"civitai 图片时好时坏"的真根因):
+    #   `dns.alidns.com` (= 223.5.5.5) 会**间歇性返回一个不可达的地址**, 而 `doh.pub` 稳定正确。
+    #   实况 (同一分钟, 同一域名 blobs-b2.civitai.com):
+    #       doh.pub        -> ['172.66.152.186', '104.20.38.219']   连测 6/6 一致
+    #       ali(223.5.5.5) -> ['103.252.114.61']                    单值, 且 TCP 443 **8s 超时**
+    #   而本函数原先是 `for url in (ali, doh.pub)` + `if out: return out` ——
+    #   **阿里只要吐出一个地址 (哪怕是那个死地址) 就立刻采纳, doh.pub 根本不会被问到**。
+    #   于是同一域名**约一半的解析拿到死地址** ⇒ 腿拿它去连 ⇒ connect 预算 4s 烧光 ⇒ 502。
+    #   这就是"同一链接时好时坏"的确切机制。
+    #   故把**可靠的 doh.pub 放到第一位**; alidns 保留为兜底 (若某天 doh.pub 也不可达,
+    #   宁可拿阿里的答案去试, 也不要返回空 —— 与"宁可快速如实失败"同一口径)。
+    #   ⚠ 不要改回"阿里优先": 那是本次缺陷的成因。
+    for url in ("https://doh.pub/dns-query", "https://dns.alidns.com/resolve"):
         try:
             req = urllib.request.Request(
                 f"{url}?name={name}&type={qtype.upper()}",
@@ -2682,7 +2709,7 @@ def default_resolver(host: str) -> List[str]:
         cand = v6 + v4
         if strict:
             cand = [ip for ip in cand if is_google_edge_ip(ip)]
-        return cand
+        return _order_gvs_prefer_v6(cand, strict)
 
     # 兜底: 系统解析 (可能被投毒, 已过滤), 同样 IPv6 优先
     try:
@@ -2699,9 +2726,35 @@ def default_resolver(host: str) -> List[str]:
                + prefer_google(list(dict.fromkeys(out4))))
         if strict:
             out = [ip for ip in out if is_google_edge_ip(ip)]
-        return out
+        out = _order_gvs_prefer_v6(out, strict)
     except Exception:
         return []
+
+
+def _order_gvs_prefer_v6(cands: List[str], strict: bool) -> List[str]:
+    """GVS 节点家族: **IPv6 排前面, 但 IPv4 保留在队尾兜底** (不再整个丢弃)
+
+    ★ 2026-10-04 **二次修正** (用户反馈"改了之后 youtube 播放好像更大了"):
+      第一版是"有 v6 就**丢掉** v4"。现场数据支持它 (4 个节点 × 每地址 2 轮:
+      v6 命中 0.6~2.6s, v4 **全部** 25.9~60s 超时; 交错 A/B 里 默认错误 6 → 只用 v6 错误 2,
+      502 耗时 13.3/16.6s → 5.1/4.9s)。**但那个样本恰好 v6 全好, 掩盖了它的代价**:
+        · `order_candidates` 是把 v6/v4 **交替**排的 ⇒ 候选里有两个族就有两次尝试机会;
+          丢掉 v4 等于**把每节点的尝试次数减半**。若轮到 v6 是坏的那一族, 该节点就从
+          "还能靠 v4 救回"变成"必死"。
+        · 实测就存在这种节点: `rr3---sn-p5qddn7k` 的 v6 (2607:f8b0:4004:15::8) 25.9s 超时,
+          而**它的 v4 (173.194.7.136) 也是 60s 超时** —— 这一次两族都死, 所以本次症状不是
+          本改动引起的; 但"v6 坏 v4 好"的节点在理论上必然存在, 丢掉 v4 就是主动放弃那条路。
+      ⇒ 改为**只重排、不丢弃**: v6 在前 (多数情况下它才是可用的那一族, 且失败快速),
+        v4 留后 (前者的兜底)。`attempt_order` 随后仍会把两族交替, 故尝试机会不减。
+
+    ⚠ 非 GVS 目标 (strict=False) 原样返回 —— Civitai/Discord 等恰恰是"只有 v4 通",
+      绝不能套用本函数。这是"youtube 与 civitai 策略必须分离"的落点。
+    """
+    if not strict:
+        return list(cands)
+    v6 = [ip for ip in cands if ":" in ip]
+    v4 = [ip for ip in cands if ":" not in ip]
+    return v6 + v4
 
 
 def main(argv: Optional[List[str]] = None) -> int:
