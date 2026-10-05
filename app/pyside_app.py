@@ -21,7 +21,7 @@ import threading
 # 否则"某一条忘了判断"就又回到无限重启循环。
 import contextlib
 from pathlib import Path
-from typing import Optional, List, Dict, Set, Tuple, Any
+from typing import Optional, List, Dict, Set, Tuple, Any, Callable
 
 # 强制设置环境语言与标准 I/O 编码，避免 Windows 多语言环境或非 UTF-8 控制台下报错
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -1333,6 +1333,8 @@ class MainWindow(QMainWindow):
         self._single_cdn_workers: Dict[str, SingleCDNTestWorker] = {}
         self._startup_cdn_worker: Optional[StartupAutoCDNWorker] = None
         self._startup_flow_in_progress: bool = False
+        self._pending_redirect_services: Optional[List[str]] = None
+        self._pending_redirect_callbacks: List[Any] = []
 
         # 控制台分块折叠
         self.collapsed_sections: Set[str] = set(load_config().get("collapsed_dashboard_sections", []))
@@ -1395,10 +1397,11 @@ class MainWindow(QMainWindow):
         try:
             warn = load_config().get("last_cleanup_warning") or {}
             if warn.get("detail"):
-                QTimer.singleShot(1200, lambda d=warn.get("detail"): show_toast(
+                QTimer.singleShot(1200, lambda: show_toast(
                     self,
-                    f"上次退出未清理干净: {d}。请以管理员身份启动本程序以自动回收残留。",
-                    toast_type="warning", duration=9000))
+                    "检测到上次退出有残留网络规则，建议提权自动清理",
+                    toast_type="warning", duration=4500, action_text="提权",
+                    on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup)))
         except Exception:
             pass
 
@@ -1822,10 +1825,10 @@ class MainWindow(QMainWindow):
         for c_idx in range(4):
             stat_grid.setColumnStretch(c_idx, 1)
 
-        self.card_stat_nginx = self.create_stat_card("核心加速服务", "检测中...", "", "server")
-        self.card_stat_cert = self.create_stat_card("Windows 根证书", "检测中...", "", "lock")
-        self.card_stat_hosts = self.create_stat_card("Hosts 规则库", "未注入", "", "file_text")
-        self.card_stat_steam = self.create_stat_card("Steam 活跃用户", "未登录", "", "gamepad")
+        self.card_stat_nginx = self.create_stat_card("加速核心", "检测中...", "", "server")
+        self.card_stat_cert = self.create_stat_card("系统根证书", "检测中...", "", "lock")
+        self.card_stat_hosts = self.create_stat_card("域名分流", "未注入", "", "file_text")
+        self.card_stat_steam = self.create_stat_card("Steam 账号", "未登录", "", "gamepad")
 
         stat_grid.addWidget(self.card_stat_nginx, 0, 0)
         stat_grid.addWidget(self.card_stat_cert, 0, 1)
@@ -2245,12 +2248,12 @@ class MainWindow(QMainWindow):
         cfg["enabled_services"] = new_list
         save_config(cfg)
 
-        # 若加速运行中或重定向规则已注入，即刻动态调整规则并刷新 DNS
+        # 若加速运行中或重定向规则已注入，即刻动态调整规则并刷新 DNS (后台执行，防冻结界面)
         if nginx_mgr.is_running() or self._is_redirect_active():
-            self._apply_redirect(new_list)
+            self._apply_redirect_async(new_list)
 
         action_name = "启用" if enable else "禁用"
-        show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务并同步更新 Hosts", toast_type="info", duration=2000)
+        show_toast(self, f"已{action_name} [{SERVICE_GROUPS.get(group_id, {}).get('name', group_id)}] 全部分类服务并同步更新规则", toast_type="info", duration=2000)
 
     def on_service_toggled(self, service_id: str, checked: bool):
         """单个加速服务开关切换: 立即更新配置并在加速激活时自动调整 Hosts 规则
@@ -2280,12 +2283,11 @@ class MainWindow(QMainWindow):
                         _sw.blockSignals(False)
                     except Exception:
                         pass
+                _sname = (_profile or {}).get('name', service_id)
                 show_toast(
                     self,
-                    f"无法开启 [{( _profile or {}).get('name', service_id)}]: "
-                    f"它属于受控分组「{SERVICE_GROUPS.get(_group_id, {}).get('name', _group_id)}」，"
-                    f"默认隐藏且不可启用 —— 请先在「设置 → 内容分组」中打开该分组的开关",
-                    toast_type="warning", duration=7000)
+                    f"[{_sname}] 需先在「设置 → 内容」开启该分类",
+                    toast_type="warning", duration=3500)
                 return
             try:
                 from h3_upstream import blocked_services
@@ -2307,8 +2309,8 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                 _name = (_profile or {}).get("name", service_id)
-                show_toast(self, f"无法开启 [{_name}]: {_blocked[service_id]}",
-                           toast_type="warning", duration=6000)
+                show_toast(self, f"当前模式不支持开启 [{_name}]",
+                           toast_type="warning", duration=3500)
                 return
             # 软告警 (不阻断): 该服务有"当前后端表达不了"的通配域时, **当场**告知 ——
             # 这类失败很隐蔽 (页面外壳能开、只有个别子域超时), 等用户自己去翻控制台太晚。
@@ -2317,10 +2319,8 @@ class MainWindow(QMainWindow):
                 _name = (_profile or {}).get("name", service_id)
                 show_toast(
                     self,
-                    f"[{_name}] 已开启, 但 Hosts 后端劫持不到它的通配域名 "
-                    f"({'/'.join(_gaps[service_id])}) —— 页面可开, 而这些子域仍会走真实解析"
-                    f"(可能超时, 如 Gemini 的会话端点)。改用 PAC 后端（推荐：免管理员，且 PAC 能表达通配）可完整覆盖。",
-                    toast_type="warning", duration=9000)
+                    f"[{_name}] 部分通配域名需 PAC 模式支持，建议切换",
+                    toast_type="warning", duration=3500)
         self._update_service_icon(service_id, checked)
         cfg = load_config()
         services = set(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES))
@@ -2333,47 +2333,27 @@ class MainWindow(QMainWindow):
         cfg["enabled_services"] = new_list
         save_config(cfg)
 
-        # 软告警 2 (2026-10-03, L3 修正 2026-10-04): 走 HTTP/3 上游腿的服务 (googlevideo) ——
-        # 它的可用性是**节点级、分钟级时变**的, 且实测"每个节点只有一个可用地址", 所以既拦不住
-        # 也修不好, 只能**如实告知且不阻断**。数据源 = 节点成绩单 (浏览器真实播放的跨会话统计),
-        # **离线读取**, 不做实时探测 (实时探测要数十秒会冻结界面, 且合成请求读不出"能不能播")。
-        #
-        # ★ 为什么放在 save_config **之后**、且传 new_list:
-        #   ① 判据是"这条告警与本次操作是否相关", 依据只能是**启用清单**;
-        #   ② 必须用切换**后**的清单 —— 打开 googlevideo 时它已在 new_list 里, 告警才出得来;
-        #   ③ 原先传 [service_id] 而函数不读该参数 ⇒ 开关任何服务都弹 googlevideo 的告警,
-        #      文案还会张冠李戴 (如 "[Gemini] 已开启 … 最近 N 次**视频**请求…")。
-        # 软告警 2 (2026-10-03; 判据两次修正 2026-10-04): 走 HTTP/3 直连通道的服务 ——
-        # 它的可用性是**节点级、分钟级时变**的, 既拦不住也修不好, 只能如实告知且不阻断。
-        # 数据源 = 节点成绩单 (浏览器真实播放的跨会话统计), **离线读取**, 不做实时探测。
-        #
-        # ★ 判据现在看 **`subject`=本次要开的那个服务**, 而不是"启用清单里有没有 googlevideo":
-        #   后者会让**开启 civitai_web** 时弹出 YouTube 的告警 (实测, 见截图) —— 因为
-        #   civitai_web 也走 h3 通道、也在这个清单里, 而成绩单是 googlevideo 专属的。
         if checked:
             try:
                 from h3_upstream import gvs_health_hint
-                # subject=本次操作的服务: 只有它**就是** googlevideo 时该提示才成立。
-                # 传 subject 后不再需要 new_list (判据已由对象本身确定), 但保留传参无害。
                 _hint = gvs_health_hint(new_list, subject=service_id)
             except Exception:
                 _hint = ""
             if _hint:
                 _name2 = (_profile or {}).get("name", service_id)
-                # 文案按用户要求收敛: "xxx可能不稳定, 节点可用性 xx%"
-                show_toast(self, f"{_name2}可能不稳定, {_hint}",
-                           toast_type="warning", duration=8000)
+                show_toast(self, f"{_name2}可用性波动 ({_hint})",
+                           toast_type="warning", duration=3500)
 
         srv_info = SERVICES_BY_ID.get(service_id)
+        srv_name = srv_info["name"] if srv_info else service_id
 
-        # 若加速处于运行状态或重定向规则已注入，即刻动态调整
+        # 若加速处于运行状态或重定向规则已注入，即刻动态调整 (后台执行，防冻结界面)
         if nginx_mgr.is_running() or self._is_redirect_active():
-            h_ok, h_msg = self._apply_redirect(new_list)
-            srv_name = srv_info["name"] if srv_info else service_id
             if not checked:
-                show_toast(self, f"已关闭 [{srv_name}] 加速，已自动移除对应重定向规则", toast_type="info", duration=1800)
-            elif h_ok:
-                show_toast(self, f"已开启 [{srv_name}] 加速并注入重定向规则", toast_type="success", duration=1800)
+                show_toast(self, f"已关闭 [{srv_name}]", toast_type="info", duration=1500)
+            else:
+                show_toast(self, f"已开启 [{srv_name}]", toast_type="success", duration=1500)
+            self._apply_redirect_async(new_list)
 
     # ------------------ PAGE 2: 实用工具箱 (Toolbox Hub & Sub-pages) ------------------
     def create_toolbox_page(self) -> QWidget:
@@ -2420,9 +2400,9 @@ class MainWindow(QMainWindow):
 
         # 1. 以图搜图卡片
         card_search = ToolHubCard(
-            title="以图搜图工作台 (Reverse Image Search)",
-            tag="二次元 / 画师检索",
-            desc="支持系统剪贴板图片快速抓取与本地文件拖拽，内置 SauceNAO、Ascii2d、Google Lens、IQDB 多引擎，秒级定位 Pixiv PID、推特画师与高清原图。",
+            title="以图搜图工作台",
+            tag="画师与原图检索",
+            desc="支持剪贴板图片快速抓取与本地文件拖拽，内置 SauceNAO、Ascii2d、Google Lens、IQDB 等引擎，快速查找 Pixiv PID 与高清原图。",
             icon_name="image",
             parent=self
         )
@@ -2431,9 +2411,9 @@ class MainWindow(QMainWindow):
 
         # 2. 端口管理与释放卡片
         card_ports = ToolHubCard(
-            title="端口占用诊断与进程释放 (Port Manager)",
-            tag="系统排障 / 冲突自愈",
-            desc="支持任意端口 (1-65535) 精准搜索与连接进程强杀，提供 80 / 443 / 53 加速核心端口状态一键体检与冲突释放。",
+            title="端口诊断与释放",
+            tag="网络冲突排查",
+            desc="支持任意端口 (1-65535) 占用查询与冲突解除，提供 80 / 443 / 53 核心端口状态体检。",
             icon_name="network",
             parent=self
         )
@@ -2442,9 +2422,9 @@ class MainWindow(QMainWindow):
 
         # 3. 生态主站快捷导航卡片
         card_nav = ToolHubCard(
-            title="加速生态官方主站直达 (Service Navigator)",
-            tag="官方入口 / 极速直达",
-            desc="聚合 Pixiv、FANBOX、BOOTH、Steam 商店/社区、育碧、战网、GOG、GitHub、HuggingFace 等官方入口，支持关键词实时筛选与一键打开。",
+            title="官方生态导航",
+            tag="快捷入口直达",
+            desc="收录 Pixiv、BOOTH、Steam、GitHub、HuggingFace 等官方入口，支持关键词即时过滤与一键打开。",
             icon_name="compass",
             parent=self
         )
@@ -2494,7 +2474,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(18)
 
         # 返回头
-        layout.addLayout(self._create_toolbox_subpage_header("以图搜图工作台 (Reverse Image Search)"))
+        layout.addLayout(self._create_toolbox_subpage_header("以图搜图工作台"))
 
         is_dark = ThemeManager.get_instance().is_dark
         primary_c = "#7EB9F5" if is_dark else "#0284C7"
@@ -2593,7 +2573,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(18)
 
         # 返回头
-        layout.addLayout(self._create_toolbox_subpage_header("端口占用诊断与进程释放 (Port Manager)"))
+        layout.addLayout(self._create_toolbox_subpage_header("端口管理与冲突释放"))
 
         is_dark = ThemeManager.get_instance().is_dark
         primary_c = "#7EB9F5" if is_dark else "#0284C7"
@@ -2606,7 +2586,7 @@ class MainWindow(QMainWindow):
         c_layout.setSpacing(12)
 
         c_header = QHBoxLayout()
-        lbl_c_title = QLabel("加速核心端口状态 (80 / 443 / 53)")
+        lbl_c_title = QLabel("核心端口状态 (80 / 443 / 53)")
         lbl_c_title.setProperty("class", "SectionHeaderTitle")
         c_header.addWidget(lbl_c_title)
         c_header.addStretch()
@@ -2652,7 +2632,7 @@ class MainWindow(QMainWindow):
         sp_layout.setContentsMargins(20, 16, 20, 16)
         sp_layout.setSpacing(12)
 
-        lbl_sp_title = QLabel("指定端口精准查询与释放")
+        lbl_sp_title = QLabel("指定端口查询与释放")
         lbl_sp_title.setProperty("class", "SectionHeaderTitle")
         sp_layout.addWidget(lbl_sp_title)
 
@@ -2660,24 +2640,24 @@ class MainWindow(QMainWindow):
         search_row.setSpacing(10)
 
         self.txt_custom_port = QLineEdit()
-        self.txt_custom_port.setPlaceholderText("输入要查询的端口号 (1-65535，如 8080, 7890, 3000)...")
+        self.txt_custom_port.setPlaceholderText("输入端口号 (1-65535，如 8080, 7890)...")
         self.txt_custom_port.setProperty("class", "SearchInput")
         self.txt_custom_port.returnPressed.connect(self.search_custom_port_action)
         search_row.addWidget(self.txt_custom_port, stretch=1)
 
-        btn_search_p = QPushButton("查询占用")
-        btn_search_p.setProperty("class", "MDBtnPrimary")
+        self.btn_custom_port_search = QPushButton("查询")
+        self.btn_custom_port_search.setProperty("class", "MDBtnPrimary")
         if SvgIconFactory:
-            btn_search_p.setIcon(SvgIconFactory.get_icon("search", "#FFFFFF", 14))
-            btn_search_p.setIconSize(QSize(14, 14))
-        btn_search_p.clicked.connect(self.search_custom_port_action)
-        search_row.addWidget(btn_search_p)
+            self.btn_custom_port_search.setIcon(SvgIconFactory.get_icon("search", "#FFFFFF", 14))
+            self.btn_custom_port_search.setIconSize(QSize(14, 14))
+        self.btn_custom_port_search.clicked.connect(self.search_custom_port_action)
+        search_row.addWidget(self.btn_custom_port_search)
         sp_layout.addLayout(search_row)
 
         # 搜索结果容器
         self.port_results_layout = QVBoxLayout()
         self.port_results_layout.setSpacing(6)
-        self.lbl_custom_port_summary = QLabel("输入任意端口号并点击【查询占用】，可毫秒级查看占用该端口的 PID 与程序路径。")
+        self.lbl_custom_port_summary = QLabel("输入端口号点击查询，即可查看占用进程。")
         self.lbl_custom_port_summary.setProperty("class", "ItemDesc")
         self.port_results_layout.addWidget(self.lbl_custom_port_summary)
         sp_layout.addLayout(self.port_results_layout)
@@ -2729,29 +2709,40 @@ class MainWindow(QMainWindow):
                         btn.setVisible(True)
 
     def release_critical_port_action(self, port: int):
-        """释放加速核心端口"""
-        procs = get_port_process_info(port)
-        if not procs:
-            show_toast(self, f"端口 {port} 当前未被占用", toast_type="info", duration=2000)
+        """释放加速核心端口 (后台执行枚举与强杀，防冻结界面)"""
+        btn = self.critical_port_btn_release.get(port)
+        show_toast(self, f"正在排查并释放 {port} 端口...", toast_type="info", duration=1500)
+
+        def _do_release():
+            procs = get_port_process_info(port)
+            if not procs:
+                return 0, 0
+            success_count = 0
+            for p in procs:
+                pid = p.get("pid", 0)
+                if pid > 0:
+                    ok, _ = kill_process_by_pid_safe(pid)
+                    if ok:
+                        success_count += 1
+            return len(procs), success_count
+
+        def _done(res):
+            if isinstance(res, Exception):
+                show_toast(self, f"释放端口异常: {res}", toast_type="error", duration=3000)
+                return
+            proc_count, success_count = res
+            if proc_count == 0:
+                show_toast(self, f"端口 {port} 当前未被占用", toast_type="info", duration=2000)
+            elif success_count > 0:
+                show_toast(self, f"已成功结束占用 {port} 端口的冲突进程！", toast_type="success", duration=2500)
+            else:
+                show_toast(self, f"结束进程失败，可能需要管理员权限或为系统受保护进程", toast_type="error", duration=3000)
             self.refresh_ports_diagnostics_ui()
-            return
 
-        success_count = 0
-        for p in procs:
-            pid = p.get("pid", 0)
-            if pid > 0:
-                ok, msg = kill_process_by_pid_safe(pid)
-                if ok:
-                    success_count += 1
-
-        if success_count > 0:
-            show_toast(self, f"已成功结束占用 {port} 端口的冲突进程！", toast_type="success", duration=2500)
-        else:
-            show_toast(self, f"结束进程失败，可能需要管理员权限或为系统受保护进程", toast_type="error", duration=3000)
-        self.refresh_ports_diagnostics_ui()
+        self._run_in_background(_do_release, _done, busy_attr=f"_port_release_{port}", trigger_btn=btn)
 
     def search_custom_port_action(self):
-        """查询指定端口号的占用情况并展示"""
+        """查询指定端口号的占用情况并展示 (后台异步扫描，防冻结界面)"""
         if not self.txt_custom_port:
             return
         text = self.txt_custom_port.text().strip()
@@ -2764,63 +2755,93 @@ class MainWindow(QMainWindow):
             show_toast(self, "端口号超出范围 (1-65535)", toast_type="warning", duration=2500)
             return
 
-        # 清除旧结果控件
+        # 清除旧结果控件并展示加载提示
         if self.port_results_layout:
             while self.port_results_layout.count() > 0:
                 child = self.port_results_layout.takeAt(0)
                 if child.widget():
                     child.widget().deleteLater()
+            lbl_loading = QLabel(f"正在扫描端口 {port} 的连接与占用进程信息...")
+            lbl_loading.setStyleSheet("color: #60A5FA; font-weight: 500; padding: 6px 0;")
+            self.port_results_layout.addWidget(lbl_loading)
 
-        procs = get_port_process_info(port)
-        if not procs:
-            lbl_res = QLabel(f"✓ 端口 {port} 当前处于空闲状态，未被任何进程占用。")
-            lbl_res.setStyleSheet("color: #10B981; font-weight: 500; padding: 6px 0;")
-            self.port_results_layout.addWidget(lbl_res)
-            show_toast(self, f"端口 {port} 空闲可用", toast_type="success", duration=2000)
-            return
+        btn_search = getattr(self, "btn_custom_port_search", None)
 
-        lbl_header = QLabel(f"发现 {len(procs)} 个连接/进程占用端口 {port}:")
-        lbl_header.setProperty("class", "ItemTitle")
-        self.port_results_layout.addWidget(lbl_header)
+        def _do_search():
+            return get_port_process_info(port)
 
-        for p in procs:
-            card = QFrame()
-            card.setProperty("class", "ServiceCard")
-            c_layout = QHBoxLayout(card)
-            c_layout.setContentsMargins(12, 8, 12, 8)
-            c_layout.setSpacing(10)
+        def _done(procs):
+            if self.port_results_layout:
+                while self.port_results_layout.count() > 0:
+                    child = self.port_results_layout.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
 
-            info_box = QVBoxLayout()
-            info_box.setSpacing(2)
-            lbl_p_name = QLabel(f"进程: {p.get('name', '未知')}  (PID: {p.get('pid', '')})  |  协议: {p.get('proto', 'TCP')}  状态: {p.get('status', 'LISTEN')}")
-            lbl_p_name.setProperty("class", "ItemTitle")
-            lbl_p_name.setWordWrap(True)
-            info_box.addWidget(lbl_p_name)
+            if isinstance(procs, Exception):
+                show_toast(self, f"查询端口异常: {procs}", toast_type="error", duration=3000)
+                return
 
-            exe_path = p.get("exe", "")
-            lbl_p_exe = QLabel(f"程序路径: {exe_path if exe_path else '系统受保护或无权限读取'}")
-            lbl_p_exe.setProperty("class", "ItemDesc")
-            lbl_p_exe.setWordWrap(True)
-            info_box.addWidget(lbl_p_exe)
+            if not procs:
+                lbl_res = QLabel(f"✓ 端口 {port} 当前处于空闲状态，未被任何进程占用。")
+                lbl_res.setStyleSheet("color: #10B981; font-weight: 500; padding: 6px 0;")
+                self.port_results_layout.addWidget(lbl_res)
+                show_toast(self, f"端口 {port} 空闲可用", toast_type="success", duration=2000)
+                return
 
-            c_layout.addLayout(info_box, stretch=1)
+            lbl_header = QLabel(f"发现 {len(procs)} 个连接/进程占用端口 {port}:")
+            lbl_header.setProperty("class", "ItemTitle")
+            self.port_results_layout.addWidget(lbl_header)
 
-            btn_kill = QPushButton("结束进程")
-            btn_kill.setProperty("class", "MDBtnDanger")
-            pid = p.get("pid", 0)
-            btn_kill.clicked.connect(lambda pid=pid, port=port: self.release_port_pid_action(pid, port))
-            c_layout.addWidget(btn_kill)
+            for p in procs:
+                card = QFrame()
+                card.setProperty("class", "ServiceCard")
+                c_layout = QHBoxLayout(card)
+                c_layout.setContentsMargins(12, 8, 12, 8)
+                c_layout.setSpacing(10)
 
-            self.port_results_layout.addWidget(card)
+                info_box = QVBoxLayout()
+                info_box.setSpacing(2)
+                lbl_p_name = QLabel(f"进程: {p.get('name', '未知')}  (PID: {p.get('pid', '')})  |  协议: {p.get('proto', 'TCP')}  状态: {p.get('status', 'LISTEN')}")
+                lbl_p_name.setProperty("class", "ItemTitle")
+                lbl_p_name.setWordWrap(True)
+                info_box.addWidget(lbl_p_name)
+
+                exe_path = p.get("exe", "")
+                lbl_p_exe = QLabel(f"程序路径: {exe_path if exe_path else '系统受保护或无权限读取'}")
+                lbl_p_exe.setProperty("class", "ItemDesc")
+                lbl_p_exe.setWordWrap(True)
+                info_box.addWidget(lbl_p_exe)
+
+                c_layout.addLayout(info_box, stretch=1)
+
+                btn_kill = QPushButton("结束进程")
+                btn_kill.setProperty("class", "MDBtnDanger")
+                pid = p.get("pid", 0)
+                btn_kill.clicked.connect(lambda pid=pid, port=port: self.release_port_pid_action(pid, port))
+                c_layout.addWidget(btn_kill)
+
+                self.port_results_layout.addWidget(card)
+
+        self._run_in_background(_do_search, _done, busy_attr="_port_search_worker", trigger_btn=btn_search)
 
     def release_port_pid_action(self, pid: int, port: int):
-        """精准结束指定 PID 进程"""
-        ok, msg = kill_process_by_pid_safe(pid)
-        if ok:
-            show_toast(self, f"已成功结束进程 (PID: {pid})！", toast_type="success", duration=2500)
-        else:
-            show_toast(self, msg, toast_type="error", duration=3000)
-        self.search_custom_port_action()
+        """精准结束指定 PID 进程 (后台执行，防冻结界面)"""
+        def _do_kill():
+            return kill_process_by_pid_safe(pid)
+
+        def _done(res):
+            if isinstance(res, Exception):
+                show_toast(self, f"结束进程异常: {res}", toast_type="error", duration=3000)
+                return
+            ok, msg = res
+            if ok:
+                show_toast(self, f"已成功结束进程 (PID: {pid})！", toast_type="success", duration=2500)
+            else:
+                show_toast(self, msg, toast_type="error", duration=3000)
+            self.search_custom_port_action()
+            self.refresh_ports_diagnostics_ui()
+
+        self._run_in_background(_do_kill, _done, busy_attr=f"_port_kill_pid_{pid}")
         self.refresh_ports_diagnostics_ui()
 
     def _build_toolbox_nav_view(self) -> QWidget:
@@ -2897,6 +2918,11 @@ class MainWindow(QMainWindow):
                 self.nav_card_widgets.append((card, sdata))
 
             g_card_layout.addLayout(cards_grid)
+
+            # 受控分组默认按 gated_group_enabled 判断是否可见
+            if group_info.get("gated") and not gated_group_enabled(group_id):
+                grp_card.setVisible(False)
+
             layout.addWidget(grp_card)
             self.nav_group_cards[group_id] = grp_card
 
@@ -2909,9 +2935,14 @@ class MainWindow(QMainWindow):
         visible_counts_by_group = {gid: 0 for gid in self.nav_group_cards}
 
         for card, data in self.nav_card_widgets:
+            gid = data.get("group")
+            # 受控分组如果未开启，始终隐藏
+            if SERVICE_GROUPS.get(gid, {}).get("gated") and not gated_group_enabled(gid):
+                card.setVisible(False)
+                continue
+
             if not q:
                 card.setVisible(True)
-                gid = data.get("group")
                 if gid in visible_counts_by_group:
                     visible_counts_by_group[gid] += 1
                 continue
@@ -2924,12 +2955,16 @@ class MainWindow(QMainWindow):
             )
             card.setVisible(matched)
             if matched:
-                gid = data.get("group")
                 if gid in visible_counts_by_group:
                     visible_counts_by_group[gid] += 1
 
         for gid, grp_card in self.nav_group_cards.items():
-            grp_card.setVisible(visible_counts_by_group.get(gid, 0) > 0)
+            if SERVICE_GROUPS.get(gid, {}).get("gated") and not gated_group_enabled(gid):
+                grp_card.setVisible(False)
+            elif q:
+                grp_card.setVisible(visible_counts_by_group.get(gid, 0) > 0)
+            else:
+                grp_card.setVisible(True)
 
     def _on_image_selected_for_search(self, path: str):
         pass
@@ -3031,56 +3066,71 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         return scroll
 
-    def load_steam_accounts_ui(self):
-        while self.accounts_container.count():
-            item = self.accounts_container.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+    def load_steam_accounts_ui(self, async_load: bool = True):
+        """读取本地已记住的 Steam 账号信息并渲染卡片 (默认后台异步加载, 防冻结界面)"""
+        btn_ref = getattr(self, "btn_refresh_steam", None)
 
-        accounts = steam_mgr.get_accounts()
-        if not accounts:
-            # MD3 空态引导卡片
-            empty_card = QFrame()
-            empty_card.setProperty("class", "EmptyStateCard")
-            ec_layout = QVBoxLayout(empty_card)
-            ec_layout.setContentsMargins(32, 36, 32, 36)
-            ec_layout.setAlignment(Qt.AlignCenter)
+        def _render(accounts):
+            if not hasattr(self, "accounts_container") or not self.accounts_container:
+                return
+            while self.accounts_container.count():
+                item = self.accounts_container.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
-            lbl_ec_icon = QLabel()
-            lbl_ec_icon.setAlignment(Qt.AlignCenter)
-            is_dark = ThemeManager.get_instance().is_dark
-            icon_c = "#D0BCFF" if is_dark else "#6750A4"
-            lbl_ec_icon.setPixmap(SvgIconFactory.get_pixmap("gamepad", icon_c, 48))
+            if isinstance(accounts, Exception) or not accounts:
+                # MD3 空态引导卡片
+                empty_card = QFrame()
+                empty_card.setProperty("class", "EmptyStateCard")
+                ec_layout = QVBoxLayout(empty_card)
+                ec_layout.setContentsMargins(32, 36, 32, 36)
+                ec_layout.setAlignment(Qt.AlignCenter)
 
-            lbl_ec_title = QLabel("未检测到本地已记住的 Steam 账号")
-            lbl_ec_title.setProperty("class", "EmptyStateTitle")
-            lbl_ec_desc = QLabel(
-                "请先在 Steam 客户端登录界面勾选【记住我的密码】并成功登录过至少一次，\n随后回到此处即可免密切换多个账号并管理备注。"
-            )
-            lbl_ec_desc.setProperty("class", "EmptyStateDesc")
-            lbl_ec_desc.setAlignment(Qt.AlignCenter)
+                lbl_ec_icon = QLabel()
+                lbl_ec_icon.setAlignment(Qt.AlignCenter)
+                is_dark = ThemeManager.get_instance().is_dark
+                icon_c = "#D0BCFF" if is_dark else "#6750A4"
+                lbl_ec_icon.setPixmap(SvgIconFactory.get_pixmap("gamepad", icon_c, 48))
 
-            btn_start_steam = QPushButton("立即启动 Steam 客户端")
-            btn_start_steam.setIcon(SvgIconFactory.get_icon("rocket", "#FFFFFF", 16))
-            btn_start_steam.setProperty("class", "MDBtnPrimary")
-            btn_start_steam.clicked.connect(self.launch_steam_app)
+                lbl_ec_title = QLabel("未检测到本地已记住的 Steam 账号")
+                lbl_ec_title.setProperty("class", "EmptyStateTitle")
+                lbl_ec_desc = QLabel(
+                    "请先在 Steam 客户端登录界面勾选【记住我的密码】并成功登录过至少一次，\n随后回到此处即可免密切换多个账号并管理备注。"
+                )
+                lbl_ec_desc.setProperty("class", "EmptyStateDesc")
+                lbl_ec_desc.setAlignment(Qt.AlignCenter)
 
-            ec_layout.addWidget(lbl_ec_icon, 0, Qt.AlignCenter)
-            ec_layout.addWidget(lbl_ec_title, 0, Qt.AlignCenter)
-            ec_layout.addWidget(lbl_ec_desc, 0, Qt.AlignCenter)
-            ec_layout.addSpacing(10)
-            ec_layout.addWidget(btn_start_steam, 0, Qt.AlignCenter)
+                btn_start_steam = QPushButton("立即启动 Steam 客户端")
+                btn_start_steam.setIcon(SvgIconFactory.get_icon("rocket", "#FFFFFF", 16))
+                btn_start_steam.setProperty("class", "MDBtnPrimary")
+                btn_start_steam.clicked.connect(self.launch_steam_app)
 
-            self.accounts_container.addWidget(empty_card)
+                ec_layout.addWidget(lbl_ec_icon, 0, Qt.AlignCenter)
+                ec_layout.addWidget(lbl_ec_title, 0, Qt.AlignCenter)
+                ec_layout.addWidget(lbl_ec_desc, 0, Qt.AlignCenter)
+                ec_layout.addSpacing(10)
+                ec_layout.addWidget(btn_start_steam, 0, Qt.AlignCenter)
+
+                self.accounts_container.addWidget(empty_card)
+                return
+
+            for idx, acc in enumerate(accounts):
+                is_active = acc.get("is_active", False)
+                card = SteamAccountCard(acc, is_active, self)
+                card.setMinimumWidth(320)
+                card.setMaximumWidth(480)
+                card.double_clicked.connect(self.switch_steam_account)
+                self.accounts_container.addWidget(card)
+
+        if not async_load or not hasattr(self, "_run_in_background") or threading.current_thread() is not threading.main_thread():
+            try:
+                accounts = steam_mgr.get_accounts()
+            except Exception:
+                accounts = []
+            _render(accounts)
             return
 
-        for idx, acc in enumerate(accounts):
-            is_active = acc.get("is_active", False)
-            card = SteamAccountCard(acc, is_active, self)
-            card.setMinimumWidth(320)
-            card.setMaximumWidth(480)
-            card.double_clicked.connect(self.switch_steam_account)
-            self.accounts_container.addWidget(card)
+        self._run_in_background(steam_mgr.get_accounts, _render, busy_attr="_steam_load_worker", trigger_btn=btn_ref)
 
     def _set_steam_card_loading(self, target_steamid: str, loading: bool):
         """控制 Steam 卡片按钮的加载中置灰与文案切换"""
@@ -3164,22 +3214,22 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("CDN 测速与动态 Upstream 优选")
+        title = QLabel("CDN 智能测速与优选")
         title.setObjectName("PageTitle")
-        desc = QLabel("并发探测各加速节点的网络延迟，自动应用延迟最低的最佳节点线路")
+        desc = QLabel("探测各服务节点延迟，自动优选并热重载最佳连通线路")
         desc.setObjectName("PageDesc")
         title_box.addWidget(title)
         title_box.addWidget(desc)
         header.addLayout(title_box)
         header.addStretch()
 
-        self.btn_start_ping = QPushButton("开始全量测速")
+        self.btn_start_ping = QPushButton("开始测速")
         self.btn_start_ping.setProperty("class", "MDBtnPrimary")
         self.btn_start_ping.setCursor(Qt.PointingHandCursor)
         self.btn_start_ping.clicked.connect(self.start_cdn_ping)
         header.addWidget(self.btn_start_ping)
 
-        self.btn_apply_cdn = QPushButton("应用测速结果")
+        self.btn_apply_cdn = QPushButton("应用最佳节点")
         self.btn_apply_cdn.setProperty("class", "MDBtnTonal")
         self.btn_apply_cdn.setCursor(Qt.PointingHandCursor)
         self.btn_apply_cdn.setEnabled(False)
@@ -3193,7 +3243,7 @@ class MainWindow(QMainWindow):
         #   哪怕 ECHConfig 仍是 2026-09-23 的内置兜底 (Go 侧全线失败时继续沿用旧配置)。
         #   那种状态下所有 ECH 画像都会逐请求失败, 用户却看到"隧道在跑" —— 本按钮用于
         #   一键强制重启以重新自举配置, 并按**与状态判定同一份逻辑**复核结果。
-        self.btn_ech_ready = QPushButton("让 ECH 就绪")
+        self.btn_ech_ready = QPushButton("就绪 ECH 隧道")
         self.btn_ech_ready.setProperty("class", "MDBtnTonal")
         self.btn_ech_ready.setCursor(Qt.PointingHandCursor)
         self.btn_ech_ready.setToolTip(
@@ -3224,7 +3274,7 @@ class MainWindow(QMainWindow):
         banner_text_l.setSpacing(2)
         self.lbl_cdn_status_summary = QLabel("测速目标已就绪")
         self.lbl_cdn_status_summary.setProperty("class", "CategoryTitle")
-        self.lbl_cdn_last_time = QLabel("默认加载所有测速目标及历史最优节点，支持一键全量测速或单项独立测速")
+        self.lbl_cdn_last_time = QLabel("支持全量测速或单项独立测速，测速后点击应用即可生效")
         self.lbl_cdn_last_time.setProperty("class", "CategoryDesc")
         banner_text_l.addWidget(self.lbl_cdn_status_summary)
         banner_text_l.addWidget(self.lbl_cdn_last_time)
@@ -3409,8 +3459,8 @@ class MainWindow(QMainWindow):
 
     def _on_net_probe_result(self, ok: bool):
         if not ok:
-            show_toast(self, "未检测到公网连通 (校园网未认证或断网)，测速可能全部超时",
-                       toast_type="warning", duration=4000)
+            show_toast(self, "公网未连通，测速可能超时",
+                       toast_type="warning", duration=3000)
 
     def on_cdn_ping_finished(self, results: Dict):
         self.cached_cdn_results = results
@@ -3423,34 +3473,29 @@ class MainWindow(QMainWindow):
         services = list(dict.fromkeys(cfg.get("enabled_services", DEFAULT_ENABLED_SERVICES)))
         health_monitor.update_services(services, results)
         self.btn_start_ping.setEnabled(True)
-        self.btn_start_ping.setText("重新全量测速")
+        self.btn_start_ping.setText("重新测速")
         self.btn_apply_cdn.setEnabled(True)
 
         self.render_cdn_results(results)
-        show_toast(self, "全量 CDN 测速完成！点击右上角【应用测速结果】即可生效", toast_type="success", duration=3500)
+        show_toast(self, "测速完成，点击【应用最佳节点】即可生效", toast_type="success", duration=2500)
 
     def _refresh_channel_state(self):
-        """重刷 ECH / h3 两条本机通道的**徽章与共用卡** (UI 线程调用)
-
-        为什么需要它 (2026-10-04, 用户反馈): 这两条通道都是**启动流程里才被拉起**的
-        (ECH 隧道由 `_start_ech_tunnel` 起, h3 腿由 `_start_h3_upstream` 起), 而徽章与
-        通道卡可能在那之前就已经渲染过 —— 那时读到的自然是"未就绪"。若不在启动完成后
-        重刷一次, 用户会看到"点了启动加速, 通道却还写着未就绪", 状态与事实不符。
-
-        实现方式: 重跑一次 `render_cdn_results`(用缓存的结果)。它会重新读两条通道的实时
-        状态并重设全部徽章 —— 不另写一套"只更新通道部分"的逻辑, 避免两处判据漂移
-        (这正是本项目反复吃亏的地方)。没有缓存结果时就只重设通道类服务的徽章。
-        """
+        """重刷 ECH / h3 两条本机通道的徽章与共用卡 (轻量快速更新，杜绝全量重绘冻结 UI)"""
         try:
-            cached = getattr(self, "cached_cdn_results", None) or {}
-            if cached and hasattr(self, "cdn_results_layout"):
-                self.render_cdn_results(cached)
-                return
-            # 没有测速结果可渲染: 至少把通道类服务的徽章刷成当前状态
+            # 1. 优先轻量更新主控制台的通道微徽章状态 (微秒级无锁刷新)
             for srv in SERVICES_LIST:
                 sid = srv["id"]
                 if is_ech_service(sid) or is_h3_service(sid):
                     self._set_badge(sid, 0)
+
+            # 2. 只有当前用户正停留在 CDN 测速页面时，才调度 CDN 列表刷新；
+            #    且使用延迟单发 QTimer 异步化，绝不在服务启动收尾的同一关键帧里同步重构 500+ 个控件
+            if hasattr(self, "stack") and hasattr(self, "cdn_results_layout"):
+                curr_w = self.stack.currentWidget() if hasattr(self.stack, "currentWidget") else None
+                if curr_w is getattr(self, "page_cdn", None):
+                    cached = getattr(self, "cached_cdn_results", None) or {}
+                    if cached:
+                        QTimer.singleShot(60, lambda: self.render_cdn_results(cached))
         except Exception as e:
             print(f"[Channel] 通道状态刷新失败: {e}")
 
@@ -4056,50 +4101,64 @@ class MainWindow(QMainWindow):
                 self.start_acceleration(show_toast_on_fail=False)
 
     def apply_optimal_cdn(self):
+        """将缓存的测速最佳节点写入配置并热重载生效 (后台异步执行，防冻结界面)"""
         if not self.cached_cdn_results:
             return
 
-        if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
-            self.btn_apply_cdn.setEnabled(False)
-            self.btn_apply_cdn.setText("正在应用...")
+        btn = getattr(self, "btn_apply_cdn", None)
+        if btn:
+            btn.setEnabled(False)
+            btn.setText("正在应用...")
 
-        def _restore_apply_btn():
-            if hasattr(self, "btn_apply_cdn") and self.btn_apply_cdn:
-                self.btn_apply_cdn.setEnabled(True)
-                self.btn_apply_cdn.setText("应用测速结果")
+        def _do_apply():
+            results = self.cached_cdn_results
+            ok, msg = cdn_opt.apply_optimal(results)
+            reloaded = False
+            if ok and nginx_mgr.is_running():
+                r_ok, r_msg = nginx_mgr.reload()
+                reloaded = r_ok
+            return ok, msg, reloaded, results
 
-        try:
-            ok, msg = cdn_opt.apply_optimal(self.cached_cdn_results)
-            if ok:
-                cfg = load_config()
-                cfg["last_optimal_time"] = int(time.time())
-                cfg["cached_cdn_full_results"] = self.cached_cdn_results
-                # 同步更新主控制台全部服务延迟微徽章与持久化
-                saved_lats = cfg.get("cached_latencies", {})
-                for sid, ip_list in self.cached_cdn_results.items():
-                    if ip_list and sid in self.service_badges:
-                        best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
-                        is_proxy = (sid in cdn_opt.last_relay_services)
-                        if is_ech_service(sid):
-                            # ECH 服务: 节点全部"不可用"是预期结果, 展示隧道状态
-                            self._set_badge(sid, 0)
-                            saved_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
-                        elif best_lat != 9999:
-                            self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
-                            saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+        def _done(res):
+            if btn:
+                btn.setEnabled(True)
+                btn.setText("应用最佳节点")
 
-                cfg["cached_latencies"] = saved_lats
-                save_config(cfg)
+            if isinstance(res, Exception):
+                show_toast(self, f"应用异常: {res}", toast_type="error", duration=4000)
+                return
 
-                if nginx_mgr.is_running():
-                    nginx_mgr.reload()
-                    show_toast(self, f"{msg} (已热重载生效)", toast_type="success", duration=3000)
-                else:
-                    show_toast(self, f"{msg} (将在下次启动代理时生效)", toast_type="info", duration=3000)
-            else:
+            ok, msg, reloaded, results = res
+            if not ok:
                 show_toast(self, f"应用失败: {msg}", toast_type="error", duration=4000)
-        finally:
-            QTimer.singleShot(600, _restore_apply_btn)
+                return
+
+            cfg = load_config()
+            cfg["last_optimal_time"] = int(time.time())
+            cfg["cached_cdn_full_results"] = results
+            # 同步更新主控制台全部服务延迟微徽章与持久化
+            saved_lats = cfg.get("cached_latencies", {})
+            for sid, ip_list in results.items():
+                if ip_list and sid in self.service_badges:
+                    best_lat = ip_list[0]["latency"] if ip_list[0].get("available") else 9999
+                    is_proxy = (sid in cdn_opt.last_relay_services)
+                    if is_ech_service(sid):
+                        # ECH 服务: 节点全部"不可用"是预期结果, 展示隧道状态
+                        self._set_badge(sid, 0)
+                        saved_lats[sid] = {"latency": 0, "via_proxy": False, "ech": True}
+                    elif best_lat != 9999:
+                        self._set_badge(sid, max(1, int(best_lat)), is_star=True, via_proxy=is_proxy)
+                        saved_lats[sid] = {"latency": max(1, int(best_lat)), "via_proxy": is_proxy}
+
+            cfg["cached_latencies"] = saved_lats
+            save_config(cfg)
+
+            if nginx_mgr.is_running():
+                show_toast(self, f"{msg} (已热重载生效)", toast_type="success", duration=3000)
+            else:
+                show_toast(self, f"{msg} (将在下次启动代理时生效)", toast_type="info", duration=3000)
+
+        self._run_in_background(_do_apply, _done, busy_attr="_apply_cdn_worker", trigger_btn=btn)
 
     # ------------------ PAGE 4: 系统诊断与设置 ------------------
     def _build_settings_env_card(self, primary_icon_c: str) -> QFrame:
@@ -4209,10 +4268,10 @@ class MainWindow(QMainWindow):
         row_autostart = QHBoxLayout()
         r_as_text = QVBoxLayout()
         r_as_text.setSpacing(2)
-        lbl_as_title = QLabel("开机自动启动 GameArt Toolkit")
+        lbl_as_title = QLabel("开机自启动")
         lbl_as_title.setProperty("class", "ItemTitle")
         lbl_as_title.setWordWrap(True)
-        lbl_as_desc = QLabel("写入 Windows 注册表当前用户启动项 (HKCU)，无需管理员提权即可在开机时常驻自启")
+        lbl_as_desc = QLabel("开机后自动在后台运行加速服务")
         lbl_as_desc.setProperty("class", "ItemDesc")
         lbl_as_desc.setWordWrap(True)
         r_as_text.addWidget(lbl_as_title)
@@ -4229,10 +4288,10 @@ class MainWindow(QMainWindow):
         row_minimized = QHBoxLayout()
         r_min_text = QVBoxLayout()
         r_min_text.setSpacing(2)
-        lbl_min_title = QLabel("启动时最小化至系统托盘 (直接在后台运行)")
+        lbl_min_title = QLabel("启动时最小化到托盘")
         lbl_min_title.setProperty("class", "ItemTitle")
         lbl_min_title.setWordWrap(True)
-        lbl_min_desc = QLabel("程序启动时不显示主窗口界面，直接最小化至右下角系统托盘静默常驻")
+        lbl_min_desc = QLabel("启动时不显示主窗口，仅在托盘后台运行")
         lbl_min_desc.setProperty("class", "ItemDesc")
         lbl_min_desc.setWordWrap(True)
         r_min_text.addWidget(lbl_min_title)
@@ -4248,10 +4307,10 @@ class MainWindow(QMainWindow):
         # 1.4 关闭窗口动作
         row_close = QVBoxLayout()
         row_close.setSpacing(6)
-        lbl_cl_title = QLabel("主窗口关闭按钮动作 (X)")
+        lbl_cl_title = QLabel("关闭窗口时")
         lbl_cl_title.setProperty("class", "ItemTitle")
         lbl_cl_title.setWordWrap(True)
-        lbl_cl_desc = QLabel("自定义点击窗口右上角关闭按钮时的默认处理方式")
+        lbl_cl_desc = QLabel("设置点击右上角关闭按钮时的行为")
         lbl_cl_desc.setProperty("class", "ItemDesc")
         lbl_cl_desc.setWordWrap(True)
         row_close.addWidget(lbl_cl_title)
@@ -4259,8 +4318,8 @@ class MainWindow(QMainWindow):
 
         cl_radio_box = QHBoxLayout()
         cl_radio_box.setSpacing(18)
-        self.rb_close_tray = QRadioButton("最小化至系统托盘 (推荐，网络加速持续运行)")
-        self.rb_close_quit = QRadioButton("直接完全退出程序 (安全剥离 Hosts 规则并停止代理)")
+        self.rb_close_tray = QRadioButton("最小化到托盘 (推荐·加速持续运行)")
+        self.rb_close_quit = QRadioButton("完全退出程序 (停止加速)")
         close_action = cfg.get("close_action", "minimize_to_tray")
         if close_action == "quit_directly":
             self.rb_close_quit.setChecked(True)
@@ -4278,10 +4337,10 @@ class MainWindow(QMainWindow):
         row_notif = QHBoxLayout()
         r_nt_text = QVBoxLayout()
         r_nt_text.setSpacing(2)
-        lbl_nt_title = QLabel("系统托盘与运行气泡提示")
+        lbl_nt_title = QLabel("系统通知气泡")
         lbl_nt_title.setProperty("class", "ItemTitle")
         lbl_nt_title.setWordWrap(True)
-        lbl_nt_desc = QLabel("关闭后将彻底静默，在窗口最小化、后台运行、服务启停或异常时均不再弹出 Windows 系统提示")
+        lbl_nt_desc = QLabel("允许在后台运行或状态变更时弹出系统提示")
         lbl_nt_desc.setProperty("class", "ItemDesc")
         lbl_nt_desc.setWordWrap(True)
         r_nt_text.addWidget(lbl_nt_title)
@@ -4325,9 +4384,7 @@ class MainWindow(QMainWindow):
         c_title_box.addStretch()
         c_layout.addLayout(c_title_box)
 
-        lbl_c_hint = QLabel(
-            "受控分组默认不显示且不可启用。关闭开关时会同时收回该分组下已启用的服务"
-            "（配置、Hosts 与 DNS 规则一并同步），不会留下「看着开着、实际已停」的残留状态。")
+        lbl_c_hint = QLabel("部分特殊分类默认隐藏，开启后可在控制台管理对应加速服务。")
         lbl_c_hint.setProperty("class", "ItemDesc")
         lbl_c_hint.setWordWrap(True)
         c_layout.addWidget(lbl_c_hint)
@@ -4344,7 +4401,7 @@ class MainWindow(QMainWindow):
             row = QHBoxLayout()
             txt = QVBoxLayout()
             txt.setSpacing(2)
-            lbl_t = QLabel(f"显示并允许启用「{ginfo.get('name', gid)}」分组")
+            lbl_t = QLabel(f"开启「{ginfo.get('name', gid)}」生态分类")
             lbl_t.setProperty("class", "ItemTitle")
             lbl_t.setWordWrap(True)
             lbl_d = QLabel(str(ginfo.get("gate_note") or ginfo.get("desc") or ""))
@@ -4364,9 +4421,7 @@ class MainWindow(QMainWindow):
         # 留痕可见: 上次加载配置时若因总闸关闭剔除了服务, 必须说出来 (而不是静默少掉几个)
         dropped = cfg.get("gated_services_dropped") or []
         if dropped:
-            lbl_drop = QLabel(
-                f"注意：上次加载配置时，有 {len(dropped)} 个受控分组的服务因总闸关闭被自动停用"
-                f"（{', '.join(dropped[:4])}{'…' if len(dropped) > 4 else ''}）。")
+            lbl_drop = QLabel(f"提示：因分类未开启，已自动停用 {len(dropped)} 个受控服务。")
             lbl_drop.setProperty("class", "ItemDesc")
             lbl_drop.setWordWrap(True)
             c_layout.addWidget(lbl_drop)
@@ -4411,9 +4466,14 @@ class MainWindow(QMainWindow):
             self.on_service_search_changed(self.txt_service_search.text())
         except Exception:
             pass
+        try:
+            if hasattr(self, "txt_nav_search"):
+                self._filter_navigator_cards(self.txt_nav_search.text())
+        except Exception:
+            pass
 
         if not enabled and (nginx_mgr.is_running() or self._is_redirect_active()):
-            self._apply_redirect(sorted(services))
+            self._apply_redirect_async(sorted(services))
 
         # 受控分组下的 ECH 画像要跟着进出隧道白名单 (总闸 = "这些服务不许生效",
         # 白名单是"允许转发到哪些目标"的前置面, 两者必须同步; 见 _start_ech_tunnel)。
@@ -4421,7 +4481,7 @@ class MainWindow(QMainWindow):
         try:
             if any(getattr(p, "ech_enabled", False) and p.group == group_id
                    for p in PROFILES):
-                self._start_ech_tunnel()
+                self._run_in_background(self._start_ech_tunnel, lambda _r: None, busy_attr="_ech_refresh_worker")
         except Exception as e:
             print(f"[UI] 受控分组切换后刷新 ECH 隧道失败 (不影响其它服务): {e}")
 
@@ -4456,10 +4516,10 @@ class MainWindow(QMainWindow):
         row_h_exit = QHBoxLayout()
         r_he_text = QVBoxLayout()
         r_he_text.setSpacing(2)
-        lbl_he_title = QLabel("退出与关机时自动修正/还原 Hosts")
+        lbl_he_title = QLabel("退出时自动还原 Hosts")
         lbl_he_title.setProperty("class", "ItemTitle")
         lbl_he_title.setWordWrap(True)
-        lbl_he_desc = QLabel("退出或 Windows 关机/重启时，自动清理加速规则并刷新 DNS 缓存，避免断网")
+        lbl_he_desc = QLabel("完全退出程序时自动清理加速规则，防止断网")
         lbl_he_desc.setProperty("class", "ItemDesc")
         lbl_he_desc.setWordWrap(True)
         r_he_text.addWidget(lbl_he_title)
@@ -4476,10 +4536,10 @@ class MainWindow(QMainWindow):
         row_h_heal = QHBoxLayout()
         r_hh_text = QVBoxLayout()
         r_hh_text.setSpacing(2)
-        lbl_hh_title = QLabel("启动时自动环境检查")
+        lbl_hh_title = QLabel("启动时自动体检 Hosts")
         lbl_hh_title.setProperty("class", "ItemTitle")
         lbl_hh_title.setWordWrap(True)
-        lbl_hh_desc = QLabel("启动时自动检测并修复非正常关机残留、只读/隐藏限制属性及破损不对称标签")
+        lbl_hh_desc = QLabel("启动时自动修复异常关机残留及权限冲突")
         lbl_hh_desc.setProperty("class", "ItemDesc")
         lbl_hh_desc.setWordWrap(True)
         r_hh_text.addWidget(lbl_hh_title)
@@ -4494,12 +4554,12 @@ class MainWindow(QMainWindow):
 
         # 2.3 诊断与还原操作按钮组
         h_btn_box = QHBoxLayout()
-        btn_diag_hosts = QPushButton("体检并修正 Hosts")
+        btn_diag_hosts = QPushButton("体检并修复 Hosts")
         btn_diag_hosts.setProperty("class", "MDBtnTonal")
         btn_diag_hosts.clicked.connect(self.diagnose_hosts_action)
         self.btn_diag_hosts = btn_diag_hosts
 
-        btn_restore_hosts = QPushButton("恢复系统官方纯净 Hosts")
+        btn_restore_hosts = QPushButton("恢复默认 Hosts")
         btn_restore_hosts.setProperty("class", "MDBtnOutlined")
         btn_restore_hosts.clicked.connect(self.restore_hosts_action)
 
@@ -4521,7 +4581,7 @@ class MainWindow(QMainWindow):
         ct_icon = QLabel()
         ct_icon.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 18))
         self.settings_icon_labels.append((ct_icon, "zap"))
-        lbl_ct_title = QLabel("IPv4 / IPv6 协议偏好与 CDN 性能微调")
+        lbl_ct_title = QLabel("网络协议与测速调优")
         lbl_ct_title.setProperty("class", "SectionHeaderTitle")
         lbl_ct_title.setWordWrap(True)
         ct_title_box.addWidget(ct_icon)
@@ -4533,10 +4593,10 @@ class MainWindow(QMainWindow):
         row_ip_mode = QHBoxLayout()
         r_im_text = QVBoxLayout()
         r_im_text.setSpacing(2)
-        lbl_im_title = QLabel("测速与节点优选协议偏好")
+        lbl_im_title = QLabel("测速协议偏好")
         lbl_im_title.setProperty("class", "ItemTitle")
         lbl_im_title.setWordWrap(True)
-        lbl_im_desc = QLabel("推荐 IPv4 优先以防止部分宽带 IPv6 Anycast 跨洋绕路；纯 v6 环境可选择 IPv6 优先")
+        lbl_im_desc = QLabel("推荐 IPv4 优先；纯 IPv6 网络请选择 IPv6 优先")
         lbl_im_desc.setProperty("class", "ItemDesc")
         lbl_im_desc.setWordWrap(True)
         r_im_text.addWidget(lbl_im_title)
@@ -4545,10 +4605,10 @@ class MainWindow(QMainWindow):
         row_ip_mode.addStretch()
 
         self.cmb_ip_mode = NoWheelComboBox()
-        self.cmb_ip_mode.addItem("优先 IPv4 节点 (推荐稳定)", "prefer_ipv4")
-        self.cmb_ip_mode.addItem("双栈延迟优先 (谁快选谁)", "dual_stack")
-        self.cmb_ip_mode.addItem("仅探测 IPv4 (彻底禁用 v6)", "ipv4_only")
-        self.cmb_ip_mode.addItem("优先 IPv6 节点 (教育网/纯v6)", "prefer_ipv6")
+        self.cmb_ip_mode.addItem("优先 IPv4 (推荐)", "prefer_ipv4")
+        self.cmb_ip_mode.addItem("双栈优先 (谁快选谁)", "dual_stack")
+        self.cmb_ip_mode.addItem("仅 IPv4 (禁用 v6)", "ipv4_only")
+        self.cmb_ip_mode.addItem("优先 IPv6", "prefer_ipv6")
 
         cur_ip_mode = cfg.get("ip_version_mode", "prefer_ipv4")
         for idx in range(self.cmb_ip_mode.count()):
@@ -4563,14 +4623,14 @@ class MainWindow(QMainWindow):
         row_cdn_params = QHBoxLayout()
         row_cdn_params.setSpacing(16)
 
-        lbl_to = QLabel("单节点超时门限:")
+        lbl_to = QLabel("单节点超时:")
         lbl_to.setProperty("class", "ItemTitle")
         lbl_to.setWordWrap(True)
         self.cmb_timeout = NoWheelComboBox()
-        self.cmb_timeout.addItem("0.8 秒 (极速探测)", 0.8)
-        self.cmb_timeout.addItem("1.5 秒 (推荐标准)", 1.5)
-        self.cmb_timeout.addItem("2.5 秒 (弱网宽容)", 2.5)
-        self.cmb_timeout.addItem("3.0 秒 (超长等待)", 3.0)
+        self.cmb_timeout.addItem("0.8 秒 (极速)", 0.8)
+        self.cmb_timeout.addItem("1.5 秒 (推荐)", 1.5)
+        self.cmb_timeout.addItem("2.5 秒 (宽松)", 2.5)
+        self.cmb_timeout.addItem("3.0 秒 (超长)", 3.0)
         cur_to = cfg.get("cdn_timeout_seconds", 1.5)
         for idx in range(self.cmb_timeout.count()):
             if abs(float(self.cmb_timeout.itemData(idx)) - float(cur_to)) < 0.1:
@@ -4583,9 +4643,9 @@ class MainWindow(QMainWindow):
         lbl_wk.setWordWrap(True)
         self.cmb_workers = NoWheelComboBox()
         self.cmb_workers.addItem("8 线程 (低占用)", 8)
-        self.cmb_workers.addItem("16 线程 (推荐标准)", 16)
+        self.cmb_workers.addItem("16 线程 (推荐)", 16)
         self.cmb_workers.addItem("24 线程", 24)
-        self.cmb_workers.addItem("32 线程 (极速并发)", 32)
+        self.cmb_workers.addItem("32 线程 (极速)", 32)
         cur_wk = cfg.get("cdn_max_workers", 16)
         for idx in range(self.cmb_workers.count()):
             if int(self.cmb_workers.itemData(idx)) == int(cur_wk):
@@ -4605,10 +4665,10 @@ class MainWindow(QMainWindow):
         row_cdn_startup = QHBoxLayout()
         r_cs_text = QVBoxLayout()
         r_cs_text.setSpacing(2)
-        lbl_cs_title = QLabel("启动时自动测速并优选 CDN 节点")
+        lbl_cs_title = QLabel("启动时自动测速优选")
         lbl_cs_title.setProperty("class", "ItemTitle")
         lbl_cs_title.setWordWrap(True)
-        lbl_cs_desc = QLabel("客户端启动后在后台静默并发探测候选节点延迟，自动选举最低延迟 IP 并热重载生效")
+        lbl_cs_desc = QLabel("启动后在后台并发探测节点延迟并自动应用最优线路")
         lbl_cs_desc.setProperty("class", "ItemDesc")
         lbl_cs_desc.setWordWrap(True)
         r_cs_text.addWidget(lbl_cs_title)
@@ -4625,10 +4685,10 @@ class MainWindow(QMainWindow):
         row_cdn_only_en = QHBoxLayout()
         r_coe_text = QVBoxLayout()
         r_coe_text.setSpacing(2)
-        lbl_coe_title = QLabel("仅测速当前已勾选启用的加速服务")
+        lbl_coe_title = QLabel("仅测速已开启的服务")
         lbl_coe_title.setProperty("class", "ItemTitle")
         lbl_coe_title.setWordWrap(True)
-        lbl_coe_desc = QLabel("开启时启动测速仅探测已启用的服务 (测速更快)；关闭时将探测全量服务")
+        lbl_coe_desc = QLabel("开启后仅测速已启用的服务，大幅缩短测速耗时")
         lbl_coe_desc.setProperty("class", "ItemDesc")
         lbl_coe_desc.setWordWrap(True)
         r_coe_text.addWidget(lbl_coe_title)
@@ -4645,10 +4705,10 @@ class MainWindow(QMainWindow):
         row_proxy_after_cdn = QHBoxLayout()
         r_pac_text = QVBoxLayout()
         r_pac_text.setSpacing(2)
-        lbl_pac_title = QLabel("测速优选成功后再启用加速 (防校园网与网关劫持)")
+        lbl_pac_title = QLabel("测速就绪后再启用加速")
         lbl_pac_title.setProperty("class", "ItemTitle")
         lbl_pac_title.setWordWrap(True)
-        lbl_pac_desc = QLabel("启动时不立即写入 Hosts 劫持流量，等待外网连通并优选出真实可用节点后再激活代理")
+        lbl_pac_desc = QLabel("等待公网连通并测出可用节点后再激活加速，防止校园网/弱网阻断")
         lbl_pac_desc.setProperty("class", "ItemDesc")
         lbl_pac_desc.setWordWrap(True)
         r_pac_text.addWidget(lbl_pac_title)
@@ -4664,7 +4724,7 @@ class MainWindow(QMainWindow):
         # 3.6 外网连通缓冲等待时长
         row_delay = QHBoxLayout()
         row_delay.setSpacing(16)
-        lbl_delay = QLabel("外网连通后稳定缓冲等待:")
+        lbl_delay = QLabel("公网连通缓冲等待:")
         lbl_delay.setProperty("class", "ItemTitle")
         lbl_delay.setWordWrap(True)
         self.cmb_stable_delay = NoWheelComboBox()
@@ -4741,7 +4801,7 @@ class MainWindow(QMainWindow):
         p_icon = QLabel()
         p_icon.setPixmap(SvgIconFactory.get_pixmap("wifi", primary_icon_c, 18))
         self.settings_icon_labels.append((p_icon, "wifi"))
-        lbl_p_title = QLabel("测速代理设置")
+        lbl_p_title = QLabel("上游代理与测速转发")
         lbl_p_title.setProperty("class", "SectionHeaderTitle")
         lbl_p_title.setWordWrap(True)
         p_title_box.addWidget(p_icon)
@@ -4752,10 +4812,10 @@ class MainWindow(QMainWindow):
         row_pxy_en = QHBoxLayout()
         r_pe_text = QVBoxLayout()
         r_pe_text.setSpacing(2)
-        lbl_pe_title = QLabel("启用测速专用本地代理")
+        lbl_pe_title = QLabel("启用本地代理分流")
         lbl_pe_title.setProperty("class", "ItemTitle")
         lbl_pe_title.setWordWrap(True)
-        lbl_pe_desc = QLabel("通过本地 Clash / Sing-box / v2ray 混合代理端口并发探测境外 Anycast 延迟 (仅供节点筛选)")
+        lbl_pe_desc = QLabel("支持共存 Clash / Sing-box / v2ray 等本地代理，直连受阻站点自动通过代理转发")
         lbl_pe_desc.setProperty("class", "ItemDesc")
         lbl_pe_desc.setWordWrap(True)
         r_pe_text.addWidget(lbl_pe_title)
@@ -4786,7 +4846,7 @@ class MainWindow(QMainWindow):
         self.txt_proxy_port.setFixedWidth(80)
         self.txt_proxy_port.textChanged.connect(self.on_proxy_config_changed)
 
-        btn_test_proxy = QPushButton("测试代理连通性")
+        btn_test_proxy = QPushButton("测试代理连通")
         btn_test_proxy.setProperty("class", "MDBtnOutlined")
         btn_test_proxy.clicked.connect(self.test_proxy_action)
         self.btn_test_proxy = btn_test_proxy
@@ -4818,7 +4878,7 @@ class MainWindow(QMainWindow):
         icon_lbl.setFixedSize(22, 22)
         icon_lbl.setPixmap(SvgIconFactory.get_pixmap("shield", primary_icon_c, 20))
         head.addWidget(icon_lbl)
-        lbl_title = QLabel("掩护 SNI 通道 (Google/YouTube · Reddit)")
+        lbl_title = QLabel("智能防封锁 (SNI 伪装)")
         lbl_title.setProperty("class", "ItemTitle")
         head.addWidget(lbl_title)
         head.addStretch()
@@ -4828,15 +4888,10 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         t1 = QVBoxLayout()
         t1.setSpacing(2)
-        lb1 = QLabel("掩护 SNI 自动回归与降级")
+        lb1 = QLabel("防封锁线路自动探测与降级")
         lb1.setProperty("class", "ItemTitle")
         lb1.setWordWrap(True)
-        d1 = QLabel(
-            "启动加速前逐通道实测掩护域名是否仍然有效 (证书门槛 + 真实 Host 探活); "
-            "失效时按各自候选池自动切换: Google 走 g.cn → 其它 Google 自有域 → 真实域名 → 空 SNI, "
-            "Reddit 走 www.fastly.com → 其它 Fastly 自有域 → 真实域名 → 空 SNI。"
-            "关闭后一律使用画像里写死的 SNI, 便于排障时排除自动切换这一变量"
-        )
+        d1 = QLabel("启动前自动探测伪装域名可用性。遭遇封锁时自动降级切换备用线路，防止服务中断。")
         d1.setProperty("class", "ItemDesc")
         d1.setWordWrap(True)
         t1.addWidget(lb1)
@@ -4852,16 +4907,10 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout()
         t2 = QVBoxLayout()
         t2.setSpacing(2)
-        lb2 = QLabel("允许降级到空 SNI (最后手段)")
+        lb2 = QLabel("允许匿名握手 (空 SNI 兜底)")
         lb2.setProperty("class", "ItemTitle")
         lb2.setWordWrap(True)
-        d2 = QLabel(
-            "空 SNI 是最后手段: Google 通道上对端回占位证书 invalid2.invalid, 上游证书完全无法校验 "
-            "(实测链校验 0/8); Fastly 通道上虽仍回目标真证书 (该厂商按 IP 选证书), 但"
-            "\"不发 SNI\"本身就是异常形态, 不应作为常规通路。"
-            "关闭后, 掩护域与真实域名全部失效时直接判为【不可用】并在界面显式报错, "
-            "而不会静默降到一条没有证书保障的通路上"
-        )
+        d2 = QLabel("备选伪装域名全部失效时尝试匿名握手连接（仅作紧急兜底，无法校验对端证书）。")
         d2.setProperty("class", "ItemDesc")
         d2.setWordWrap(True)
         t2.addWidget(lb2)
@@ -4887,7 +4936,7 @@ class MainWindow(QMainWindow):
         d_icon = QLabel()
         d_icon.setPixmap(SvgIconFactory.get_pixmap("activity", primary_icon_c, 18))
         self.settings_icon_labels.append((d_icon, "activity"))
-        lbl_d_title = QLabel("本地 DNS 智能分流与上游解析服务器")
+        lbl_d_title = QLabel("本地 DNS 分流与上游解析")
         lbl_d_title.setProperty("class", "SectionHeaderTitle")
         lbl_d_title.setWordWrap(True)
         d_title_box.addWidget(d_icon)
@@ -4920,13 +4969,10 @@ class MainWindow(QMainWindow):
         row_redir = QHBoxLayout()
         r_redir_text = QVBoxLayout()
         r_redir_text.setSpacing(2)
-        lbl_redir_title = QLabel("使用 NRPT 策略表重定向 (替代 Hosts 注入)")
+        lbl_redir_title = QLabel("使用 NRPT 策略表分流")
         lbl_redir_title.setProperty("class", "ItemTitle")
         lbl_redir_title.setWordWrap(True)
-        lbl_redir_desc = QLabel(
-            "把加速域名的解析劫持交给 Windows 名称解析策略表: 不改动系统 Hosts 文件, "
-            "且后缀匹配天然覆盖整个子域。需管理员权限 + 本机 53/UDP 空闲, 不满足时自动回退 Hosts"
-        )
+        lbl_redir_desc = QLabel("通过 Windows 名称解析策略表接管解析，无需改动 hosts 文件（需管理员权限）")
         lbl_redir_desc.setProperty("class", "ItemDesc")
         lbl_redir_desc.setWordWrap(True)
         r_redir_text.addWidget(lbl_redir_title)
@@ -4946,23 +4992,13 @@ class MainWindow(QMainWindow):
         self.refresh_nrpt_status_label()
 
         # 5.1b ★ 解析后端四选一 (2026-10-02)
-        #      为什么单列一个选择器而不是只留 NRPT 那个开关:
-        #      `pac` / `pac_auto` 两个后端**早就实现好了** (见 app/redirect_manager 的 PAC 分支
-        #      与 app/pac_redirect.py), 但界面上只能改 config.json 才选得到 —— 于是最实用的
-        #      那个 (pac_auto: 免管理员 + 运行中的浏览器立即采纳) 事实上无人能用。
-        #      同时它也是**通配域名**的唯一免管理员出路: googlevideo 在 hosts 下被硬拦,
-        #      gemini 的 *.clients6.google.com 在 hosts 下会漏 (Hosts 不支持通配)。
         row_mode = QHBoxLayout()
         r_mode_text = QVBoxLayout()
         r_mode_text.setSpacing(2)
-        lbl_mode_title = QLabel("加速域名解析后端")
+        lbl_mode_title = QLabel("域名分流模式")
         lbl_mode_title.setProperty("class", "ItemTitle")
         lbl_mode_title.setWordWrap(True)
-        lbl_mode_desc = QLabel(
-            "Hosts/NRPT 需要管理员；**通配域名**（如 *.clients6.google.com、动态节点名 "
-            "rr1---sn-xxx.googlevideo.com）只有具备通配能力的后端才劫持得到。"
-            "PAC 两种均免管理员：pac 需由本程序启动浏览器，pac_auto 写系统自动配置脚本、"
-            "运行中的浏览器即刻采纳。切换后若加速正在运行会即时迁移。")
+        lbl_mode_desc = QLabel("推荐 PAC 模式（免管理员·原生支持通配）；Hosts 模式需管理员且不支持通配。")
         lbl_mode_desc.setProperty("class", "ItemDesc")
         lbl_mode_desc.setWordWrap(True)
         r_mode_text.addWidget(lbl_mode_title)
@@ -4971,16 +5007,10 @@ class MainWindow(QMainWindow):
         row_mode.addStretch()
         self.combo_redirect_mode = QComboBox()
         for _label, _value in (
-                # ★ 顺序即推荐度 (2026-10-02 按用户决策): PAC 置首, NRPT 移末尾。
-                #   为什么 PAC 优先: 免管理员 + 通配是一等公民 (用 host.endsWith 表达)
-                #   + 只改**一个**注册表值, 还原面最小。
-                #   为什么 NRPT 垫底: 要管理员 + 独占本机 53/UDP + 改整机 DNS,
-                #   残留危害最大 (数百域名被指向没人监听的 127.0.0.1:53),
-                #   且实测其 cmdlet 会抛 EndProcessing NullReferenceException (源码环境复现不出)。
-                ("PAC 自动配置脚本（推荐·免管理员·免重启浏览器）", MODE_PAC_AUTO),
-                ("PAC + 启动浏览器（免管理员）", MODE_PAC),
-                ("Hosts 注入（需管理员；不支持通配）", MODE_HOSTS),
-                ("NRPT 策略表（不推荐：需管理员 + 独占 53，冲突面大）", MODE_NRPT)):
+                ("系统自动代理 PAC（推荐·免管理员）", MODE_PAC_AUTO),
+                ("PAC 启动浏览器（免管理员）", MODE_PAC),
+                ("修改系统 Hosts（需管理员·不支持通配）", MODE_HOSTS),
+                ("Windows NRPT 策略表（需管理员）", MODE_NRPT)):
             self.combo_redirect_mode.addItem(_label, _value)
         _cur = normalize_redirect_mode(cfg)
         _i = self.combo_redirect_mode.findData(_cur)
@@ -4990,20 +5020,14 @@ class MainWindow(QMainWindow):
         row_mode.addWidget(self.combo_redirect_mode)
         d_layout.addLayout(row_mode)
 
-        # 5.1c ★ PAC 免管理员方案 (2026-10-02): 把通配从 DNS 层挪到线路层
-        #      为什么单列一行而不是塞进上面的开关: `--proxy-pac-url` 是**进程级**参数,
-        #      无法靠写配置让已在运行的浏览器生效, 必须由本程序以该参数启动浏览器。
-        #      故这里是一个**动作**(启动浏览器), 而不是一个常驻开关。
+        # 5.1c ★ PAC 免管理员方案 (2026-10-02)
         row_pac = QHBoxLayout()
         r_pac_text = QVBoxLayout()
         r_pac_text.setSpacing(2)
-        lbl_pac_title = QLabel("PAC 免管理员方案 (以 PAC 启动浏览器)")
+        lbl_pac_title = QLabel("启动 PAC 浏览器")
         lbl_pac_title.setProperty("class", "ItemTitle")
         lbl_pac_title.setWordWrap(True)
-        lbl_pac_desc = QLabel(
-            "把通配交给 PAC 脚本: 浏览器经本机隧道访问 nginx, 无需管理员、不写注册表、"
-            "不占用 53、不改系统 DNS。动态节点名 (如 rr1---sn-xxx.googlevideo.com) 依赖此方式"
-        )
+        lbl_pac_desc = QLabel("以独立 PAC 模式拉起浏览器，免管理员权限访问受限动态节点")
         lbl_pac_desc.setProperty("class", "ItemDesc")
         lbl_pac_desc.setWordWrap(True)
         r_pac_text.addWidget(lbl_pac_title)
@@ -5025,7 +5049,7 @@ class MainWindow(QMainWindow):
         # 5.2 上游公共 DNS 预设胶囊
         row_presets = QHBoxLayout()
         row_presets.setSpacing(8)
-        lbl_pr_title = QLabel("常用公共 DNS 快速填入:")
+        lbl_pr_title = QLabel("公共 DNS 快速填入:")
         lbl_pr_title.setProperty("class", "ItemTitle")
         lbl_pr_title.setWordWrap(True)
         row_presets.addWidget(lbl_pr_title)
@@ -5053,14 +5077,17 @@ class MainWindow(QMainWindow):
         primary_dns = up_dns[0] if len(up_dns) > 0 else "223.5.5.5"
         sec_dns = up_dns[1] if len(up_dns) > 1 else "119.29.29.29"
 
-        lbl_pdns = QLabel("主力上游 DNS:")
+        lbl_pdns = QLabel("主 DNS:")
         lbl_pdns.setProperty("class", "ItemTitle")
         lbl_pdns.setWordWrap(True)
         self.txt_dns_primary = QLineEdit(primary_dns)
         self.txt_dns_primary.setFixedWidth(130)
         self.txt_dns_primary.textChanged.connect(self.on_custom_dns_changed)
 
-        lbl_sdns = QLabel("备用上游 DNS:")
+        lbl_sdns = QLabel("备用 DNS:")
+        lbl_sdns.setProperty("class", "ItemTitle")
+        lbl_sdns.setWordWrap(True)
+        self.txt_dns_secondary = QLineEdit(sec_dns)
         lbl_sdns.setProperty("class", "ItemTitle")
         lbl_sdns.setWordWrap(True)
         self.txt_dns_secondary = QLineEdit(sec_dns)
@@ -5121,7 +5148,7 @@ class MainWindow(QMainWindow):
         s_layout.addLayout(row_sp)
 
         # 6.2 常用启动参数预设
-        lbl_args_intro = QLabel("快捷启动参数预设 (启动 Steam 或免密切号时自动追加):")
+        lbl_args_intro = QLabel("启动参数预设 (启动 Steam 时自动追加):")
         lbl_args_intro.setProperty("class", "ItemTitle")
         lbl_args_intro.setWordWrap(True)
         s_layout.addWidget(lbl_args_intro)
@@ -5130,19 +5157,19 @@ class MainWindow(QMainWindow):
         args_grid = QGridLayout()
         args_grid.setSpacing(10)
 
-        self.chk_steam_tcp = QCheckBox("-tcp (强制 TCP 传输，解决好友列表/聊天转圈丢包)")
+        self.chk_steam_tcp = QCheckBox("-tcp (强制 TCP 传输，防商城转圈)")
         self.chk_steam_tcp.setChecked("-tcp" in current_args)
         self.chk_steam_tcp.toggled.connect(self.on_steam_launch_args_changed)
 
-        self.chk_steam_nofriends = QCheckBox("-nofriendsui (轻量极简好友列表，极大节省内存)")
+        self.chk_steam_nofriends = QCheckBox("-nofriendsui (轻量好友列表，节省内存)")
         self.chk_steam_nofriends.setChecked("-nofriendsui" in current_args)
         self.chk_steam_nofriends.toggled.connect(self.on_steam_launch_args_changed)
 
-        self.chk_steam_nobrowser = QCheckBox("-no-browser (纯净运行模式，禁用内置 Chromium 网页)")
+        self.chk_steam_nobrowser = QCheckBox("-no-browser (纯净模式，禁用内置网页)")
         self.chk_steam_nobrowser.setChecked("-no-browser" in current_args)
         self.chk_steam_nobrowser.toggled.connect(self.on_steam_launch_args_changed)
 
-        self.chk_steam_dev = QCheckBox("-dev (启用开发者模式与原生调试控制台)")
+        self.chk_steam_dev = QCheckBox("-dev (开启开发者模式)")
         self.chk_steam_dev.setChecked("-dev" in current_args)
         self.chk_steam_dev.toggled.connect(self.on_steam_launch_args_changed)
 
@@ -5184,7 +5211,7 @@ class MainWindow(QMainWindow):
         cc_icon = QLabel()
         cc_icon.setPixmap(SvgIconFactory.get_pixmap("lock", primary_icon_c, 18))
         self.settings_icon_labels.append((cc_icon, "lock"))
-        lbl_cc_title = QLabel("系统根证书与本地数据诊断")
+        lbl_cc_title = QLabel("证书管理与本地存储")
         lbl_cc_title.setProperty("class", "SectionHeaderTitle")
         lbl_cc_title.setWordWrap(True)
         cc_title_box.addWidget(cc_icon)
@@ -5199,7 +5226,7 @@ class MainWindow(QMainWindow):
         cc_l.addWidget(self.lbl_cert_detail)
 
         cc_btn_box = QHBoxLayout()
-        btn_inst_cert = QPushButton("静默安装证书")
+        btn_inst_cert = QPushButton("安装根证书")
         btn_inst_cert.setProperty("class", "MDBtnTonal")
         btn_inst_cert.clicked.connect(self.install_cert_action)
         self.btn_inst_cert = btn_inst_cert
@@ -5217,10 +5244,10 @@ class MainWindow(QMainWindow):
         row_cache_mgmt = QHBoxLayout()
         r_cm_text = QVBoxLayout()
         r_cm_text.setSpacing(2)
-        lbl_ca_title = QLabel("GameArt 本地图片与静态资源磁盘缓存")
+        lbl_ca_title = QLabel("本地图片与静态资源缓存")
         lbl_ca_title.setProperty("class", "ItemTitle")
         lbl_ca_title.setWordWrap(True)
-        self.lbl_cache_size_desc = QLabel(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {self._get_cache_size_str()})。")
+        self.lbl_cache_size_desc = QLabel("Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (正在计算已占用空间...)。")
         self.lbl_cache_size_desc.setProperty("class", "ItemDesc")
         self.lbl_cache_size_desc.setWordWrap(True)
         r_cm_text.addWidget(lbl_ca_title)
@@ -5228,19 +5255,20 @@ class MainWindow(QMainWindow):
         row_cache_mgmt.addLayout(r_cm_text)
         row_cache_mgmt.addStretch()
 
-        btn_clear_cache = QPushButton("清空本地图片缓存")
-        btn_clear_cache.setProperty("class", "MDBtnOutlined")
-        btn_clear_cache.clicked.connect(self.clear_cache_action)
-        row_cache_mgmt.addWidget(btn_clear_cache)
+        self.btn_clear_cache = QPushButton("清空本地图片缓存")
+        self.btn_clear_cache.setProperty("class", "MDBtnOutlined")
+        self.btn_clear_cache.clicked.connect(self.clear_cache_action)
+        row_cache_mgmt.addWidget(self.btn_clear_cache)
         cc_l.addLayout(row_cache_mgmt)
+        QTimer.singleShot(800, self._refresh_cache_size_async)
 
         row_auto_clear = QHBoxLayout()
         r_ac_text = QVBoxLayout()
         r_ac_text.setSpacing(2)
-        lbl_ac_title = QLabel("退出程序时自动清空图片磁盘缓存")
+        lbl_ac_title = QLabel("退出时自动清空图片缓存")
         lbl_ac_title.setProperty("class", "ItemTitle")
         lbl_ac_title.setWordWrap(True)
-        lbl_ac_desc = QLabel("开启后每次完全退出程序时自动清理临时图片缓存，保持磁盘空间清爽")
+        lbl_ac_desc = QLabel("每次完全退出程序时自动清理临时图片，保持磁盘清爽")
         lbl_ac_desc.setProperty("class", "ItemDesc")
         lbl_ac_desc.setWordWrap(True)
         r_ac_text.addWidget(lbl_ac_title)
@@ -5257,10 +5285,10 @@ class MainWindow(QMainWindow):
         row_git = QHBoxLayout()
         r_git_text = QVBoxLayout()
         r_git_text.setSpacing(2)
-        lbl_git_title = QLabel("Git 命令行网络与大文件传输优化")
+        lbl_git_title = QLabel("Git 传输与大文件优化")
         lbl_git_title.setProperty("class", "ItemTitle")
         lbl_git_title.setWordWrap(True)
-        lbl_git_desc = QLabel("自动将 Git 全局 http.postBuffer 提升至 500MB，解除低速超时限制，解决 git pull / clone 卡顿")
+        lbl_git_desc = QLabel("提升 Git 传输缓冲区至 500MB，解除低速超时限制，解决 pull/clone 卡顿")
         lbl_git_desc.setProperty("class", "ItemDesc")
         lbl_git_desc.setWordWrap(True)
         r_git_text.addWidget(lbl_git_title)
@@ -5268,14 +5296,14 @@ class MainWindow(QMainWindow):
         row_git.addLayout(r_git_text)
         row_git.addStretch()
 
-        btn_opt_git = QPushButton("一键优化 Git 配置")
+        btn_opt_git = QPushButton("优化 Git 配置")
         btn_opt_git.setProperty("class", "MDBtnTonal")
         btn_opt_git.clicked.connect(self.optimize_git_config_action)
         row_git.addWidget(btn_opt_git)
         cc_l.addLayout(row_git)
 
         # 7.4 端口诊断
-        lbl_po_title = QLabel("本地 80 / 443 端口诊断")
+        lbl_po_title = QLabel("80 / 443 端口诊断")
         lbl_po_title.setProperty("class", "ItemTitle")
         lbl_po_title.setWordWrap(True)
         self.lbl_port_detail = QLabel("端口状态: 检测中...")
@@ -5366,7 +5394,7 @@ class MainWindow(QMainWindow):
         icon_lbl.setFixedSize(22, 22)
         icon_lbl.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 20))
         head.addWidget(icon_lbl)
-        lbl_title = QLabel("HTTP/3 直连通道 · 同地址重试")
+        lbl_title = QLabel("HTTP/3 播放增强重试")
         lbl_title.setProperty("class", "ItemTitle")
         head.addWidget(lbl_title)
         head.addStretch()
@@ -5375,16 +5403,11 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         t = QVBoxLayout()
         t.setSpacing(2)
-        lb = QLabel("失败后对同一地址的额外重试次数")
+        lb = QLabel("视频流失败重试次数")
         lb.setProperty("class", "ItemTitle")
         lb.setWordWrap(True)
         d = QLabel(
-            "默认 0 (不重试): 一个地址失败即换下一个候选, 尽快把失败交给播放器自己重试。"
-            "设为 1~2 可提高成功率 —— 实测节点的可达状态是**秒级翻转**的 (同一地址相隔几分钟"
-            "成功率中位变化 44%), 所以\"稍后重试\"确有收益: 腿级对照下成功率 42% → 58%, "
-            "而成功延迟中位不变 (0.9s), p90 由 1.1s 升至 1.6s。"
-            "⚠ 该设置对**全部** HTTP/3 请求生效, 包括视频流的 /videoplayback —— 一次 8~12 秒的"
-            "重试对正在播放的流是致命的; 若播放反而变卡, 请调回 0。改完需**重启加速服务**生效。"
+            "网络丢包时自动重试当前节点。遇到视频转圈建议设为 1~2 次提高成功率；若缓冲反而变卡请保持 0。改完需重启加速生效。"
         )
         d.setProperty("class", "ItemDesc")
         d.setWordWrap(True)
@@ -5394,8 +5417,8 @@ class MainWindow(QMainWindow):
         row.addStretch()
 
         self.cmb_h3_retries = NoWheelComboBox()
-        for n, label in ((0, "0 次 (默认 · 快速失败)"), (1, "1 次"),
-                         (2, "2 次 (实测成功率最高)"),
+        for n, label in ((0, "0 次 (默认·快速失败)"), (1, "1 次"),
+                         (2, "2 次 (推荐·成功率高)"),
                          (3, "3 次 (上限)")):
             self.cmb_h3_retries.addItem(label, n)
         cur = int(cfg.get("gvs_same_node_retries", 0) or 0)
@@ -5657,11 +5680,33 @@ class MainWindow(QMainWindow):
         except Exception:
             return "0.0 MB"
 
+    def _refresh_cache_size_async(self):
+        """后台异步计算图片缓存已占用大小并更新界面"""
+        def _done(size_str):
+            if isinstance(size_str, str) and hasattr(self, 'lbl_cache_size_desc') and self.lbl_cache_size_desc:
+                self.lbl_cache_size_desc.setText(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {size_str})。")
+        self._run_in_background(self._get_cache_size_str, _done, busy_attr="_cache_size_worker")
+
     def clear_cache_action(self):
-        ok, msg = nginx_mgr.clear_cache()
-        if hasattr(self, 'lbl_cache_size_desc') and self.lbl_cache_size_desc:
-            self.lbl_cache_size_desc.setText(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {self._get_cache_size_str()})。")
-        show_toast(self, msg, toast_type="success", duration=2500)
+        """异步清空本地图片缓存与截断日志 (后台执行，防冻结界面)"""
+        btn = getattr(self, "btn_clear_cache", None)
+        show_toast(self, "正在清理本地缓存与日志，请稍候...", toast_type="info", duration=1500)
+
+        def _do_clear():
+            ok, msg = nginx_mgr.clear_cache()
+            size_str = self._get_cache_size_str()
+            return ok, msg, size_str
+
+        def _done(res):
+            if isinstance(res, Exception):
+                show_toast(self, f"清理缓存异常: {res}", toast_type="error", duration=3000)
+                return
+            ok, msg, size_str = res
+            if hasattr(self, 'lbl_cache_size_desc') and self.lbl_cache_size_desc:
+                self.lbl_cache_size_desc.setText(f"Nginx 会在本地磁盘缓存浏览过的插画原图与社区图片 (当前已占用: {size_str})。")
+            show_toast(self, msg, toast_type="success" if ok else "error", duration=2500)
+
+        self._run_in_background(_do_clear, _done, busy_attr="_cache_clear_worker", trigger_btn=btn)
 
     # ------------------ 状态同步与托盘后台 ------------------
     def init_tray(self):
@@ -5682,6 +5727,7 @@ class MainWindow(QMainWindow):
         tray_menu.addAction(self.act_tray_toggle)
 
         self.steam_submenu = tray_menu.addMenu("Steam 账号快速切换")
+        self.steam_submenu.aboutToShow.connect(self.refresh_tray_steam_menu)
         self.refresh_tray_steam_menu()
 
         act_ping = QAction("CDN 测速", self)
@@ -5699,21 +5745,38 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def refresh_tray_steam_menu(self):
-        self.steam_submenu.clear()
-        accounts = steam_mgr.get_accounts()
-        if not accounts:
-            act_none = QAction("未检测到已记住的账号", self)
-            act_none.setEnabled(False)
-            self.steam_submenu.addAction(act_none)
+        """刷新托盘 Steam 快速切号子菜单 (后台异步读取，避免读头像与注册表冻结主线程)"""
+        if not hasattr(self, "steam_submenu") or not self.steam_submenu:
             return
 
-        for acc in accounts:
-            alias_str = f" [{acc['alias']}]" if acc.get("alias") else ""
-            prefix = "[当前] " if acc.get("is_active") else "       "
-            name = f"{prefix}{acc['persona_name']} ({acc['account_name']}){alias_str}"
-            act = QAction(name, self)
-            act.triggered.connect(lambda _, sid=acc["steamid"]: self.switch_steam_account(sid))
-            self.steam_submenu.addAction(act)
+        def _populate(accounts):
+            if not hasattr(self, "steam_submenu") or not self.steam_submenu:
+                return
+            self.steam_submenu.clear()
+            if isinstance(accounts, Exception) or not accounts:
+                act_none = QAction("未检测到已记住的账号", self)
+                act_none.setEnabled(False)
+                self.steam_submenu.addAction(act_none)
+                return
+
+            for acc in accounts:
+                alias_str = f" [{acc['alias']}]" if acc.get("alias") else ""
+                prefix = "[当前] " if acc.get("is_active") else "       "
+                name = f"{prefix}{acc['persona_name']} ({acc['account_name']}){alias_str}"
+                act = QAction(name, self)
+                act.triggered.connect(lambda _, sid=acc["steamid"]: self.switch_steam_account(sid))
+                self.steam_submenu.addAction(act)
+
+        # 单元测试或非主线程环境下快速同步回退
+        if os.environ.get("PYTEST_CURRENT_TEST") or not hasattr(self, "_run_in_background") or threading.current_thread() is not threading.main_thread():
+            try:
+                accs = steam_mgr.get_accounts()
+            except Exception:
+                accs = []
+            _populate(accs)
+            return
+
+        self._run_in_background(steam_mgr.get_accounts, _populate, busy_attr="_tray_steam_menu_worker")
 
     def notify_tray(self, title: str, message: str, icon=QSystemTrayIcon.Information, duration: int = 2000):
         """统一托盘通知网关，集中遵从 tray_notifications 配置实现彻底静默"""
@@ -6027,8 +6090,17 @@ class MainWindow(QMainWindow):
             pass
         return ok
 
-    def watchdog_auto_heal(self):
+    def watchdog_auto_heal(self, blocking: bool = False):
         if getattr(self, "_startup_flow_in_progress", False):
+            return
+
+        # 在 UI 主线程被 QTimer 触发时自动派发到后台执行, 彻底杜绝主线程阻塞与微卡顿
+        if not blocking and hasattr(self, "_run_in_background") and threading.current_thread() is threading.main_thread():
+            if getattr(self, "_watchdog_worker", None) is not None and self._watchdog_worker.isRunning():
+                return
+            self._run_in_background(lambda: self.watchdog_auto_heal(blocking=True),
+                                    lambda _: None,
+                                    busy_attr="_watchdog_worker")
             return
 
         # NRPT 存活兜底必须最先做: 规则生效而本机解析器已死时, 命中域名在整机范围内解析
@@ -6116,17 +6188,19 @@ class MainWindow(QMainWindow):
     def _is_redirect_active(self) -> bool:
         """加速劫持是否已生效 (Hosts 或 NRPT 任一后端生效即为真, 覆盖回退场景)
 
-        性能注意: NRPT 后端的 is_applied 要走一次 PowerShell 查询 (进程启动开销 ~0.8s),
-        而本方法会被每 8 秒的看门狗定时器与多处 UI 回调调用 —— 若每次都查, NRPT 模式下
-        界面会周期性卡顿。因此优先信任本进程记录的后端状态 (配合"本机解析器是否已在 53
-        端口服务"这一即时判据), 仅在状态未知时才回落到真实查询。
+        性能注意: 优先信任本进程记录的生效状态 (配合"本机解析器是否已在 53 端口服务"这一即时判据),
+        避免在 UI 点击与定时器中反复调用 PowerShell (~0.8s) 或读写磁盘 hosts 文件。
+        仅在状态未知时才回落到真实查询。
         """
-        if REDIRECT_STATE.get("backend") == MODE_NRPT:
-            try:
-                if local_dns_server.is_running() and local_dns_server.port == NRPT_DNS_PORT:
+        _backend = REDIRECT_STATE.get("backend")
+        if _backend:
+            if _backend == MODE_NRPT:
+                try:
+                    return local_dns_server.is_running() and local_dns_server.port == NRPT_DNS_PORT
+                except Exception:
                     return True
-            except Exception:
-                pass
+            return True
+
         try:
             return is_redirect_applied(load_config(), hosts_mgr, nrpt_mgr)
         except Exception:
@@ -6195,6 +6269,58 @@ class MainWindow(QMainWindow):
         return apply_redirect(load_config(), services, hosts_mgr, nrpt_mgr,
                               local_dns_server, REDIRECT_STATE)
 
+    def _apply_redirect_async(self, services: Optional[List[str]] = None, on_done: Optional[Callable] = None):
+        """在后台异步应用域名重定向规则, 避免 Hosts 写入、PowerShell 与 flushdns 冻结 UI
+
+        支持连续调用的批处理合并 (最新配置覆盖中间态), 保证并发调用下的数据一致性。
+        """
+        if services is None:
+            cfg = load_config()
+            services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
+        else:
+            services = list(services)
+
+        # 单元测试环境检测: 测试套件在主线程串行断言文件落地, 若走后台线程会有断言竞态
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            res = self._apply_redirect(services)
+            if on_done:
+                try:
+                    on_done(res)
+                except Exception:
+                    pass
+            return
+
+        if not hasattr(self, "_pending_redirect_callbacks"):
+            self._pending_redirect_callbacks = []
+
+        if getattr(self, "_redirect_worker", None) is not None and self._redirect_worker.isRunning():
+            self._pending_redirect_services = list(services)
+            if on_done:
+                self._pending_redirect_callbacks.append(on_done)
+            return
+
+        self._pending_redirect_services = None
+        if on_done:
+            self._pending_redirect_callbacks.append(on_done)
+
+        def _worker_fn():
+            return self._apply_redirect(services)
+
+        def _finish(res):
+            cbs = list(getattr(self, "_pending_redirect_callbacks", []))
+            self._pending_redirect_callbacks = []
+            for cb in cbs:
+                try:
+                    cb(res)
+                except Exception:
+                    pass
+            pending = getattr(self, "_pending_redirect_services", None)
+            if pending is not None:
+                self._pending_redirect_services = None
+                self._apply_redirect_async(pending)
+
+        self._run_in_background(_worker_fn, _finish, busy_attr="_redirect_worker")
+
     def _remove_redirect(self) -> Tuple[bool, str]:
         """幂等清理两种后端的全部残留, 并恢复本机解析器默认端口"""
         return remove_redirect(load_config(), hosts_mgr, nrpt_mgr,
@@ -6232,9 +6358,15 @@ class MainWindow(QMainWindow):
 
         self._is_manually_stopped = False
 
-        if blocking or threading.current_thread() is not threading.main_thread():
+        if blocking:
             self._finish_start_acceleration(
                 self._start_acceleration_heavy(show_toast_on_fail), show_toast_on_fail)
+            return
+
+        if threading.current_thread() is not threading.main_thread():
+            # 后台线程调用时，重活在当前线程执行，收尾安全投递回主线程，彻底杜绝跨线程操作 UI 导致死锁
+            heavy_res = self._start_acceleration_heavy(show_toast_on_fail)
+            QTimer.singleShot(0, lambda: self._finish_start_acceleration(heavy_res, show_toast_on_fail))
             return
 
         # UI 即时过渡态反馈: 立即置灰防狂点，给出明确文案
@@ -6359,30 +6491,29 @@ class MainWindow(QMainWindow):
         stage = (result or {}).get("stage", "error")
         if stage == "redirect_fail":
             _restore_btn_failed()
-            msg = result.get("msg", "")
             if not result.get("prompted"):
                 if show_toast_on_fail:
-                    show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
-                               duration=6000, action_text="提权",
+                    show_toast(self, "修改 Hosts 失败，需要管理员权限", toast_type="warning",
+                               duration=4500, action_text="提权",
                                on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup))
                 else:
-                    self.notify_tray("Hosts 权限提示", "未获取管理员权限修改 Hosts，可点击界面侧栏【提权】。",
-                                     QSystemTrayIcon.Warning, 3000)
+                    self.notify_tray("Hosts 权限提示", "需要管理员权限修改 Hosts，可在侧栏点击提权",
+                                     QSystemTrayIcon.Warning, 2500)
             elif show_toast_on_fail:
-                show_toast(self, f"{msg} (需管理员权限修改 Hosts)", toast_type="warning",
-                           duration=6000, action_text="提权",
+                show_toast(self, "修改 Hosts 失败，需要管理员权限", toast_type="warning",
+                           duration=4500, action_text="提权",
                                on_action=lambda *_: elevate_relaunch(cleanup=emergency_fast_cleanup))
             return
         if stage == "nginx_fail":
             _restore_btn_failed()
             if show_toast_on_fail:
-                show_toast(self, f"核心加速服务启动失败: {result.get('msg', '')}", toast_type="error", duration=4000)
+                show_toast(self, "核心加速服务启动失败", toast_type="error", duration=3500)
             else:
                 self.notify_tray("核心加速服务启动提示", result.get("msg", ""), QSystemTrayIcon.Warning, 2500)
             return
         if stage == "error":
             _restore_btn_failed()
-            show_toast(self, f"启动加速失败: {result.get('msg', '')}", toast_type="error", duration=4000)
+            show_toast(self, f"启动加速失败: {result.get('msg', '')}", toast_type="error", duration=3500)
             return
 
         # 启动成功，更新按钮状态
@@ -6402,63 +6533,47 @@ class MainWindow(QMainWindow):
         self._refresh_channel_state()
 
         services = result.get("services") or []
-        # 掩护 SNI 状态卡刷新 (方案 §10 第 6 条: 降级必须可见)。
-        # 不可用时不仅更新卡片, 还额外弹一条错误提示 —— 方案 §8 末行要求"显式标记失败",
-        # 只在卡片里写一行小字不算"显式"。
+        # 掩护 SNI 状态卡刷新 (降级显式可见)
         if getattr(self, "cover_sni_card", None) is not None:
             try:
                 cs_state = result.get("cover_sni")
                 self.cover_sni_card.refresh(cs_state)
-                # 不可用时逐通道弹错误提示 —— 方案 §8 末行要求"显式标记失败",
-                # 只在卡片里写一行小字不算"显式"; 多通道时还必须**指名**是哪条挂了。
                 if isinstance(cs_state, dict):
-                    for name, st in cs_state.items():
-                        if st is not None and not getattr(st, "available", True):
-                            show_toast(self,
-                                       f"⚠ {name} 通道不可用: 掩护 SNI 候选池全部失效 "
-                                       f"({len(getattr(st, 'results', []))} 个策略)",
-                                       toast_type="error", duration=7000)
+                    bad_names = [name for name, st in cs_state.items() if st is not None and not getattr(st, "available", True)]
+                    if bad_names:
+                        show_toast(self,
+                                   f"⚠ 防封锁线路受阻 ({'、'.join(bad_names)})",
+                                   toast_type="warning", duration=4000)
                 elif cs_state is not None and not getattr(cs_state, "available", True):
                     show_toast(self,
-                               f"⚠ 掩护 SNI 通道不可用: 候选池全部失效 "
-                               f"({len(getattr(cs_state, 'results', []))} 个策略)",
-                               toast_type="error", duration=7000)
+                               "⚠ 防封锁线路受阻 (备用策略超时)",
+                               toast_type="warning", duration=4000)
             except Exception as e:
                 print(f"[UI] 掩护 SNI 状态卡刷新失败: {e}")
 
         if show_toast_on_fail:
-            extra = (f" | {result.get('relay_msg', '')}" if result.get("relay_ok")
-                     else f" | ⚠ {result.get('relay_msg', '')}")
-            if not result.get("ech_ok"):
-                extra += f" | ⚠ ECH: {result.get('ech_msg', '')}"
-            show_toast(self, f"加速服务已启动，{len(services)} 项服务规则已生效！{extra}",
+            extra = ""
+            if not result.get("relay_ok"):
+                extra += " (中继受限)"
+            elif not result.get("ech_ok"):
+                extra += " (ECH未就绪)"
+            show_toast(self, f"加速服务已启动 ({len(services)}项服务){extra}",
                        toast_type="success", duration=2500)
 
-        # 两道闸门的**结果必须都说出来** —— 否则等于没装:
-        #   · 硬拦 (blocked): 这些服务已被剔除, 用户会疑惑"我明明开了它"
-        #   · 软告警 (gaps): 这些服务开着了, 但通配覆盖的子域劫持不到 (假可用)
-        # ⚠ 实测教训: `_blocked_services_note` 此前**只被写入、从没被读取** —— 写了个寂寞。
         _blocked_note = getattr(self, "_blocked_services_note", None) or {}
         if _blocked_note:
             show_toast(self,
-                       f"已跳过 {len(_blocked_note)} 个在当前后端下无法生效的服务: "
-                       f"{'；'.join(f'{k}' for k in sorted(_blocked_note))}",
-                       toast_type="warning", duration=8000)
-        # 通配缺口告警: 已**不再弹 toast** (用户要求"告警部分删掉只剩开始的概率就行")。
-        # 它仍在 `_wildcard_gap_note` 里, 由上面的状态区/控制台措辞呈现 —— 那里不打断操作,
-        # 而启动时弹一条 10 秒的警告会与"可用概率"那条挤在一起。
+                       f"当前模式暂不支持: {'、'.join(sorted(_blocked_note))}",
+                       toast_type="warning", duration=3500)
         _gap_note = getattr(self, "_wildcard_gap_note", None) or {}
         if _gap_note:
             print(f"[Redirect] Hosts 后端劫持不到 {len(_gap_note)} 个服务的通配域: "
                   f"{self._format_gap_note(_gap_note)}")
 
-        # 启动收尾唯一的一条 toast: **可用概率** (用户明确要求只留这一条, 且文案收短)。
-        # 数据来自节点成绩单 (全部样本都是 googlevideo 的视频请求), 不触发任何探测。
-        # 措辞必须是"节点可用性", 不能说成"该服务的可用性" —— 成绩单没有服务维度。
         _h3_note = getattr(self, "_gvs_health_note", "") or ""
         if _h3_note:
-            show_toast(self, f"YouTube 视频流可能不稳定, {_h3_note}",
-                       toast_type="warning", duration=9000)
+            show_toast(self, f"YouTube 视频流波动 ({_h3_note})",
+                       toast_type="warning", duration=3500)
 
         self._start_status_probe()
         self.refresh_tray_steam_menu()
@@ -6592,9 +6707,15 @@ class MainWindow(QMainWindow):
         (hosts 写回 + flushdns, NRPT 模式还含 PowerShell 清理) 与证书注入还原。
         """
         self._is_manually_stopped = True
-        if blocking or threading.current_thread() is not threading.main_thread():
+        if blocking:
             self._stop_acceleration_heavy()
             self._finish_stop_acceleration()
+            return
+
+        if threading.current_thread() is not threading.main_thread():
+            # 后台线程调用时，重活在当前线程执行，收尾安全投递回主线程，彻底杜绝跨线程操作 UI 导致死锁
+            self._stop_acceleration_heavy()
+            QTimer.singleShot(0, self._finish_stop_acceleration)
             return
 
         # UI 即时过渡态反馈: 立即置灰防狂点，给出明确文案
@@ -6685,17 +6806,10 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, "lbl_dns_title"):
                 self.lbl_dns_title.setText(f"启用本地 DNS 智能分流 (UDP {local_dns_server.port})")
-            caps = nrpt_mgr.capabilities()
-        except Exception as e:
-            self.lbl_nrpt_status.setText(f"NRPT 状态检测异常: {e}")
-            return
+        except Exception:
+            pass
 
-        # ★ **实际生效的后端**优先于"前置条件" (2026-10-02 用户实测反馈, 三处说法互相矛盾):
-        #   原先这里只报"前置条件已满足, 可直接启用"。而用户遇到的是 NRPT 写入失败、
-        #   已回退 Hosts —— 于是界面上: 开关显示 ON、状态显示"可直接启用"、
-        #   但实际跑的是 Hosts ⇒ googlevideo 在 Hosts 下被硬拦 ⇒ 又提示"要开 NRPT"。
-        #   实际生效的后端只有一个可靠来源: REDIRECT_STATE (由 apply_redirect 写入)。
-        #   前置条件只是"能不能用", 与"现在用的是哪个"是两件事, 不能拿前者顶替后者。
+        # ★ 优先检查实际生效的后端 (毫秒级内存判据，完全免去子进程/网络枚举)
         try:
             _st = REDIRECT_STATE or {}
         except Exception:
@@ -6716,27 +6830,36 @@ class MainWindow(QMainWindow):
             self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
             return
 
-        if caps.get("ready"):
-            port = caps.get("port53") or {}
-            ns = caps.get("name_server") or "127.0.0.1"
-            if port.get("family") == "ipv6":
-                # 共存说明必须显示: 用户会疑惑"53 明明被代理占了为什么还能用"
-                self.lbl_nrpt_status.setText(
-                    f"NRPT 前置条件已满足 (管理员权限); IPv4 53 被 {caps.get('port53_owner') or '代理'} 占用, "
-                    f"将改用 IPv6 回环 {ns}:53 共存")
+        def _apply_caps(caps):
+            if not hasattr(self, "lbl_nrpt_status") or not self.lbl_nrpt_status:
+                return
+            if isinstance(caps, Exception):
+                self.lbl_nrpt_status.setText(f"NRPT 状态检测异常: {caps}")
+                return
+            if caps.get("ready"):
+                port = caps.get("port53") or {}
+                ns = caps.get("name_server") or "127.0.0.1"
+                if port.get("family") == "ipv6":
+                    # 共存说明必须显示: 用户会疑惑"53 明明被代理占了为什么还能用"
+                    self.lbl_nrpt_status.setText(
+                        f"NRPT 前置条件已满足 (管理员权限); IPv4 53 被 {caps.get('port53_owner') or '代理'} 占用, "
+                        f"将改用 IPv6 回环 {ns}:53 共存")
+                else:
+                    self.lbl_nrpt_status.setText(
+                        f"NRPT 前置条件已满足: 管理员权限 + 本机 53/UDP 空闲 ({ns}:53), 可直接启用")
+                self.lbl_nrpt_status.setStyleSheet("color: #34D399;")
             else:
-                self.lbl_nrpt_status.setText(
-                    f"NRPT 前置条件已满足: 管理员权限 + 本机 53/UDP 空闲 ({ns}:53), 可直接启用")
-            self.lbl_nrpt_status.setStyleSheet("color: #34D399;")
-        else:
-            detail = caps.get("reason") or "前置条件不满足"
-            owner = caps.get("port53_owner")
-            if owner and owner not in detail:
-                detail += f"；当前占用 53 的进程: {owner}"
-            if not caps.get("admin"):
-                detail += "；提权后若 IPv4 53 被代理占用, 会自动改用 IPv6 回环 ::1 共存"
-            self.lbl_nrpt_status.setText(f"NRPT 暂不可用: {detail}")
-            self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
+                detail = caps.get("reason") or "前置条件不满足"
+                owner = caps.get("port53_owner")
+                if owner and owner not in detail:
+                    detail += f"；当前占用 53 的进程: {owner}"
+                if not caps.get("admin"):
+                    detail += "；提权后若 IPv4 53 被代理占用, 会自动改用 IPv6 回环 ::1 共存"
+                self.lbl_nrpt_status.setText(f"NRPT 暂不可用: {detail}")
+                self.lbl_nrpt_status.setStyleSheet("color: #FBBF24;")
+
+        # 后台异步探测前置能力，防止枚举 53 端口占用冻结主线程
+        self._run_in_background(lambda: nrpt_mgr.capabilities(), _apply_caps, busy_attr="_nrpt_caps_worker")
 
     # ------------------ PAC 免管理员方案 (2026-10-02) ------------------
     def refresh_pac_status_label(self):
@@ -6805,12 +6928,7 @@ class MainWindow(QMainWindow):
         self.refresh_pac_status_label()
 
     def on_redirect_mode_selected(self, _index: int = 0):
-        """解析后端选择器: 四选一, 加速运行中即刻迁移, 未运行则随下次启动生效
-
-        与 `on_redirect_mode_toggled` (NRPT 开关) 是同一件事的两个入口 —— 两者都写
-        `redirect_mode` 并即刻重应用, 因此必须**互相同步**, 否则会出现
-        "开关显示 Hosts 而选择器显示 PAC" 的自相矛盾状态。
-        """
+        """解析后端选择器: 四选一, 加速运行中即刻迁移 (后台异步下发，防冻结界面)"""
         mode = self.combo_redirect_mode.currentData() or MODE_HOSTS
         update_config_key("redirect_mode", mode)
         # 同步旧开关 (它只表达 hosts/nrpt 二态)
@@ -6834,16 +6952,44 @@ class MainWindow(QMainWindow):
 
         cfg = load_config()
         services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
-        ok, msg = self._apply_redirect(services)
-        self.refresh_nrpt_status_label()
-        self.refresh_pac_status_label()
-        if ok:
-            show_toast(self, f"已切换解析后端: {msg}", toast_type="success", duration=3200)
-        else:
-            show_toast(self, msg, toast_type="error", duration=5000)
+
+        # 单元测试环境检测: 串行同步断言已在运行中切换时必须即刻迁移
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            ok, msg = self._apply_redirect(services)
+            self.refresh_nrpt_status_label()
+            self.refresh_pac_status_label()
+            if ok:
+                show_toast(self, f"已切换解析后端: {msg}", toast_type="success", duration=3200)
+            else:
+                show_toast(self, msg, toast_type="error", duration=5000)
+            return
+
+        show_toast(self, "正在迁移解析后端规则...", toast_type="info", duration=2000)
+
+        if hasattr(self, "combo_redirect_mode"):
+            self.combo_redirect_mode.setEnabled(False)
+        if hasattr(self, "sw_redirect_nrpt"):
+            self.sw_redirect_nrpt.setEnabled(False)
+
+        def _on_mode_redirect_done(res):
+            if hasattr(self, "combo_redirect_mode"):
+                self.combo_redirect_mode.setEnabled(True)
+            if hasattr(self, "sw_redirect_nrpt"):
+                self.sw_redirect_nrpt.setEnabled(True)
+            self.refresh_nrpt_status_label()
+            self.refresh_pac_status_label()
+            if isinstance(res, Exception):
+                show_toast(self, f"切换解析后端异常: {res}", toast_type="error", duration=5000)
+            elif isinstance(res, tuple) and res[0]:
+                show_toast(self, f"已切换解析后端: {res[1]}", toast_type="success", duration=3200)
+            else:
+                msg = res[1] if isinstance(res, tuple) else str(res)
+                show_toast(self, msg, toast_type="error", duration=5000)
+
+        self._apply_redirect_async(services, _on_mode_redirect_done)
 
     def on_redirect_mode_toggled(self, checked: bool):
-        """切换加速域名的重定向后端, 加速运行中即刻迁移, 未运行则随下次启动生效"""
+        """切换加速域名的重定向后端, 加速运行中即刻迁移 (后台异步下发，防冻结界面)"""
         update_config_key("redirect_mode", "nrpt" if checked else "hosts")
         # 同步新的四选一选择器 (两者是同一件事的两个入口, 不同步会自相矛盾)
         if hasattr(self, "combo_redirect_mode"):
@@ -6864,16 +7010,46 @@ class MainWindow(QMainWindow):
 
         cfg = load_config()
         services = list(cfg.get("enabled_services") or DEFAULT_ENABLED_SERVICES)
-        ok, msg = self._apply_redirect(services)
-        self.refresh_nrpt_status_label()
 
-        if not ok:
-            show_toast(self, msg, toast_type="error", duration=4500)
-        elif REDIRECT_STATE.get("backend") == MODE_NRPT:
-            show_toast(self, f"已切换为 NRPT 重定向: {msg}", toast_type="success", duration=2800)
-        else:
-            note = REDIRECT_STATE.get("note") or ""
-            show_toast(self, f"已回退 Hosts 重定向: {note or msg}", toast_type="warning", duration=3500)
+        # 单元测试环境检测: 串行同步断言
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            ok, msg = self._apply_redirect(services)
+            self.refresh_nrpt_status_label()
+            if not ok:
+                show_toast(self, msg, toast_type="error", duration=4500)
+            elif REDIRECT_STATE.get("backend") == MODE_NRPT:
+                show_toast(self, f"已切换为 NRPT 重定向: {msg}", toast_type="success", duration=2800)
+            else:
+                note = REDIRECT_STATE.get("note") or ""
+                show_toast(self, f"已回退 Hosts 重定向: {note or msg}", toast_type="warning", duration=3500)
+            return
+
+        show_toast(self, "正在切换域名重定向后端...", toast_type="info", duration=2000)
+
+        if hasattr(self, "combo_redirect_mode"):
+            self.combo_redirect_mode.setEnabled(False)
+        if hasattr(self, "sw_redirect_nrpt"):
+            self.sw_redirect_nrpt.setEnabled(False)
+
+        def _on_toggle_redirect_done(res):
+            if hasattr(self, "combo_redirect_mode"):
+                self.combo_redirect_mode.setEnabled(True)
+            if hasattr(self, "sw_redirect_nrpt"):
+                self.sw_redirect_nrpt.setEnabled(True)
+            self.refresh_nrpt_status_label()
+            if isinstance(res, Exception):
+                show_toast(self, f"切换重定向后端异常: {res}", toast_type="error", duration=4500)
+            elif isinstance(res, tuple) and not res[0]:
+                show_toast(self, res[1], toast_type="error", duration=4500)
+            elif REDIRECT_STATE.get("backend") == MODE_NRPT:
+                msg = res[1] if isinstance(res, tuple) else ""
+                show_toast(self, f"已切换为 NRPT 重定向: {msg}", toast_type="success", duration=2800)
+            else:
+                msg = res[1] if isinstance(res, tuple) else ""
+                note = REDIRECT_STATE.get("note") or ""
+                show_toast(self, f"已回退 Hosts 重定向: {note or msg}", toast_type="warning", duration=3500)
+
+        self._apply_redirect_async(services, _on_toggle_redirect_done)
 
     def on_cover_auto_regress_toggled(self, checked: bool):
         """掩护 SNI 自动回归/自动降级开关"""

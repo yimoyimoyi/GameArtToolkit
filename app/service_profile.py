@@ -2453,7 +2453,9 @@ TOTAL_SERVICES_COUNT: int = len(PROFILES)
 # 官方生态主站快捷导航数据注册表
 # ==============================================================================
 NAVIGATOR_SERVICES = [
-    # 二次元与创作者
+    # ==========================================
+    # 二次元与创作者生态 (ACG)
+    # ==========================================
     {
         "id": "pixiv",
         "group": "acg",
@@ -2485,6 +2487,16 @@ NAVIGATOR_SERVICES = [
         "tags": ["同人", "商城", "3D模型", "周边", "BOOTH"]
     },
     {
+        "id": "pixiv_sketch",
+        "group": "acg",
+        "name": "Pixiv Sketch 绘画交流",
+        "desc": "Pixiv 官方在线绘图、涂鸦与创作交流轻量社区",
+        "url": "https://sketch.pixiv.net",
+        "domain": "sketch.pixiv.net",
+        "icon": "palette",
+        "tags": ["Pixiv", "Sketch", "涂鸦", "画画", "插画"]
+    },
+    {
         "id": "pixivision",
         "group": "acg",
         "name": "Pixivision 官方杂志",
@@ -2505,6 +2517,36 @@ NAVIGATOR_SERVICES = [
         "tags": ["图库", "动漫", "壁纸", "标签检索", "Danbooru"]
     },
     {
+        "id": "yande_re",
+        "group": "acg",
+        "name": "Yande.re 高清动漫壁纸",
+        "desc": "高质量动漫插画与无损二次元壁纸图库 (标签检索、真 SNI 直连)",
+        "url": "https://yande.re",
+        "domain": "yande.re",
+        "icon": "image",
+        "tags": ["图库", "壁纸", "插画", "动漫", "yande.re", "二次元"]
+    },
+    {
+        "id": "konachan",
+        "group": "acg",
+        "name": "Konachan 动漫壁纸站",
+        "desc": "知名二次元插画与动漫电脑壁纸检索图库",
+        "url": "https://konachan.net",
+        "domain": "konachan.net",
+        "icon": "image",
+        "tags": ["壁纸", "图库", "动漫", "Konachan", "插画"]
+    },
+    {
+        "id": "safebooru",
+        "group": "acg",
+        "name": "Safebooru 全年龄动漫图库",
+        "desc": "全年龄精选动漫壁纸与二次元插画标签检索图库",
+        "url": "https://safebooru.org",
+        "domain": "safebooru.org",
+        "icon": "image",
+        "tags": ["图库", "全年龄", "壁纸", "Safebooru", "插画"]
+    },
+    {
         "id": "vndb",
         "group": "acg",
         "name": "VNDB 视觉小说资料库",
@@ -2513,6 +2555,36 @@ NAVIGATOR_SERVICES = [
         "domain": "vndb.org",
         "icon": "book",
         "tags": ["Galgame", "视觉小说", "评分", "百科", "VNDB"]
+    },
+    {
+        "id": "bangumi",
+        "group": "acg",
+        "name": "Bangumi 番组计划",
+        "desc": "中文权威二次元动漫、番剧、轻小说与 Galgame 资料评分库",
+        "url": "https://bgm.tv",
+        "domain": "bgm.tv",
+        "icon": "book",
+        "tags": ["Bangumi", "番组计划", "评分", "动漫", "追番", "bgm.tv"]
+    },
+    {
+        "id": "anidb",
+        "group": "acg",
+        "name": "AniDB 动漫资料库",
+        "desc": "经典老牌日本动画全量数据检索与百科资料库",
+        "url": "https://anidb.net",
+        "domain": "anidb.net",
+        "icon": "book",
+        "tags": ["AniDB", "动漫", "资料库", "番剧", "百科"]
+    },
+    {
+        "id": "civitai",
+        "group": "acg",
+        "name": "Civitai AI 绘画模型社区",
+        "desc": "全球最大 AI 绘画创作者社区，汇聚 SD / FLUX / LoRA 等开源生图模型",
+        "url": "https://civitai.com",
+        "domain": "civitai.com",
+        "icon": "sparkles",
+        "tags": ["AI绘画", "Civitai", "Stable Diffusion", "FLUX", "LoRA", "模型"]
     },
     {
         "id": "fantia",
@@ -2524,8 +2596,30 @@ NAVIGATOR_SERVICES = [
         "icon": "star",
         "tags": ["创作者", "赞助", "同人", "Cosplay", "Fantia"]
     },
+    {
+        "id": "imgur_site",
+        "group": "acg",
+        "name": "Imgur 图床",
+        "desc": "海外最常用免费图床与图片分享社区 (Fastly 掩护直连)",
+        "url": "https://imgur.com",
+        "domain": "imgur.com",
+        "icon": "image",
+        "tags": ["图床", "图片", "Imgur", "贴图"]
+    },
+    {
+        "id": "myanimelist_site",
+        "group": "acg",
+        "name": "MyAnimeList 动漫资料库",
+        "desc": "欧美向动漫评分、排行榜与追番记录平台 (Akamai)",
+        "url": "https://myanimelist.net",
+        "domain": "myanimelist.net",
+        "icon": "book",
+        "tags": ["动漫", "评分", "追番", "MAL"]
+    },
 
-    # 游戏生态
+    # ==========================================
+    # 游戏生态 (Gaming)
+    # ==========================================
     {
         "id": "steam_store",
         "group": "gaming",
@@ -2545,6 +2639,36 @@ NAVIGATOR_SERVICES = [
         "domain": "steamcommunity.com",
         "icon": "gamepad",
         "tags": ["社区", "创意工坊", "好友", "动态", "Steam社区"]
+    },
+    {
+        "id": "steam_workshop",
+        "group": "gaming",
+        "name": "Steam 创意工坊",
+        "desc": "Steam 游戏模组 (Mod)、自定义地图、皮肤与玩家创意资产库",
+        "url": "https://steamcommunity.com/workshop",
+        "domain": "steamcommunity.com",
+        "icon": "gamepad",
+        "tags": ["创意工坊", "Workshop", "Mod", "Steam", "模组"]
+    },
+    {
+        "id": "steamdb",
+        "group": "gaming",
+        "name": "SteamDB 数据库",
+        "desc": "权威 Steam 第三方数据库，汇集史低特惠、在线人数与后台更新记录",
+        "url": "https://steamdb.info",
+        "domain": "steamdb.info",
+        "icon": "database",
+        "tags": ["SteamDB", "史低", "价格查询", "在线人数", "数据"]
+    },
+    {
+        "id": "epic_games",
+        "group": "gaming",
+        "name": "Epic Games 游戏商城",
+        "desc": "Epic 游戏官方商城，每周独占特惠、免费喜加一游戏与虚幻引擎",
+        "url": "https://store.epicgames.com",
+        "domain": "store.epicgames.com",
+        "icon": "shopping_bag",
+        "tags": ["Epic", "商城", "喜加一", "免费游戏", "虚幻商城"]
     },
     {
         "id": "ubisoft",
@@ -2597,7 +2721,9 @@ NAVIGATOR_SERVICES = [
         "tags": ["Minecraft", "我的世界", "Mojang", "沙盒"]
     },
 
-    # 开发者与 AI
+    # ==========================================
+    # 开发者与 AI 生态 (Dev & Tech)
+    # ==========================================
     {
         "id": "github",
         "group": "dev",
@@ -2628,27 +2754,35 @@ NAVIGATOR_SERVICES = [
         "icon": "cpu",
         "tags": ["AI", "大模型", "Transformers", "机器学习", "HuggingFace"]
     },
-
-    # 2026-10-01 替代路线解锁的站点 (详见 docs/archive/uplift-route-findings.md)
     {
-        "id": "imgur_site",
-        "group": "acg",
-        "name": "Imgur 图床",
-        "desc": "Reddit / 社交平台最常用图床 (Fastly, 伪 SNI 掩护直连)",
-        "url": "https://imgur.com",
-        "domain": "imgur.com",
-        "icon": "image",
-        "tags": ["图床", "图片", "Imgur", "贴图"]
+        "id": "google",
+        "group": "dev",
+        "name": "Google 谷歌搜索",
+        "desc": "全球第一的通用网络搜索引擎与谷歌全生态服务入口",
+        "url": "https://www.google.com",
+        "domain": "google.com",
+        "icon": "globe",
+        "tags": ["Google", "谷歌", "搜索", "Search", "Gmail"]
     },
     {
-        "id": "myanimelist_site",
-        "group": "acg",
-        "name": "MyAnimeList 动漫资料库",
-        "desc": "欧美向动漫评分、排行榜与追番记录 (Akamai)",
-        "url": "https://myanimelist.net",
-        "domain": "myanimelist.net",
-        "icon": "book",
-        "tags": ["动漫", "评分", "追番", "MAL"]
+        "id": "gemini",
+        "group": "dev",
+        "name": "Google Gemini AI",
+        "desc": "Google 官方前沿多模态大语言模型与智能助手",
+        "url": "https://gemini.google.com",
+        "domain": "gemini.google.com",
+        "icon": "cpu",
+        "tags": ["Gemini", "Google", "AI", "大模型", "Bard"]
+    },
+    {
+        "id": "youtube",
+        "group": "dev",
+        "name": "YouTube 视频平台",
+        "desc": "全球最大视频分享平台、技术教程与创作者影音中心",
+        "url": "https://www.youtube.com",
+        "domain": "youtube.com",
+        "icon": "video",
+        "tags": ["YouTube", "油管", "视频", "影音", "教程"]
     },
     {
         "id": "reddit_site",
@@ -2679,7 +2813,191 @@ NAVIGATOR_SERVICES = [
         "domain": "discord.com",
         "icon": "message",
         "tags": ["社区", "语音", "Discord", "开发群"]
-    }
+    },
+    {
+        "id": "npm",
+        "group": "dev",
+        "name": "npm 官方包管理生态",
+        "desc": "JavaScript / Node.js 全球最大开源包管理生态与官方 Registry",
+        "url": "https://www.npmjs.com",
+        "domain": "npmjs.com",
+        "icon": "code",
+        "tags": ["npm", "Node.js", "JavaScript", "包管理", "依赖"]
+    },
+    {
+        "id": "pypi",
+        "group": "dev",
+        "name": "PyPI Python 官方包索引",
+        "desc": "Python 官方软件包索引 (The Python Package Index) 与 pip 下载源",
+        "url": "https://pypi.org",
+        "domain": "pypi.org",
+        "icon": "code",
+        "tags": ["PyPI", "Python", "pip", "包管理", "库"]
+    },
+    {
+        "id": "crates_io",
+        "group": "dev",
+        "name": "crates.io Rust 包索引",
+        "desc": "Rust 编程语言官方社区包注册中心与 cargo 依赖分发源",
+        "url": "https://crates.io",
+        "domain": "crates.io",
+        "icon": "code",
+        "tags": ["crates.io", "Rust", "cargo", "包索引", "依赖"]
+    },
+    {
+        "id": "nuget",
+        "group": "dev",
+        "name": "NuGet .NET 包管理",
+        "desc": "Microsoft .NET 官方包管理平台与 nuget / dotnet 分发中心",
+        "url": "https://www.nuget.org",
+        "domain": "nuget.org",
+        "icon": "code",
+        "tags": ["NuGet", ".NET", "C#", "微软", "包管理"]
+    },
+    {
+        "id": "jsdelivr",
+        "group": "dev",
+        "name": "jsDelivr 开源公共 CDN",
+        "desc": "针对 npm 和 GitHub 极速免费开源公共 CDN 与加速分发网络",
+        "url": "https://www.jsdelivr.com",
+        "domain": "jsdelivr.com",
+        "icon": "link",
+        "tags": ["jsDelivr", "CDN", "开源", "静态资源", "npm"]
+    },
+    {
+        "id": "cdnjs",
+        "group": "dev",
+        "name": "cdnjs 前端公共库 CDN",
+        "desc": "Cloudflare 驱动的全球最大前端开源 Web 静态资源与 JavaScript 库 CDN",
+        "url": "https://cdnjs.com",
+        "domain": "cdnjs.com",
+        "icon": "link",
+        "tags": ["cdnjs", "Cloudflare", "CDN", "前端", "JS库"]
+    },
+    {
+        "id": "unpkg",
+        "group": "dev",
+        "name": "unpkg npm 包公共 CDN",
+        "desc": "npm 全量软件包极速全球 CDN 内容分发网络",
+        "url": "https://unpkg.com",
+        "domain": "unpkg.com",
+        "icon": "link",
+        "tags": ["unpkg", "npm", "CDN", "静态资源"]
+    },
+
+    # ==========================================
+    # 成人内容与扩展社区 (受控分组 Adult)
+    # ==========================================
+    {
+        "id": "ehentai",
+        "group": "adult",
+        "name": "E-Hentai 动漫图库",
+        "desc": "全球知名二次元动漫、同人插画与图库社区 (受控分组)",
+        "url": "https://e-hentai.org",
+        "domain": "e-hentai.org",
+        "icon": "image",
+        "tags": ["E-Hentai", "图库", "同人志", "二次元", "E站"]
+    },
+    {
+        "id": "exhentai",
+        "group": "adult",
+        "name": "ExHentai 里站",
+        "desc": "E-Hentai 扩展会员站 (需 Cookie 凭证, 经本地 ECH 隧道直连)",
+        "url": "https://exhentai.org",
+        "domain": "exhentai.org",
+        "icon": "lock",
+        "tags": ["ExHentai", "里站", "E站", "二次元"]
+    },
+    {
+        "id": "nhentai",
+        "group": "adult",
+        "name": "nhentai 同人志库",
+        "desc": "二次元同人漫画与画集在线检索阅览站",
+        "url": "https://nhentai.net",
+        "domain": "nhentai.net",
+        "icon": "book",
+        "tags": ["nhentai", "同人志", "漫画", "本子库"]
+    },
+    {
+        "id": "dlsite",
+        "group": "adult",
+        "name": "DLsite 二次元同人商城",
+        "desc": "日本知名同人志、同人游戏、音声与创作者数字分发平台",
+        "url": "https://www.dlsite.com",
+        "domain": "dlsite.com",
+        "icon": "shopping_bag",
+        "tags": ["DLsite", "同人", "音声", "同人游戏", "创作者"]
+    },
+    {
+        "id": "furaffinity",
+        "group": "adult",
+        "name": "FurAffinity 兽圈创作社区",
+        "desc": "全球最大 Furry 兽圈艺术插画、文学与创作者交流平台",
+        "url": "https://www.furaffinity.net",
+        "domain": "furaffinity.net",
+        "icon": "palette",
+        "tags": ["FurAffinity", "Furry", "兽圈", "插画", "创作者"]
+    },
+    {
+        "id": "cara",
+        "group": "adult",
+        "name": "Cara 艺术家社区",
+        "desc": "主打反 AI 保护原创的全球数字艺术家作品集与社交网络",
+        "url": "https://cara.app",
+        "domain": "cara.app",
+        "icon": "palette",
+        "tags": ["Cara", "插画", "画师", "艺术社区", "作品集"]
+    },
+    {
+        "id": "artstation",
+        "group": "adult",
+        "name": "ArtStation 全球艺术社区",
+        "desc": "全球顶级数字概念设计、CG插画与 3D 艺术工作者展示交流平台",
+        "url": "https://www.artstation.com",
+        "domain": "artstation.com",
+        "icon": "palette",
+        "tags": ["ArtStation", "CG", "原画", "概念设计", "插画", "3D"]
+    },
+    {
+        "id": "hitomi",
+        "group": "adult",
+        "name": "Hitomi.la 漫画检索",
+        "desc": "高速同人本与漫画标签检索数据库",
+        "url": "https://hitomi.la",
+        "domain": "hitomi.la",
+        "icon": "image",
+        "tags": ["Hitomi", "图库", "漫画", "标签检索"]
+    },
+    {
+        "id": "pawchive",
+        "group": "adult",
+        "name": "Pawchive 创作者档案",
+        "desc": "创作者赞助作品历史存档与离线检索档案站",
+        "url": "https://pawchive.pw",
+        "domain": "pawchive.pw",
+        "icon": "database",
+        "tags": ["Pawchive", "创作者", "赞助", "存档", "Kemono"]
+    },
+    {
+        "id": "sankaku",
+        "group": "adult",
+        "name": "Sankaku Channel 图库",
+        "desc": "二次元插画、Cosplay 与动漫视觉文化图库社区",
+        "url": "https://chan.sankakucomplex.com",
+        "domain": "chan.sankakucomplex.com",
+        "icon": "image",
+        "tags": ["Sankaku", "图库", "插画", "二次元", "壁纸"]
+    },
+    {
+        "id": "hlib",
+        "group": "adult",
+        "name": "H图书馆 (hlib.cc)",
+        "desc": "中文轻小说、同人文学与二次元创作阅读站",
+        "url": "https://hlib.cc",
+        "domain": "hlib.cc",
+        "icon": "book",
+        "tags": ["H图书馆", "hlib", "小说", "文学", "阅读"]
+    },
 ]
 
 
