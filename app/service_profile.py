@@ -1412,6 +1412,17 @@ PROFILES: List[ServiceProfile] = [
             "ytimg.com", "i.ytimg.com", "s.ytimg.com",
             "youtubei.googleapis.com", "studio.youtube.com", "music.youtube.com",
             "tv.youtube.com", "gdata.youtube.com",
+            # ★ 2026-10-05 补 **accounts.youtube.com** (用户实测: 登录流程走到这里被取消):
+            #   实测该域**无任何画像登记** ⇒ 请求落到 nginx default_server, 回 **0 字节 (444)**;
+            #   而 `accounts.google.com` (已登记) 同一时刻正常回 302 —— 差别就在登记与否。
+            #   ⚠ 它的**两个解析结果都是投毒**, 这正是必须登记的硬理由:
+            #       doh.pub   157.240.7.20    (Meta 段)
+            #       系统解析   185.45.5.35     (已知投毒取值, 见 _DNS_POISON_PREFIX)
+            #     不登记 ⇒ 浏览器拿投毒地址直连 ⇒ Google 登录判定"会话异常" ⇒ **登录被取消**。
+            #   另一个理由: YouTube 登录会从 www.youtube.com 跳到 accounts.youtube.com,
+            #   漏登记它等于**登录链路断在中间** (本项目已多次吃过"漏一个子域"的账, 如
+            #   blobs-b2 / b2.civitai.com / discord_gateway)。
+            "accounts.youtube.com",
         ],
         icon="video",
         mode=ServiceMode.L7_NGINX,
