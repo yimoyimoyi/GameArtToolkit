@@ -2386,6 +2386,23 @@ PROFILES: List[ServiceProfile] = [
         #   故把稳定的那个放首位, 时变的留作备选。
         candidate_ips=["172.64.66.1", "172.64.190.1"],
         stable_ips=["172.64.66.1"],
+        # ★ 测速探针的**探测域必须写 R2 主机自己** (2026-10-05 缺陷修复, 用户反馈
+        #   "civitai 模型就两个节点且全死"): 原先 `probe_domains` 是空的 ⇒ 探测退化成
+        #   拿 `civitai.com` 当 SNI/域, 而 Cloudflare 的 R2 边缘**不服务** `civitai.com`
+        #   这个名字 ⇒ **TLS 直接 RST** ⇒ 两个候选都被判"全死"。
+        #   用 R2 主机名做探测后实测 **两个候选各 3/3 全部可用** (tcp/tls/http 全 True,
+        #   状态 400)。这正是"检测不可用、实际可用"的又一例 —— 与 ECH/h3 那两类同源:
+        #   探针复现不了真实链路。
+        # ⚠ 顺带纠正我此前一次**方法错误**的实测: 我用 `civitai.com` 作 SNI 测这两个地址
+        #   得到 "TLS RST / 真死", 那是拿错 SNI 的结论, 不能作为"节点坏了"的证据。
+        probe_domains=("civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf"
+                       ".r2.cloudflarestorage.com",),
+        # ★ 400 必须放行 (2026-10-05): R2 对**桶根路径**的正常应答就是 400
+        #   (`<Error><Code>InvalidRequest</Code>` 一类 —— 它要求签名 URL)。
+        #   不放行时 http_suspect=True ⇒ `_http_clean()` 判 False ⇒ rank 3 "全死",
+        #   于是"节点明明 3/3 握手成功"却显示不可用 —— 与 S3 403 / githubassets 404
+        #   同一性质 (项目已有 probe_ok_statuses 这个显式放行机制, 本处漏配)。
+        probe_ok_statuses=(400, 403, 404),
         # 不设 path_rules: 本画像在 nginx 侧**没有 server 块** (DIRECT ∈ NGINX_BYPASS_MODES),
         # path_rules 是 L7 概念, 放这里等于死配置 —— 直连路径本就没有"缓冲/超时"可调,
         # 那正是它比反代快的原因。

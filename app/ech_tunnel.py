@@ -75,8 +75,20 @@ def is_cloudflare_ip(ip: str) -> bool:
 # DoH 端点: 仅作 ECHConfig 自举与域名解析的补充路径。实测境内 DoH 对受限
 # 域名会间歇性返回污染结果, 真正可靠的是域名自带的静态 IP 池, 因此这里的
 # 端点失败不影响可用性 (隧道内部有网段过滤与池回退)。
+#
+# ★ 2026-10-04 顺序修正 (用户"civitai/discord 时好时坏"的真根因之一):
+#   原先是**阿里优先**, 而实测阿里对**几乎所有受限域名**都在返回 Meta/垃圾段:
+#       civitai.com            doh.pub=172.66.152.186/104.20.38.219  ali=173.252.88.133
+#       blobs-b2.civitai.com   doh.pub=172.66.152.186/…             ali=103.252.114.61(死)
+#       gateway.discord.gg     doh.pub=162.159.133.234/…            ali=31.13.82.33
+#       www.youtube.com        doh.pub=142.251.156.4/…              ali=31.13.92.37
+#   而 `doh.pub` 连测 6/6 一致给出正确结果。把阿里放第一位 ⇒ 隧道自举与解析会**优先
+#   采纳污染答案**。这与 `cdn_optimizer.DOH_ENDPOINTS` 的口径也对齐了 —— 那边早已写成
+#   "阿里…可能继承 GFW 注入结果, 仅作容灾"并把 doh.pub 放第一; 本处与 h3_upstream 是
+#   漏改的两处 (同一教训, 三张表只改对了一张)。
+#   ⚠ 不要把阿里挪回第一位: 那是本次缺陷的成因。保留它是为了"doh.pub 也不可达"时的兜底。
 DEFAULT_DOH_ENDPOINTS = [
-    "https://223.5.5.5/resolve",
+    "https://doh.pub/dns-query",
     "https://dns.alidns.com/resolve",
 ]
 

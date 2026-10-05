@@ -2622,7 +2622,19 @@ def _doh(name: str, qtype: str, timeout: float = 4.0) -> List[str]:
     import urllib.request
 
     want = 28 if qtype.upper() == "AAAA" else 1
-    for url in ("https://dns.alidns.com/resolve", "https://doh.pub/dns-query"):
+    # ★★ 顺序是**实测决定**的, 不是偏好 (2026-10-04 用户"civitai 图片时好时坏"的真根因):
+    #   `dns.alidns.com` (= 223.5.5.5) 会**间歇性返回一个不可达的地址**, 而 `doh.pub` 稳定正确。
+    #   实况 (同一分钟, 同一域名 blobs-b2.civitai.com):
+    #       doh.pub        -> ['172.66.152.186', '104.20.38.219']   连测 6/6 一致
+    #       ali(223.5.5.5) -> ['103.252.114.61']                    单值, 且 TCP 443 **8s 超时**
+    #   而本函数原先是 `for url in (ali, doh.pub)` + `if out: return out` ——
+    #   **阿里只要吐出一个地址 (哪怕是那个死地址) 就立刻采纳, doh.pub 根本不会被问到**。
+    #   于是同一域名**约一半的解析拿到死地址** ⇒ 腿拿它去连 ⇒ connect 预算 4s 烧光 ⇒ 502。
+    #   这就是"同一链接时好时坏"的确切机制。
+    #   故把**可靠的 doh.pub 放到第一位**; alidns 保留为兜底 (若某天 doh.pub 也不可达,
+    #   宁可拿阿里的答案去试, 也不要返回空 —— 与"宁可快速如实失败"同一口径)。
+    #   ⚠ 不要改回"阿里优先": 那是本次缺陷的成因。
+    for url in ("https://doh.pub/dns-query", "https://dns.alidns.com/resolve"):
         try:
             req = urllib.request.Request(
                 f"{url}?name={name}&type={qtype.upper()}",
@@ -2697,7 +2709,7 @@ def default_resolver(host: str) -> List[str]:
         cand = v6 + v4
         if strict:
             cand = [ip for ip in cand if is_google_edge_ip(ip)]
-        return _drop_dead_ipv4_for_gvs(cand, strict)
+        return _order_gvs_prefer_v6(cand, strict)
 
     # 兜底: 系统解析 (可能被投毒, 已过滤), 同样 IPv6 优先
     try:
@@ -2714,39 +2726,35 @@ def default_resolver(host: str) -> List[str]:
                + prefer_google(list(dict.fromkeys(out4))))
         if strict:
             out = [ip for ip in out if is_google_edge_ip(ip)]
-        return _drop_dead_ipv4_for_gvs(out, strict)
+        out = _order_gvs_prefer_v6(out, strict)
     except Exception:
         return []
 
 
-def _drop_dead_ipv4_for_gvs(cands: List[str], strict: bool) -> List[str]:
-    """GVS 节点家族: 有 IPv6 可用时**丢掉 IPv4** —— 它们是死的或近乎死的
+def _order_gvs_prefer_v6(cands: List[str], strict: bool) -> List[str]:
+    """GVS 节点家族: **IPv6 排前面, 但 IPv4 保留在队尾兜底** (不再整个丢弃)
 
-    为什么必须丢 (2026-10-04 用户实测"youtube 全 502", 本机现场数据):
-      · 对 4 个真实 gvs 节点 × 每个地址各测 2 轮, 结果是**干净的分族**:
-            IPv6 (2404:6800::/2607:f8b0:4004::/…):  404 命中, **0.6~2.6s**
-            IPv4 (209.85.229.134 / 74.125.155.134 / …): **None, 25.9~60.0s(超时)**
-        README/`attempt_order` 的注释早就写了"googlevideo 的 IPv4 侧被压制", 这里把
-        **后果**量化了: 撞一个死 v4 要烧 25~60 秒, 而腿的 connect 预算只有 4s、首头 8s,
-        于是每次必然以 502 收场, 且把整个请求拖到 13~16.6s.
-      · 交错 A/B (同一批节点, 两条腿同时跑) 的直接对照:
-            默认(v6+v4): 错误 6, 502 耗时 13.3s / 16.6s
-            只用 v6      : 错误 2, 502 耗时  5.1s /  4.9s
-        ⇒ 错误减半、失败从"十几秒"降到"约 5 秒"。
+    ★ 2026-10-04 **二次修正** (用户反馈"改了之后 youtube 播放好像更大了"):
+      第一版是"有 v6 就**丢掉** v4"。现场数据支持它 (4 个节点 × 每地址 2 轮:
+      v6 命中 0.6~2.6s, v4 **全部** 25.9~60s 超时; 交错 A/B 里 默认错误 6 → 只用 v6 错误 2,
+      502 耗时 13.3/16.6s → 5.1/4.9s)。**但那个样本恰好 v6 全好, 掩盖了它的代价**:
+        · `order_candidates` 是把 v6/v4 **交替**排的 ⇒ 候选里有两个族就有两次尝试机会;
+          丢掉 v4 等于**把每节点的尝试次数减半**。若轮到 v6 是坏的那一族, 该节点就从
+          "还能靠 v4 救回"变成"必死"。
+        · 实测就存在这种节点: `rr3---sn-p5qddn7k` 的 v6 (2607:f8b0:4004:15::8) 25.9s 超时,
+          而**它的 v4 (173.194.7.136) 也是 60s 超时** —— 这一次两族都死, 所以本次症状不是
+          本改动引起的; 但"v6 坏 v4 好"的节点在理论上必然存在, 丢掉 v4 就是主动放弃那条路。
+      ⇒ 改为**只重排、不丢弃**: v6 在前 (多数情况下它才是可用的那一族, 且失败快速),
+        v4 留后 (前者的兜底)。`attempt_order` 随后仍会把两族交替, 故尝试机会不减。
 
-    ⚠ 只在**确有为 v6 时才丢** v4: 若该节点本轮没有 v6 应答, 保留 v4 是唯一出路
-      (宁可试一个大概率死的 v4, 也不要返回空让上层立刻失败)。
-      同理, 这**不改变** Civitai/Discord 等非 GVS 目标 —— 它们由 strict=False 分支处理,
-      那些目标恰恰是"只有 v4 通"(实测 CF 的 v6 时好时坏、v4 稳定), 绝不能同样丢 v4。
-      这也是"youtube 与 civitai 策略必须分离"的落点。
+    ⚠ 非 GVS 目标 (strict=False) 原样返回 —— Civitai/Discord 等恰恰是"只有 v4 通",
+      绝不能套用本函数。这是"youtube 与 civitai 策略必须分离"的落点。
     """
     if not strict:
         return list(cands)
     v6 = [ip for ip in cands if ":" in ip]
     v4 = [ip for ip in cands if ":" not in ip]
-    if v6:
-        return v6            # 有 v6 ⇒ v4 只会白烧预算
-    return v4                # 没有 v6 ⇒ v4 是唯一候选, 留着
+    return v6 + v4
 
 
 def main(argv: Optional[List[str]] = None) -> int:
