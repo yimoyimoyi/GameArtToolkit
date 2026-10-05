@@ -5313,6 +5313,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_settings_content_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_hosts_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_cover_sni_card(primary_icon_c, cfg))
+        # HTTP/3 腿的重试策略: 与掩护 SNI 同属"通道行为"调参, 但语义独立 (见该卡 docstring)
+        layout.addWidget(self._build_settings_h3_retry_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_speedtest_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_proxy_card(primary_icon_c, cfg))
         layout.addWidget(self._build_settings_dns_card(primary_icon_c, cfg))
@@ -5342,6 +5344,85 @@ class MainWindow(QMainWindow):
         if val:
             update_config_key("ip_version_mode", val)
             show_toast(self, f"已切换测速偏好为: {self.cmb_ip_mode.currentText()}", toast_type="success", duration=2000)
+
+    def _build_settings_h3_retry_card(self, primary_icon_c: str, cfg: dict) -> QFrame:
+        """HTTP/3 直连通道的**同地址重试**设置卡 (`gvs_same_node_retries`, 默认 0)
+
+        为什么单独成卡而不是塞进"掩护 SNI 通道"卡 (2026-10-05): 那张卡的三个开关都关于
+        **SNI 降级策略**, 而本项是**重试次数** —— 归属不同, 混在一起会让"关了自动回归为什么
+        重试变了"这类问题无从定位。本项目一贯按"同一语义只放一处"划卡。
+
+        ⚠ 必须显式说明"改完要重启加速才生效": 腿在 `start()` 时读一次配置, 运行中不会重读。
+        """
+        card = QFrame()
+        card.setProperty("class", "MDCard")
+        c_layout = QVBoxLayout(card)
+        c_layout.setContentsMargins(20, 16, 20, 16)
+        c_layout.setSpacing(12)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(22, 22)
+        icon_lbl.setPixmap(SvgIconFactory.get_pixmap("zap", primary_icon_c, 20))
+        head.addWidget(icon_lbl)
+        lbl_title = QLabel("HTTP/3 直连通道 · 同地址重试")
+        lbl_title.setProperty("class", "ItemTitle")
+        head.addWidget(lbl_title)
+        head.addStretch()
+        c_layout.addLayout(head)
+
+        row = QHBoxLayout()
+        t = QVBoxLayout()
+        t.setSpacing(2)
+        lb = QLabel("失败后对同一地址的额外重试次数")
+        lb.setProperty("class", "ItemTitle")
+        lb.setWordWrap(True)
+        d = QLabel(
+            "默认 0 (不重试): 一个地址失败即换下一个候选, 尽快把失败交给播放器自己重试。"
+            "设为 1~2 可提高成功率 —— 实测节点的可达状态是**秒级翻转**的 (同一地址相隔几分钟"
+            "成功率中位变化 44%), 所以\"稍后重试\"确有收益: 腿级对照下成功率 42% → 58%, "
+            "而成功延迟中位不变 (0.9s), p90 由 1.1s 升至 1.6s。"
+            "⚠ 该设置对**全部** HTTP/3 请求生效, 包括视频流的 /videoplayback —— 一次 8~12 秒的"
+            "重试对正在播放的流是致命的; 若播放反而变卡, 请调回 0。改完需**重启加速服务**生效。"
+        )
+        d.setProperty("class", "ItemDesc")
+        d.setWordWrap(True)
+        t.addWidget(lb)
+        t.addWidget(d)
+        row.addLayout(t)
+        row.addStretch()
+
+        self.cmb_h3_retries = NoWheelComboBox()
+        for n, label in ((0, "0 次 (默认 · 快速失败)"), (1, "1 次"),
+                         (2, "2 次 (实测成功率最高)"),
+                         (3, "3 次 (上限)")):
+            self.cmb_h3_retries.addItem(label, n)
+        cur = int(cfg.get("gvs_same_node_retries", 0) or 0)
+        for idx in range(self.cmb_h3_retries.count()):
+            if int(self.cmb_h3_retries.itemData(idx)) == cur:
+                self.cmb_h3_retries.setCurrentIndex(idx)
+                break
+        self.cmb_h3_retries.currentIndexChanged.connect(self.on_h3_retries_changed)
+        row.addWidget(self.cmb_h3_retries)
+        c_layout.addLayout(row)
+
+        return card
+
+    def on_h3_retries_changed(self, index: int):
+        """同地址重试次数 (gvs_same_node_retries) —— 腿在启动时读, 故需重启加速生效"""
+        val = self.cmb_h3_retries.itemData(index)
+        if val is None:
+            return
+        update_config_key("gvs_same_node_retries", int(val))
+        if int(val) == 0:
+            show_toast(self, "已关闭同地址重试（快速失败）—— 重启加速服务后生效",
+                       toast_type="info", duration=2800)
+        else:
+            show_toast(self,
+                       f"已设为同地址重试 {int(val)} 次 —— 可提高成功率, "
+                       f"但视频流可能变卡; 重启加速服务后生效",
+                       toast_type="warning", duration=4200)
 
     def on_cdn_timeout_changed(self, index: int):
         val = self.cmb_timeout.itemData(index)
